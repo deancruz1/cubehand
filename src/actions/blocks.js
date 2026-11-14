@@ -4,6 +4,7 @@ import { ok, fail, posText, pause } from './util.js';
 import { walkTo, isGate, isOpen, SCAFFOLD_BLOCKS } from './movement.js';
 import { collectDrops } from './items.js';
 import { parseBlock, blockText, stateText, stateProblem, matchesState, placementOptions, itemFor } from './states.js';
+import { isAdmin } from '../guard.js';
 
 const { GoalPlaceBlock, GoalLookAtBlock, GoalNear } = pathfinderPkg.goals;
 
@@ -68,16 +69,24 @@ export async function inspectBlocks({ bot, config }, { x1, y1, z1, x2, y2, z2 })
     return fail(`box is ${volume} blocks, the limit is ${config.limits.maxInspectBlocks}`);
   }
 
+  // Runs of the same block along z share a line, so big boxes stay short.
   const lines = [];
   for (let y = ay; y <= by; y++) {
     for (let x = ax; x <= bx; x++) {
-      for (let z = az; z <= bz; z++) {
-        const block = bot.blockAt(new Vec3(x, y, z), false);
-        lines.push(`${x} ${y} ${z}: ${block ? stateText(block) : 'not loaded'}`);
+      let start = az;
+      let last = null;
+      for (let z = az; z <= bz + 1; z++) {
+        const block = z <= bz ? bot.blockAt(new Vec3(x, y, z), false) : null;
+        const text = z <= bz ? (block ? stateText(block) : 'not loaded') : null;
+        if (z > az && text !== last) {
+          lines.push(`${x} ${y} ${start === z - 1 ? start : `${start}..${z - 1}`}: ${last}`);
+          start = z;
+        }
+        last = text;
       }
     }
   }
-  return ok(lines.join('\n'));
+  return ok(`${volume > 1 ? 'x y z: block, where z a..b is a run along z\n' : ''}${lines.join('\n')}`);
 }
 
 function isFullBlock(block) {
@@ -230,8 +239,9 @@ export async function breakBlock(ctx, { x, y, z, confirmed }) {
   const block = bot.blockAt(pos, false);
   if (!block) return fail(`position not loaded: ${posText(pos)}`);
   const mine = ctx.placed?.has(pos, block.name);
-  if (isProtected(block.name, config.protectedBlocks) && !confirmed && !mine) {
-    return fail(`protected block: ${block.name}. Only break it if a player clearly asked for this one (then set confirmed), or if you placed it yourself.`);
+  if (isProtected(block.name, config.protectedBlocks) && !mine) {
+    if (!confirmed) return fail(`protected block: ${block.name}. Only break it if a player clearly asked for this one (then set confirmed), or if you placed it yourself.`);
+    if (ctx.requester && !isAdmin(config, ctx.requester)) return fail(`protected block: ${block.name}. Only an admin can have you break someone's ${block.name}, and ${ctx.requester} isn't one.`);
   }
   const result = await digBlock(ctx, pos);
   if (result.ok) await collectDrops(ctx, { radius: 3, center: pos.offset(0.5, 0.5, 0.5), max: 3 });

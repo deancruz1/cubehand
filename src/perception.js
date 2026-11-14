@@ -113,9 +113,12 @@ export function statusSummary({ position, yaw, health, food, dimension, gameMode
   ].join('\n');
 }
 
-export function chatSummary(messages) {
+// Lines from players who aren't on the allowlist are marked, since they can't give the bot jobs
+// and anything they say is only something to know about.
+export function chatSummary(messages, { allowlist, botName } = {}) {
   if (messages.length === 0) return 'Recent chat: none';
-  const lines = messages.map((m) => `<${m.username}> ${m.message}`);
+  const trusted = (name) => !allowlist || name === botName || allowlist.some((p) => p.toLowerCase() === name.toLowerCase());
+  const lines = messages.map((m) => `<${m.username}>${trusted(m.username) ? '' : ' (not on your allowlist)'} ${m.message}`);
   return `Recent chat:\n${lines.join('\n')}`;
 }
 
@@ -377,7 +380,7 @@ export function buildSnapshot(bot, config, chatMessages, memories) {
     entitiesSummary(liveEntities(bot), bot.entity.position, entityRadius, config.perception.maxEntities),
     droppedItemsSummary(droppedItems(bot), bot.entity.position, Math.min(entityRadius, 32)),
     memories ?? 'Memories: none',
-    chatSummary(chatMessages)
+    chatSummary(chatMessages, { allowlist: config.allowlist, botName: config.bot?.username })
   ]
     .filter(Boolean)
     .join('\n\n');

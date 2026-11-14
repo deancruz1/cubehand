@@ -8,6 +8,7 @@
     "username": "Clodine"
   },
   "allowlist": ["YourName", "FriendName"],
+  "admins": ["YourName"],
   "claude": {
     "model": "claude-opus-5-5",
     "effort": "medium",
@@ -16,7 +17,10 @@
     "maxTokens": 16000,
     "maxRetries": 2,
     "busyReplies": true,
-    "buildEffort": "high"
+    "buildEffort": "high",
+    "routing": true,
+    "everydayModel": "claude-sonnet-5-5",
+    "quickModel": "claude-haiku-5-5"
   },
   "limits": {
     "maxSteps": 25,
@@ -25,7 +29,7 @@
     "buildMaxSeconds": 1200,
     "queueSize": 3,
     "maxBuildBlocks": 2000,
-    "maxInspectBlocks": 125,
+    "maxInspectBlocks": 600,
     "moveTimeoutSeconds": 90,
     "stuckSeconds": 45,
     "quietSeconds": 60

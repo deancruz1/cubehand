@@ -27,6 +27,26 @@ export function isBuildRequest(text) {
   return BUILD_WORDS.test(text);
 }
 
+const ROUTER_INSTRUCTIONS = `Before you start, sort this request by how much thinking it needs. Reply with exactly one word:
+- SIMPLE, for one or two obvious actions: come here, follow me, stop following, look at something, give or drop an item, eat, sleep, or just chatting and answering a question.
+- NORMAL, for everyday jobs of a few steps: mining, chopping, gathering, crafting, smelting, storing or fetching items, fighting, going somewhere, recording an area.
+- COMPLEX, for anything that needs a plan or taste: building, designing, changing or fixing a build, decorating, carrying on with a build, or a long job with many parts. When unsure, COMPLEX.`;
+
+// Smaller models reject the strict grammar once there are many tools, and only the bigger ones
+// have the server-side refusal fallback.
+const isSmallModel = (model) => /haiku/.test(model);
+const hasFallback = (model) => /opus|fable|mythos/.test(model);
+
+const MAX_NUDGES = 2;
+const CARRY_ON = "You ended your turn by saying what you'll do next, but nothing happens until you do it. Carry on now with your tools, and only reply when the whole job is done or you really need an answer from a player. If you are in fact finished, or waiting on the players, reply with one short sentence saying so.";
+
+// A final reply that only says what comes next ("Next I'll do the shutters.", "The west wall is
+// next.") rather than finishing or asking something.
+export function announcesMore(reply) {
+  if (!reply || reply.includes('?')) return false;
+  return /\b(next|then|after that)\b[^.!]{0,40}\b(I'll|I will|I'm|I am)\b|\b(I'll|I will|I'm going to|I am going to)\b[^.!]{0,20}\b(next|now)\b|\b(is|are) next\b|\bnext up\b/i.test(reply);
+}
+
 export function errorMessage(err) {
   if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {
     return "I couldn't reach my brain: the API key was rejected.";
@@ -57,7 +77,7 @@ export class Brain {
     this.paused = false;
     this.lastJobEnd = Date.now();
     this.lastFreeTime = Date.now();
-    this.system = systemPrompt(config.bot.username);
+    this.system = systemPrompt(config.bot.username, config.admins ?? []);
   }
 
   get busy() {
@@ -105,7 +125,7 @@ export class Brain {
     const { claude } = this.config;
     const job = this.current;
     const response = await this.client.beta.messages.create({
-      model: claude.model,
+      model: this.modelFor('simple'),
       max_tokens: 2000,
       system: this.system,
       messages: [
@@ -179,7 +199,7 @@ export class Brain {
     this.paused = true;
     const job = this.current;
     if (!job) return;
-    if (!job.self) this.queue.unshift({ player: job.player, text: job.text, resumed: true, notes: [...job.notes] });
+    if (!job.self) this.queue.unshift({ player: job.player, text: job.text, resumed: true, notes: [...job.notes], tier: job.tier });
     job.controller.abort('danger');
     await Promise.race([job.done, new Promise((resolve) => setTimeout(resolve, 5000).unref?.())]);
   }
@@ -224,19 +244,54 @@ export class Brain {
     return job.done;
   }
 
-  createMessage(messages, signal, effort = this.config.claude.effort) {
+  // Jobs go to a model by how much thinking they need: simple ones (and sorting messages that
+  // come in mid-job) to the quick model, everyday chores to the everyday model, and building or
+  // anything that needs a plan to the main one. With routing off, everything uses the main model.
+  modelFor(tier) {
+    const { claude } = this.config;
+    if (claude.routing !== true) return claude.model;
+    if (tier === 'simple') return claude.quickModel ?? claude.model;
+    if (tier === 'normal') return claude.everydayModel ?? claude.model;
+    return claude.model;
+  }
+
+  async pickTier({ text, self }, signal) {
+    if (this.config.claude.routing !== true) return 'complex';
+    if (self) return 'normal';
+    if (isBuildRequest(text)) return 'complex';
+    try {
+      const response = await this.client.beta.messages.create(
+        {
+          model: this.modelFor('simple'),
+          max_tokens: 1000,
+          system: this.system,
+          messages: [{ role: 'user', content: `${this.snapshot()}\n\nRequest: ${text}\n\n${ROUTER_INSTRUCTIONS}` }],
+          output_config: { effort: 'low' }
+        },
+        { signal }
+      );
+      const word = response.content.filter((b) => b.type === 'text').map((b) => b.text).join(' ').toUpperCase();
+      if (/\bSIMPLE\b/.test(word)) return 'simple';
+      if (/\bNORMAL\b/.test(word)) return 'normal';
+      return 'complex';
+    } catch (err) {
+      if (!signal?.aborted) this.log(`[brain] couldn't sort the request (${err.message}), using the everyday model`);
+      return 'normal';
+    }
+  }
+
+  createMessage(messages, signal, effort = this.config.claude.effort, model = this.config.claude.model) {
     const { claude } = this.config;
     const params = {
-      model: claude.model,
+      model,
       max_tokens: claude.maxTokens,
       system: this.system,
-      // Smaller models reject the strict grammar once there are many tools.
-      tools: claude.strictTools ? TOOLS : TOOLS.map(({ strict, ...rest }) => rest),
+      tools: claude.strictTools && !isSmallModel(model) ? TOOLS : TOOLS.map(({ strict, ...rest }) => rest),
       messages,
       output_config: { effort },
       cache_control: { type: 'ephemeral' }
     };
-    if (claude.fallback) {
+    if (claude.fallback && hasFallback(model)) {
       params.betas = [FALLBACK_BETA];
       params.fallbacks = 'default';
     }
@@ -261,8 +316,13 @@ export class Brain {
     // by the survival routine, and 'replaced' needs nothing.
   }
 
-  async handle({ player, text, self = false, resumed = false }, signal, job = { notes: [] }) {
+  async handle(request, signal, job = { notes: [] }) {
+    const { player, text, self = false, resumed = false } = request;
     const { limits, claude, idle } = this.config;
+    const tier = request.tier ?? (await this.pickTier(request, signal));
+    if (signal.aborted) return this.endedByAbort(signal, self);
+    job.tier = tier;
+    const model = this.modelFor(tier);
     let build = !self && isBuildRequest(text);
     const buildSeconds = limits.buildMaxSeconds ?? 1200;
     const buildSteps = limits.buildMaxSteps ?? 40;
@@ -279,8 +339,10 @@ export class Brain {
       timer = setTimeout(() => this.current?.controller.abort('time'), Math.max(at - Date.now(), 0));
     };
     setDeadline(deadline);
-    this.log(self ? '[brain] free time' : `[brain] request from ${player}: ${text}${build ? ' (build)' : ''}${resumed ? ' (resumed)' : ''}`);
+    const using = claude.routing === true ? ` [${tier}, ${model}]` : '';
+    this.log(self ? `[brain] free time${using}` : `[brain] request from ${player}: ${text}${build ? ' (build)' : ''}${resumed ? ' (resumed)' : ''}${using}`);
     const ended = () => this.endedByAbort(signal, self);
+    let nudges = 0;
 
     try {
       const ask = self ? FREE_TIME : `Request from ${player}: ${text}${resumed ? RESUMED : ''}`;
@@ -294,7 +356,7 @@ export class Brain {
 
         let response;
         try {
-          response = await this.createMessage(messages, signal, effort);
+          response = await this.createMessage(messages, signal, effort, model);
         } catch (err) {
           if (signal.aborted || err instanceof Anthropic.APIUserAbortError) return ended();
           this.log(`[brain] API error: ${err.message}`);
@@ -328,6 +390,14 @@ export class Brain {
             messages.push({ role: 'user', content: this.takeNotes(job) });
             continue;
           }
+          // A reply that only says what comes next would leave her standing there, so she
+          // gets sent on to do it.
+          if (!self && nudges < MAX_NUDGES && announcesMore(reply)) {
+            nudges++;
+            this.log('[brain] she said what comes next, sending her on');
+            messages.push({ role: 'user', content: CARRY_ON });
+            continue;
+          }
           return;
         }
 
@@ -353,8 +423,15 @@ export class Brain {
             results.push({ type: 'tool_result', tool_use_id: block.id, content: 'Not done, because a player just changed the instructions (see below).', is_error: true });
             continue;
           }
-          this.log(`[tool] ${block.name} ${JSON.stringify(block.input)}`);
           const building = !self && BUILD_TOOLS.has(block.name);
+          // A job that turns out to be a build starts over on the main model. A conversation
+          // can't change model halfway, since the thinking in it belongs to the first one.
+          if (building && tier !== 'complex' && model !== claude.model) {
+            this.log('[brain] this needs building, handing it to the main model');
+            clearTimeout(timer);
+            return this.handle({ ...request, tier: 'complex' }, signal, job);
+          }
+          this.log(`[tool] ${block.name} ${JSON.stringify(block.input)}`);
           // A job that turns into a build, like "carry on", gets the build budget from here on.
           if (building && !build) {
             build = true;

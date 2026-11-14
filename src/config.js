@@ -49,9 +49,18 @@ export function validateConfig(raw, env) {
     throw new ConfigError('config.json protectedBlocks must be a list.');
   }
 
+  if (raw.admins !== undefined && !Array.isArray(raw.admins)) {
+    throw new ConfigError('config.json admins must be a list of player names.');
+  }
+
   return {
     ...raw,
-    claude: { fallback: true, strictTools: true, maxTokens: 16000, maxRetries: 2, busyReplies: true, buildEffort: 'high', ...raw.claude },
+    // Players who may give standing orders and confirm breaking protected blocks.
+    admins: raw.admins ?? raw.allowlist,
+    claude: {
+      fallback: true, strictTools: true, maxTokens: 16000, maxRetries: 2, busyReplies: true, buildEffort: 'high',
+      routing: true, everydayModel: 'claude-sonnet-5-5', quickModel: 'claude-haiku-5-5', ...raw.claude
+    },
     limits: { buildMaxSteps: 40, buildMaxSeconds: 1200, stuckSeconds: 45, quietSeconds: 60, ...raw.limits },
     idle: { enabled: true, freeTimeMinutes: 15, freeTimeSteps: 8, freeTimeSeconds: 240, defendRadius: 10, ...raw.idle },
     survival: { criticalHealth: 8, eatAtFood: 14, ...raw.survival }

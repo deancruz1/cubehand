@@ -208,3 +208,12 @@ test('placing stairs looks the way they should face and clicks the upper half fo
   assert.equal(turned.wrong, true);
   assert.match(turned.message, /came out as oak_stairs\[facing=east,half=top\]/);
 });
+
+test('inspecting a box puts runs of the same block on one line', async () => {
+  const { inspectBlocks } = await import('../src/actions/blocks.js');
+  const bot = { blockAt: (p) => ({ name: p.z < 2 ? 'stone' : 'air' }) };
+  const result = await inspectBlocks({ bot, config: { limits: { maxInspectBlocks: 600 } } }, { x1: 0, y1: 64, z1: 0, x2: 0, y2: 64, z2: 4 });
+  assert.equal(result.message.split('\n').slice(1).join('|'), '0 64 0..1: stone|0 64 2..4: air');
+  const one = await inspectBlocks({ bot, config: { limits: { maxInspectBlocks: 600 } } }, { x1: 0, y1: 64, z1: 3 });
+  assert.equal(one.message, '0 64 3: air');
+});

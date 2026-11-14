@@ -427,3 +427,65 @@ test('rate limit and connection errors get their own messages', async () => {
   await conn.brain.start({ player: 'Steve', text: 'x' });
   assert.match(conn.said[0], /connection problem/);
 });
+
+test('a final reply that only says what comes next sends her on to do it', async () => {
+  const client = fakeClient([
+    reply('end_turn', [{ type: 'text', text: 'I fixed the door. Next I am going over the west wall gaps.' }]),
+    reply('tool_use', [toolUse('a', 'build_structure', { origin: { x: 0, y: 0, z: 0 } })]),
+    reply('end_turn', [{ type: 'text', text: 'West wall done.' }])
+  ]);
+  const { brain, said, toolCalls } = makeBrain({ client });
+  await brain.start({ player: 'Steve', text: 'Clodine fix the walls' });
+  assert.deepEqual(toolCalls.map((t) => t.name), ['build_structure']);
+  assert.deepEqual(said, ['I fixed the door. Next I am going over the west wall gaps.', 'West wall done.']);
+  assert.match(client.calls[1].params.messages.at(-1).content, /Carry on now/);
+});
+
+test('replies that finish or ask something end the job', async () => {
+  const { announcesMore } = await import('../src/brain.js');
+  assert.equal(announcesMore('The west wall gaps are next.'), true);
+  assert.equal(announcesMore("Next I'll put shutters on, unless you'd rather I start the outhouse first."), true);
+  assert.equal(announcesMore("I'll add the eaves now."), true);
+  assert.equal(announcesMore('Done, the house has a porch now.'), false);
+  assert.equal(announcesMore('Should I do the shutters next?'), false);
+  assert.equal(announcesMore("I'm fine."), false);
+});
+
+const routed = { ...baseConfig, claude: { ...baseConfig.claude, routing: true, everydayModel: 'claude-sonnet-5-5', quickModel: 'claude-haiku-5-5' } };
+
+test('simple requests go to the quick model, without the fallback or strict tools it lacks', async () => {
+  const client = fakeClient([reply('end_turn', [{ type: 'text', text: 'SIMPLE' }]), reply('end_turn', [{ type: 'text', text: 'Coming.' }])]);
+  const { brain, said } = makeBrain({ client, config: routed });
+  await brain.start({ player: 'Steve', text: 'Clodine come here' });
+  assert.equal(client.calls[0].params.model, 'claude-haiku-5-5');
+  assert.match(client.calls[0].params.messages[0].content, /SIMPLE, for one or two obvious actions/);
+  const job = client.calls[1].params;
+  assert.equal(job.model, 'claude-haiku-5-5');
+  assert.equal(job.fallbacks, undefined);
+  assert.ok(job.tools.every((t) => t.strict === undefined));
+  assert.deepEqual(said, ['Coming.']);
+});
+
+test('build requests skip the sorting and go straight to the main model', async () => {
+  const client = fakeClient([reply('end_turn', [{ type: 'text', text: 'On it.' }])]);
+  const { brain } = makeBrain({ client, config: routed });
+  await brain.start({ player: 'Steve', text: 'Clodine build a house here' });
+  assert.equal(client.calls.length, 1);
+  assert.equal(client.calls[0].params.model, 'claude-opus-5-5');
+  assert.equal(client.calls[0].params.fallbacks, 'default');
+});
+
+test('an everyday job that turns into a build starts over on the main model', async () => {
+  const client = fakeClient([
+    reply('end_turn', [{ type: 'text', text: 'NORMAL' }]),
+    reply('tool_use', [toolUse('a', 'build_structure', { origin: { x: 0, y: 0, z: 0 } })]),
+    reply('tool_use', [toolUse('b', 'build_structure', { origin: { x: 0, y: 0, z: 0 } })]),
+    reply('end_turn', [{ type: 'text', text: 'Fixed.' }])
+  ]);
+  const { brain, toolCalls } = makeBrain({ client, config: routed });
+  await brain.start({ player: 'Steve', text: 'Clodine fix the west wall' });
+  assert.deepEqual(client.calls.map((c) => c.params.model), ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-opus-5-5']);
+  // The first build call never ran; the main model starts from the request again.
+  assert.equal(toolCalls.length, 1);
+  assert.equal(client.calls[2].params.messages.length, 1);
+});

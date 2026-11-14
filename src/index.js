@@ -7,7 +7,7 @@ import { Brain } from './brain.js';
 import { Memory } from './memory.js';
 import { PlacedLog } from './placed.js';
 import { runAction } from './actions/index.js';
-import { splitMessage } from './actions/chat.js';
+import { chatLines } from './actions/chat.js';
 import { findPlayer } from './actions/movement.js';
 import { smeltSummary } from './actions/furnace.js';
 import { AreaRecorder, TravelLog } from './areas.js';
@@ -43,10 +43,18 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, maxRetries
 let connection;
 const currentBot = () => connection?.getBot();
 
+// Everything the bot says goes through the chat guard first.
 function say(text) {
   const bot = currentBot();
   if (!bot?.entity) return;
-  for (const part of splitMessage(text)) bot.chat(part);
+  const { parts, blocked, reason } = chatLines(text);
+  if (blocked) {
+    log(`[guard] kept out of chat (${blocked}): ${text}`);
+    bot.chat("I'd rather not say that.");
+  } else if (reason === 'too long') {
+    log(`[guard] cut a long reply short: ${text}`);
+  }
+  for (const part of parts) bot.chat(part);
   status.spoke();
 }
 
@@ -58,7 +66,8 @@ const status = new Status({
   stuckSeconds: config.limits.stuckSeconds,
   quietSeconds: config.limits.quietSeconds
 });
-const makeCtx = (signal) => ({ bot: currentBot(), config, signal, memory, placed, areas, smeltJobs, status });
+// requester is the player whose job is running, or null for the bot's own chores.
+const makeCtx = (signal) => ({ bot: currentBot(), config, signal, memory, placed, areas, smeltJobs, status, log, requester: brain.current?.self ? null : brain.current?.player ?? null });
 
 function snapshot() {
   const bot = currentBot();
