@@ -145,6 +145,7 @@ let stopping = false;
 connection = startBot(config, {
   log,
   onCreate: (bot) => {
+    bot.placedLog = placed;
     // Find the sender by UUID instead of parsing the name, so team prefixes don't break it.
     bot.on('messagestr', (message, position, jsonMsg, sender) => {
       log(`[chat:${position}] ${message}`);

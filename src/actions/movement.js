@@ -1,10 +1,27 @@
 import { Vec3 } from 'vec3';
 import pathfinderPkg from 'mineflayer-pathfinder';
+import AStar from 'mineflayer-pathfinder/lib/astar.js';
+import Move from 'mineflayer-pathfinder/lib/move.js';
 import { ok, fail, botPos, guarded, customName, TimeoutError, AbortedError, StalledError } from './util.js';
 import { leaveDrops } from './items.js';
 
 const { GoalNear, GoalFollow } = pathfinderPkg.goals;
 const { Movements } = pathfinderPkg;
+
+// The pathfinder moves each step of a path it hands out (onto the block below, into the doorway)
+// by changing the step itself. A long search hands out its path several times, so the same steps
+// got moved again each time: steps up a ladder crept a block higher every round until they all
+// sat at the top of the shaft. Each path now gets its own copies of the steps.
+const makeResult = AStar.prototype.makeResult;
+AStar.prototype.makeResult = function (...args) {
+  const result = makeResult.apply(this, args);
+  result.path = result.path.map(copyStep);
+  return result;
+};
+
+export function copyStep(m) {
+  return new Move(m.x, m.y, m.z, m.remainingBlocks, m.cost, [...m.toBreak], [...m.toPlace], m.parkour);
+}
 
 export function isHandDoor(name) {
   return name.endsWith('_door') && name !== 'iron_door';
@@ -42,11 +59,32 @@ class DoorMovements extends Movements {
       b.climbable = true;
       b.passage = true;
       b.height = pos.y + dy;
+    } else if (b.name.endsWith('_trapdoor') && isOpen(b)) {
+      // An open trapdoor, like a window shutter, is a thin panel on one side of its block:
+      // nothing to stand on and no room to walk through.
+      b.safe = false;
+      b.physical = false;
     } else if (b.name === 'snow' && deepSnow(b.getProperties().layers)) {
       b.safe = false;
       b.physical = false;
     }
     return b;
+  }
+
+  // Never dig what the bot built itself, even when it's made of something that looks natural,
+  // like a tuff wall.
+  safeToBreak(block) {
+    if (block.position && this.bot.placedLog?.has(block.position, block.name)) return false;
+    return super.safeToBreak(block);
+  }
+
+  // Doors and gates can only be walked through straight on, along the way they face. From the
+  // side, the frame or the open door itself is in the way. Checks the block the move starts in
+  // and the given heights of the block it goes to.
+  intoPassageSideways(node, dir, dys) {
+    const along = dir.x !== 0 ? ['east', 'west'] : ['north', 'south'];
+    const cells = [this.getBlock(node, 0, 0, 0), ...dys.map((dy) => this.getBlock(node, dir.x, dy, dir.z))];
+    return cells.some((b) => b.passage && (isHandDoor(b.name) || isGate(b.name)) && !along.includes(b.getProperties().facing));
   }
 
   // A ladder counts as solid to the pathfinder, so it would happily walk across the top of a
@@ -56,12 +94,17 @@ class DoorMovements extends Movements {
   }
 
   getMoveForward(node, dir, neighbors) {
-    if (this.overLadder(node, dir.x, 0, dir.z)) return;
+    if (this.overLadder(node, dir.x, 0, dir.z) || this.intoPassageSideways(node, dir, [0, 1])) return;
     super.getMoveForward(node, dir, neighbors);
   }
 
+  getMoveDropDown(node, dir, neighbors) {
+    if (this.intoPassageSideways(node, dir, [0, 1])) return;
+    super.getMoveDropDown(node, dir, neighbors);
+  }
+
   getMoveJumpUp(node, dir, neighbors) {
-    if (this.overLadder(node, dir.x, 1, dir.z)) return;
+    if (this.overLadder(node, dir.x, 1, dir.z) || this.intoPassageSideways(node, dir, [1, 2])) return;
     const before = neighbors.length;
     super.getMoveJumpUp(node, dir, neighbors);
     // Three or more snow layers on the step make the jump too high, so clear them first.
