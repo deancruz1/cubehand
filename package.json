@@ -1,0 +1,21 @@
+{
+  "name": "cubehand",
+  "version": "0.1.0",
+  "description": "A Mineflayer bot for Minecraft Java that takes building requests from chat, with Claude deciding what to do.",
+  "type": "module",
+  "main": "src/index.js",
+  "private": true,
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "start": "node --env-file=.env src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0",
+    "mineflayer": "^4.39.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "vec3": "^0.2.0"
+  }
+}

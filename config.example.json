@@ -1,0 +1,55 @@
+{
+  "server": {
+    "host": "localhost",
+    "port": 25568,
+    "version": "26.1"
+  },
+  "bot": {
+    "username": "Clodine"
+  },
+  "allowlist": ["YourName", "FriendName"],
+  "claude": {
+    "model": "claude-opus-5-5",
+    "effort": "medium",
+    "fallback": true,
+    "strictTools": true,
+    "maxTokens": 16000,
+    "maxRetries": 2,
+    "busyReplies": true,
+    "buildEffort": "high"
+  },
+  "limits": {
+    "maxSteps": 25,
+    "maxSeconds": 300,
+    "buildMaxSteps": 40,
+    "buildMaxSeconds": 1200,
+    "queueSize": 3,
+    "maxBuildBlocks": 500,
+    "maxInspectBlocks": 125,
+    "moveTimeoutSeconds": 90,
+    "stuckSeconds": 45,
+    "quietSeconds": 60
+  },
+  "perception": {
+    "blockRadius": 12,
+    "entityRadius": 64,
+    "maxEntities": 20,
+    "chatHistory": 20
+  },
+  "reconnect": {
+    "baseDelaySeconds": 5,
+    "maxDelaySeconds": 60
+  },
+  "idle": {
+    "enabled": true,
+    "freeTimeMinutes": 15,
+    "freeTimeSteps": 8,
+    "freeTimeSeconds": 240,
+    "defendRadius": 10
+  },
+  "survival": {
+    "criticalHealth": 8,
+    "eatAtFood": 14
+  },
+  "protectedBlocks": ["chest", "barrel", "bed", "shulker_box", "spawner", "furnace", "crafting_table"]
+}
