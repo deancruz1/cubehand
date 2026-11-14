@@ -66,13 +66,13 @@ export const TOOLS = [
   ),
   tool(
     'inspect_blocks',
-    'Get the block at x1 y1 z1, or every block in the box from x1 y1 z1 to x2 y2 z2 (small boxes only).',
+    'Get the block at x1 y1 z1, or every block in the box from x1 y1 z1 to x2 y2 z2 (small boxes only), with the way stairs, slabs, logs and trapdoors are turned.',
     { x1: int, y1: int, z1: int, x2: int, y2: int, z2: int },
     ['x1', 'y1', 'z1']
   ),
   tool(
     'place_block',
-    'Place one block from the inventory at x y z. The spot must be empty and next to a solid block.',
+    'Place one block from the inventory at x y z. The spot must be empty and next to a solid block. The block can carry a state, like oak_stairs[facing=north,half=top] (see build_structure).',
     { block: str, x: int, y: int, z: int },
     ['block', 'x', 'y', 'z']
   ),
@@ -90,13 +90,29 @@ export const TOOLS = [
   ),
   tool(
     'build_structure',
-    'Build a structure from a list of blocks placed relative to origin (dx, dy, dz offsets). Placed bottom layer first. Use this for anything bigger than a few blocks.',
+    'Build a structure relative to origin (dx, dy, dz offsets), from parts (shapes) and single blocks. Use this for anything bigger than a few blocks. Parts are boxes from one corner to the other: fill (solid), hollow (a closed shell), walls (four walls, no floor or top), frame (only the edges, for beams and posts), line (a straight or diagonal line), and roof (a gable roof of stairs over the walls from..to: from.dy is the layer just above the wall tops; the ridge runs along the longer side, slabs go on an odd ridge, overhang is 0 to 2, default 1, and fill closes the gable ends and the wall tops under the eaves). Later parts and single blocks win where they overlap, and "air" takes out what came before (doorways, windows). A block can carry a state, like the game writes it: spruce_stairs[facing=east,half=top], oak_slab[type=top], stripped_oak_log[axis=x], spruce_trapdoor[facing=south,half=top,open=true], lantern[hanging=true], oak_door[facing=north]. Stairs face the way they climb (the tall side); half=top is upside down. Trapdoors and wall torches face away from the block they hang on. Logs take axis x, y or z. Placed bottom layer first, then every block is checked and fixed once. Set dry_run to get the exact items needed without building.',
     {
       origin: {
         type: 'object',
         properties: { x: int, y: int, z: int },
         required: ['x', 'y', 'z'],
         additionalProperties: false
+      },
+      parts: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            shape: { type: 'string', enum: ['fill', 'hollow', 'walls', 'frame', 'line', 'roof'] },
+            from: { type: 'object', properties: { dx: int, dy: int, dz: int }, required: ['dx', 'dy', 'dz'], additionalProperties: false },
+            to: { type: 'object', properties: { dx: int, dy: int, dz: int }, required: ['dx', 'dy', 'dz'], additionalProperties: false },
+            block: str,
+            fill: str,
+            overhang: int
+          },
+          required: ['shape', 'from', 'to', 'block'],
+          additionalProperties: false
+        }
       },
       blocks: {
         type: 'array',
@@ -106,13 +122,14 @@ export const TOOLS = [
           required: ['dx', 'dy', 'dz', 'block'],
           additionalProperties: false
         }
-      }
+      },
+      dry_run: { type: 'boolean' }
     },
-    ['origin', 'blocks']
+    ['origin']
   ),
   tool(
     'build_house',
-    'Build a simple survival house: floor, walls, windows, a door, torches, and a flat or stepped gable roof, with ladders between floors. x y z is the middle of the floor at foot level (a standing player\'s position); the floor replaces the ground under it. Clears grass, dirt and other natural blocks out of the way first, and also blocks you placed yourself that don\'t fit the plan, so calling it again over your own house changes that house in place (bigger, more floors, a basement, another door side) and keeps what already fits. Refuses if anything else built or a tree is in the way. Materials default to what you carry most of; give materials to choose (use "none" to leave out the floor, windows or door). Set dry_run to only check the site and get the exact blocks needed. Width and depth are 5 to 15 (default 7), floors 1 to 3, height is the wall height inside each floor, 3 to 5 (default 3). door is the side the door faces (default south). basement digs out one more storey under the ground floor, joined by the ladder. attic lays a floor over the top storey under a gable roof, with a ladder up (needs width and depth of 7 or more). Accent materials: corners for the corner posts (like logs), foundation for the bottom row of the walls and the basement walls (like cobblestone), trim for a band at each floor line and along the top of the walls (like stripped logs).',
+    'Build a simple survival house: floor, walls, windows, a door, torches, and a flat or stepped gable roof, with ladders between floors. x y z is the middle of the floor at foot level (a standing player\'s position); the floor replaces the ground under it. Clears grass, dirt and other natural blocks out of the way first, and also blocks you placed yourself that don\'t fit the plan, so calling it again over your own house changes that house in place (bigger, more floors, a basement, another door side) and keeps what already fits. Refuses if anything else built or a tree is in the way. Materials default to what you carry most of; give materials to choose (use "none" to leave out the floor, windows or door). Set dry_run to only check the site and get the exact blocks needed. Width and depth are 5 to 15 (default 7), floors 1 to 3, height is the wall height inside each floor, 3 to 5 (default 3). door is the side the door faces (default south). basement digs out one more storey under the ground floor, joined by the ladder. attic lays a floor over the top storey under a gable roof, with a ladder up (needs width and depth of 7 or more). Accent materials: corners for the corner posts (like logs), foundation for the bottom row of the walls and the basement walls (like cobblestone), trim for a band at each floor line and along the top of the walls (logs lie along the wall). Details: a stairs block as roof (like spruce_stairs) makes a stair roof that hangs over the walls, with a slab ridge; sills puts a trapdoor, stairs or slab under each window outside; shutters puts open trapdoors beside each window; porch puts a roof (a slab is best) over the door, held up by posts (like a fence) if given; chimney runs a column (like cobblestone or bricks) up the gable end away from the door; lights picks torch or lantern for inside.',
     {
       x: int,
       y: int,
@@ -127,7 +144,10 @@ export const TOOLS = [
       attic: { type: 'boolean' },
       materials: {
         type: 'object',
-        properties: { walls: str, floor: str, roof: str, corners: str, foundation: str, trim: str, windows: str, door: str },
+        properties: {
+          walls: str, floor: str, roof: str, corners: str, foundation: str, trim: str, windows: str, door: str,
+          sills: str, shutters: str, porch: str, posts: str, chimney: str, lights: str
+        },
         additionalProperties: false
       },
       dry_run: { type: 'boolean' }

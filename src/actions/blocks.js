@@ -3,6 +3,7 @@ import pathfinderPkg from 'mineflayer-pathfinder';
 import { ok, fail, posText, pause } from './util.js';
 import { walkTo, isGate, isOpen, SCAFFOLD_BLOCKS } from './movement.js';
 import { collectDrops } from './items.js';
+import { parseBlock, blockText, stateText, stateProblem, matchesState, placementOptions, itemFor } from './states.js';
 
 const { GoalPlaceBlock, GoalLookAtBlock, GoalNear } = pathfinderPkg.goals;
 
@@ -72,7 +73,7 @@ export async function inspectBlocks({ bot, config }, { x1, y1, z1, x2, y2, z2 })
     for (let x = ax; x <= bx; x++) {
       for (let z = az; z <= bz; z++) {
         const block = bot.blockAt(new Vec3(x, y, z), false);
-        lines.push(`${x} ${y} ${z}: ${block ? block.name : 'not loaded'}`);
+        lines.push(`${x} ${y} ${z}: ${block ? stateText(block) : 'not loaded'}`);
       }
     }
   }
@@ -84,18 +85,39 @@ function isFullBlock(block) {
   return s.length === 1 && s[0][0] === 0 && s[0][1] === 0 && s[0][2] === 0 && s[0][3] === 1 && s[0][4] === 1 && s[0][5] === 1;
 }
 
-// A solid neighbor to place against. Ladders only go on the side of a full block; attach
-// (a direction like 0 0 -1) picks which side when it matters.
-export function findReference(bot, pos, name, attach) {
+// A solid neighbor to place against, from the ways to place the block (see placementOptions).
+// Ladders only go on the side of a full block; attach (a direction like 0 0 -1) picks which
+// side when it matters. A slab clicked onto the same slab would join it into a double slab.
+export function findReference(bot, pos, name, attach, options) {
   const ladder = name === 'ladder';
-  const faces = attach ? [attach] : ladder ? FACES.filter((f) => f.y === 0) : FACES;
-  for (const dir of faces) {
-    const neighbor = bot.blockAt(pos.plus(dir), false);
+  const ways = attach ? [{ dir: attach }] : options ?? (ladder ? FACES.filter((f) => f.y === 0) : FACES).map((dir) => ({ dir }));
+  for (const how of ways) {
+    const neighbor = bot.blockAt(pos.plus(how.dir), false);
     if (!neighbor || neighbor.boundingBox !== 'block') continue;
     if (ladder && !isFullBlock(neighbor)) continue;
-    return { reference: neighbor, face: dir.scaled(-1) };
+    if (name.endsWith('_slab') && neighbor.name === name) continue;
+    return { reference: neighbor, face: how.dir.scaled(-1), how };
   }
   return null;
+}
+
+// Clicks the reference block so the new block comes out in the wanted state: on the upper or
+// lower half of a side face for top and bottom halves, looking the wanted way for stairs,
+// doors and the like.
+async function clickToPlace(bot, ref) {
+  const { how, reference, face } = ref;
+  if (how.yaw === undefined && !how.half) return bot.placeBlock(reference, face);
+  let dy = 0.5 + face.y * 0.5;
+  if (face.y === 0 && how.half) dy += how.half === 'top' ? 0.25 : -0.25;
+  let forceLook;
+  if (how.yaw !== undefined) {
+    const point = reference.position.offset(0.5 + face.x * 0.5, dy, 0.5 + face.z * 0.5);
+    const eye = bot.entity.position.offset(0, bot.entity.height ?? 1.62, 0);
+    const d = point.minus(eye);
+    await bot.look(how.yaw, Math.atan2(d.y, Math.sqrt(d.x * d.x + d.z * d.z)));
+    forceLook = 'ignore';
+  }
+  return bot._placeBlockWithOptions(reference, face, { half: how.half, forceLook, swingArm: 'right' });
 }
 
 // True when the bot's body is in the block at pos, so nothing can be placed there.
@@ -105,11 +127,19 @@ function standingIn(bot, pos) {
 }
 
 // Shared by place_block, build_structure and build_house. Assumes the block name is known.
-export async function placeOne(ctx, name, pos, { attach } = {}) {
+// props is the wanted state (facing, half, axis, type, open, hanging), see states.js.
+export async function placeOne(ctx, name, pos, { attach, props } = {}) {
   const { bot } = ctx;
   let target = bot.blockAt(pos, false);
   if (!target) return fail(`position not loaded: ${posText(pos)}`);
-  if (target.name === name) return ok(`already ${name} at ${posText(pos)}`);
+  if (matchesState(target, name, props)) return ok(`already ${name} at ${posText(pos)}`);
+  // The right block turned the wrong way: its own blocks get redone, anyone else's stay.
+  if (target.name === name) {
+    if (!ctx.placed?.has(pos, name)) return fail(`position occupied by ${stateText(target)}: ${posText(pos)}`);
+    const dug = await digBlock(ctx, pos);
+    if (!dug.ok) return dug;
+    target = bot.blockAt(pos, false);
+  }
   // Snow deeper than one layer can't be built into, so dig it out first.
   if (target.name === 'snow' && target.getProperties().layers > 1) {
     const dug = await digBlock(ctx, pos);
@@ -118,10 +148,12 @@ export async function placeOne(ctx, name, pos, { attach } = {}) {
   }
   if (!REPLACEABLE.has(target.name)) return fail(`position occupied by ${target.name}: ${posText(pos)}`);
 
-  const item = bot.inventory.items().find((i) => i.name === name);
-  if (!item) return fail(`missing item: ${name}`);
+  const itemName = itemFor(name, bot.registry);
+  const item = bot.inventory.items().find((i) => i.name === itemName);
+  if (!item) return fail(`missing item: ${itemName}`);
 
-  if (!findReference(bot, pos, name, attach)) return fail(`no block to place against at ${posText(pos)}`);
+  const options = props && Object.keys(props).length ? placementOptions(name, props) : undefined;
+  if (!findReference(bot, pos, name, attach, options)) return fail(`no block to place against at ${posText(pos)}`);
 
   if (!inReach(bot, pos) || standingIn(bot, pos)) {
     const walked = await walkTo(ctx, new GoalPlaceBlock(pos, bot.world, { range: 4 }), { place: 'climb' });
@@ -130,24 +162,39 @@ export async function placeOne(ctx, name, pos, { attach } = {}) {
   }
 
   // Re-check after walking, the pathfinder may have changed things nearby.
-  const ref = findReference(bot, pos, name, attach);
+  const ref = findReference(bot, pos, name, attach, options);
   if (!ref) return fail(`no block to place against at ${posText(pos)}`);
 
   try {
     await bot.equip(item, 'hand');
-    await bot.placeBlock(ref.reference, ref.face);
+    await clickToPlace(bot, ref);
   } catch (err) {
     const placed = bot.blockAt(pos, false);
     if (placed?.name !== name) return fail(`could not place at ${posText(pos)}: ${err.message}`);
   }
   ctx.placed?.add(name, pos);
   await pause(80, 200);
-  return ok(`placed ${name} at ${posText(pos)}`);
+
+  let placed = bot.blockAt(pos, false);
+  if (props?.open !== undefined && placed?.name === name && !name.startsWith('iron_') && String(placed.getProperties?.().open) !== props.open) {
+    try {
+      await bot.activateBlock(placed);
+      await pause(150, 250);
+      placed = bot.blockAt(pos, false);
+    } catch {}
+  }
+  if (props && !matchesState(placed, name, props)) {
+    return { ...ok(`placed ${name} at ${posText(pos)}, but it came out as ${stateText(placed)} instead of ${blockText(name, props)}`), wrong: true };
+  }
+  return ok(`placed ${props ? blockText(name, props) : name} at ${posText(pos)}`);
 }
 
 export async function placeBlock(ctx, { block, x, y, z }) {
-  if (!ctx.bot.registry.blocksByName[block]) return fail(`unknown block: ${block}`);
-  return placeOne(ctx, block, new Vec3(x, y, z));
+  const { name, props } = parseBlock(block);
+  if (!ctx.bot.registry.blocksByName[name]) return fail(`unknown block: ${name}`);
+  const problem = stateProblem(ctx.bot.registry, name, props);
+  if (problem) return fail(problem);
+  return placeOne(ctx, name, new Vec3(x, y, z), { props });
 }
 
 // "log" matches oak_log, spruce_log and so on; "chest" matches chest and trapped_chest.

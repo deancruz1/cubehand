@@ -24,7 +24,7 @@
     "buildMaxSteps": 40,
     "buildMaxSeconds": 1200,
     "queueSize": 3,
-    "maxBuildBlocks": 500,
+    "maxBuildBlocks": 2000,
     "maxInspectBlocks": 125,
     "moveTimeoutSeconds": 90,
     "stuckSeconds": 45,
