@@ -442,6 +442,18 @@ export function scaffoldSummary(entries, here) {
   return `Scaffolding left standing from walks: ${count}, nearest ${near.name} at ${near.x} ${near.y} ${near.z} (${Math.round(dist(near))} away). It comes down in free time.`;
 }
 
+// One line about the standing job (see standing.js), so any job can answer questions about it or
+// change it. Nothing when there is none.
+export function standingSummary(job, max = 160) {
+  if (!job) return null;
+  const cut = (text) => {
+    const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+    return flat.length > max ? `${flat.slice(0, max - 3).trimEnd()}...` : flat;
+  };
+  const state = job.state === 'paused' ? `paused${job.reason ? `: ${cut(job.reason)}` : ''}` : 'active';
+  return `Standing job (${state}; from ${job.by}, ${job.rounds} rounds so far): ${cut(job.task)} Progress: ${cut(job.progress)}`;
+}
+
 export function buildSnapshot(bot, config, chatMessages, memories) {
   const origin = bot.entity.position.floored();
   const radius = config.perception.blockRadius;

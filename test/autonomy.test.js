@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { Vec3 } from 'vec3';
 import { outlineFrom, inArea, areaBounds, AreaRecorder, TravelLog } from '../src/areas.js';
 import { Memory } from '../src/memory.js';
@@ -509,6 +509,48 @@ test('scaffolding she left comes down in free time, never during a job, a hold o
   }
 });
 
+test('with a standing job active, chores still come first and rounds take the place of model free time', async () => {
+  const path = tempPath('standing-scaffold');
+  const scaffold = new ScaffoldLog(path);
+  try {
+    scaffold.add('dirt', new Vec3(4, 64, 0), 'overworld');
+    const bot = hurtBot({ health: 20, food: 20, game: { dimension: 'overworld' }, time: { timeOfDay: 6000 }, isRaining: false, players: { Steve: {} } });
+    bot.blockAt = (p) => ({ name: p.x === 4 && p.y === 64 && p.z === 0 ? 'dirt' : 'air', position: p });
+    let rounds = 0;
+    let frees = 0;
+    const brain = {
+      busy: false, paused: false, queue: [], lastJobEnd: 0, lastFreeTime: 0, standingActive: true,
+      standingRound: () => rounds++,
+      freeTime: () => frees++
+    };
+    const lines = [];
+    const config = { idle: { enabled: true, freeTimeMinutes: 15 }, survival: { eatAtFood: 14 }, allowlist: ['Steve'] };
+    const idle = new Idle({ getBot: () => bot, brain, survival: { recovering: false }, config, makeCtx: () => ({ bot }), log: (line) => lines.push(line), smeltJobs: new Map(), scaffold });
+    idle.tidy = async () => idle.later('tidy', 60000);
+    idle.tick();
+    assert.deepEqual(lines, ['[idle] take down scaffolding I left']);
+    assert.equal(rounds, 0);
+    await idle.running.done;
+    idle.tick();
+    assert.deepEqual([rounds, frees], [1, 0]);
+    assert.equal(idle.running, null);
+
+    // Without one, the same quiet spell is model free time.
+    brain.standingActive = false;
+    idle.tick();
+    assert.deepEqual([rounds, frees], [1, 1]);
+
+    // With chores off, rounds still start.
+    brain.standingActive = true;
+    config.idle.enabled = false;
+    idle.tick();
+    assert.deepEqual([rounds, frees], [2, 1]);
+  } finally {
+    scaffold.save();
+    rmSync(path, { force: true });
+  }
+});
+
 test('the line about backing off goes to whoever whispered the job', async () => {
   const heard = [];
   for (const replyTo of ['Steve', null]) {
@@ -635,5 +677,54 @@ test('a furnace that never opens is given up on with a clear result', async () =
     assert.match(result.message, /the furnace at 0 64 2 wouldn't open/);
   } finally {
     setPauseScale(1);
+  }
+});
+
+test('notes are tidied in free time when due, never with a standing job active, at most once a day, and the call goes in the job log', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cubehand-note-backups-'));
+  const path = tempPath('notes');
+  try {
+    const memory = new Memory(path);
+    memory.notes = Array.from({ length: 21 }, (_, i) => ({ name: `spot ${i}`, note: `place ${i}` }));
+    const bot = hurtBot({ health: 20, food: 20, game: { dimension: 'overworld' }, time: { timeOfDay: 6000 }, isRaining: false });
+    bot.blockAt = (p) => ({ name: 'air', position: p });
+    const calls = [];
+    const written = [];
+    const brain = {
+      busy: false, paused: false, queue: [], lastJobEnd: Date.now(), lastFreeTime: Date.now(), standingActive: true,
+      standingRound: () => {},
+      modelFor: (tier) => (tier === 'normal' ? 'claude-sonnet-5-5' : 'claude-haiku-5-5'),
+      client: { beta: { messages: { create: async (params) => (calls.push(params), { model: 'claude-sonnet-5-5', content: [{ type: 'text', text: '[]' }], usage: { input_tokens: 900, output_tokens: 5 } }) } } },
+      writeRecord: (record, end, extra) => written.push({ ...record.finish(end), ...extra })
+    };
+    const lines = [];
+    const config = { idle: { enabled: true, freeTimeMinutes: 0 }, survival: { eatAtFood: 14 }, allowlist: [] };
+    const idle = new Idle({ getBot: () => bot, brain, survival: { recovering: false }, config, makeCtx: (signal) => ({ bot, signal }), log: (line) => lines.push(line), smeltJobs: new Map(), memory, noteBackups: dir });
+    idle.later('stroll', 60000);
+    idle.tick();
+    assert.equal(idle.running, null);
+    brain.standingActive = false;
+    idle.until.delete('notes');
+    brain.busy = true;
+    idle.tick();
+    assert.equal(idle.running, null);
+    brain.busy = false;
+    idle.tick();
+    assert.ok(idle.running);
+    await idle.running.done;
+    assert.deepEqual(lines, ['[idle] tidy my notes', '[memory] nothing in the notes to merge']);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].model, 'claude-sonnet-5-5');
+    assert.equal(written.length, 1);
+    assert.equal(written[0].end, 'tidy');
+    assert.equal(written[0].merged, 0);
+    assert.equal(written[0].calls[0].kind, 'tidy');
+    idle.until.delete('notes');
+    idle.tick();
+    assert.equal(idle.running, null);
+    assert.equal(calls.length, 1);
+  } finally {
+    rmSync(path, { force: true });
+    rmSync(dir, { recursive: true, force: true });
   }
 });

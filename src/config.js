@@ -77,6 +77,25 @@ export function validateConfig(raw, env) {
     const value = raw.learning?.[key];
     if (value !== undefined && typeof value !== 'boolean') throw new ConfigError(`config.json learning.${key} must be true or false.`);
   }
+  for (const key of ['sessionHours', 'lockMinutes']) {
+    const value = raw.security?.[key];
+    if (value !== undefined && !(typeof value === 'number' && value > 0)) throw new ConfigError(`config.json security.${key} must be a number above 0.`);
+  }
+  const tries = raw.security?.maxTries;
+  if (tries !== undefined && !(Number.isInteger(tries) && tries > 0)) {
+    throw new ConfigError('config.json security.maxTries must be a whole number above 0.');
+  }
+  if (raw.standing?.enabled !== undefined && typeof raw.standing.enabled !== 'boolean') {
+    throw new ConfigError('config.json standing.enabled must be true or false.');
+  }
+  for (const key of ['maxHours', 'maxCostUsd']) {
+    const value = raw.standing?.[key];
+    if (value !== undefined && !(typeof value === 'number' && value > 0)) throw new ConfigError(`config.json standing.${key} must be a number above 0.`);
+  }
+  const sayEvery = raw.standing?.sayEveryMin;
+  if (sayEvery !== undefined && !(typeof sayEvery === 'number' && sayEvery >= 0)) {
+    throw new ConfigError('config.json standing.sayEveryMin must be a number, 0 or more.');
+  }
 
   return {
     ...raw,
@@ -98,7 +117,14 @@ export function validateConfig(raw, env) {
     survival: { criticalHealth: 8, eatAtFood: 14, ...raw.survival },
     // lessons are one-line notes she writes after a job goes wrong, shown to later jobs that fit.
     // skills are routines of her own tool calls she saves and runs again in one call.
-    learning: { lessons: true, skills: true, ...raw.learning }
+    learning: { lessons: true, skills: true, ...raw.learning },
+    // Only used with a passphrase in CUBEHAND_PASSPHRASE: how long a player stays verified, and how
+    // many wrong tries lock a name out for lockMinutes.
+    security: { sessionHours: 12, maxTries: 5, lockMinutes: 10, ...raw.security },
+    // A standing job is work she keeps doing in rounds until told to stop. It pauses after maxHours
+    // or maxCostUsd since it started or was last resumed, and a round's own line is said at most
+    // once every sayEveryMin minutes.
+    standing: { enabled: true, maxHours: 4, maxCostUsd: 5, sayEveryMin: 5, ...raw.standing }
   };
 }
 

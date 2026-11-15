@@ -1,9 +1,11 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { loadConfig, ConfigError } from './config.js';
-import { startBot, isWhisperLine } from './connection.js';
-import { ChatHistory, RequestLog, classifyMessage, chatBody } from './chat.js';
-import { buildSnapshot } from './perception.js';
+import { startBot, readChat } from './connection.js';
+import { Auth } from './auth.js';
+import { ChatHistory, RequestLog, classifyMessage } from './chat.js';
+import { buildSnapshot, standingSummary } from './perception.js';
 import { Brain } from './brain.js';
+import { Standing } from './standing.js';
 import { Memory } from './memory.js';
 import { PlacedLog, ScaffoldLog } from './placed.js';
 import { ChestIndex } from './chests.js';
@@ -49,12 +51,15 @@ const memory = new Memory();
 const placed = new PlacedLog();
 const scaffold = new ScaffoldLog();
 const chests = new ChestIndex();
+const standing = new Standing('standing.json');
 const areas = new AreaRecorder();
 const travel = new TravelLog();
 const smeltJobs = new Map();
 const lessons = config.learning.lessons ? new Lessons('lessons.json', { ignore: [config.bot.username, ...config.allowlist], log }) : null;
 const skills = config.learning.skills ? new Skills({ tools: TOOLS }) : null;
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, maxRetries: config.claude.maxRetries });
+// Off unless CUBEHAND_PASSPHRASE is set. The passphrase stays here and never goes into config.
+const auth = new Auth({ passphrase: process.env.CUBEHAND_PASSPHRASE, allowlist: config.allowlist, admins: config.admins, botName: config.bot.username, ...config.security, log });
 
 let connection;
 const currentBot = () => connection?.getBot();
@@ -83,7 +88,8 @@ const status = new Status({
   getBot: currentBot,
   say: (text) => say(text, brain.replyTo),
   log,
-  isBusy: () => brain.busy && !brain.current?.self,
+  // Rounds of the standing job don't fill the silences either: a player wouldn't narrate every tunnel.
+  isBusy: () => brain.busy && !brain.current?.self && !brain.current?.standing,
   stuckSeconds: config.limits.stuckSeconds,
   quietSeconds: config.limits.quietSeconds
 });
@@ -92,7 +98,7 @@ const makeCtx = (signal) => ({ bot: currentBot(), config, signal, memory, placed
 
 function snapshot() {
   const bot = currentBot();
-  const notes = [status.summary(), memory.summary(bot.entity.position), skills?.summary(), requests.summary(), areas.status(), travel.summary(), smeltSummary(smeltJobs)].filter(Boolean).join('\n\n');
+  const notes = [status.summary(), standingSummary(brain.standingJob), memory.summary(bot.entity.position), skills?.summary(), requests.summary(), areas.status(), travel.summary(), smeltSummary(smeltJobs)].filter(Boolean).join('\n\n');
   return buildSnapshot(bot, config, history.list(), notes);
 }
 
@@ -115,7 +121,10 @@ const brain = new Brain({
   jobLog: new JobLog('jobs.jsonl', log),
   refusalLog: new RefusalLog('logs/refusals', 20, log),
   forgetRequests: (before) => requests.forget(before),
+  forgetChat: (before) => history.forget(before),
   lessons,
+  standing,
+  skills,
   say,
   snapshot,
   runTool: (name, input, signal, requester) => {
@@ -146,7 +155,7 @@ const survival = new Survival({
     return idle.interrupt();
   }
 });
-const idle = new Idle({ getBot: currentBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold, reflexWalking: () => reflex.walking });
+const idle = new Idle({ getBot: currentBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold, memory, reflexWalking: () => reflex.walking });
 const reflex = new Reflex({ getBot: currentBot, brain, idle, config, makeCtx, log, say });
 const gestures = new Gestures({ getBot: currentBot, brain, survival, idle, config, toolRunning: () => Boolean(status.run || brain.current?.tool || reflex.walking) });
 survival.start();
@@ -158,20 +167,27 @@ setInterval(() => {
 }, 5000);
 
 function onMessage(username, message, whisper) {
-  const result = classifyMessage({ username, message, whisper }, { botName: config.bot.username, allowlist: config.allowlist });
+  // With a passphrase set, a player on the allowlist who hasn't whispered it counts as off the
+  // list for everything below, and a whisper about the passphrase goes no further than here.
+  const screen = auth.screen({ username, message, whisper });
+  for (const { text, to } of screen.replies) say(text, to);
+  if (screen.drop) return;
+  message = screen.message;
+  const allowlist = auth.trustedList();
+  const result = classifyMessage({ username, message, whisper }, { botName: config.bot.username, allowlist });
   // Keep the bot's own lines too, so the next request knows what it last said.
-  if (!whisper) history.add(username, message);
+  if (!whisper) history.add(auth.label(username), message);
   if (result.type === 'ignore') return;
   // "no, the other chest" counts against the job it's about, named or not. It goes in before the
   // message itself, which can start a new job of theirs.
-  const allowed = config.allowlist.some((p) => p.toLowerCase() === username.toLowerCase());
+  const allowed = allowlist.some((p) => p.toLowerCase() === username.toLowerCase());
   if (allowed && result.type !== 'stop' && isCorrection(message, [config.bot.username])) brain.correct(username, message);
   gestures.notice(username);
   if (result.type === 'stop') {
     // Stand still for a bit instead of going straight back to chores.
     idle.hold(60000);
     reflex.cancel();
-    brain.stop(whisper ? username : null);
+    brain.stop(whisper ? username : null, username);
   } else if (result.type === 'request') {
     // Where they stood, so "here" or "this hill" still means something later.
     const bot = currentBot();
@@ -197,20 +213,23 @@ connection = startBot(config, {
     bot.placedLog = placed;
     bot.walkScaffold = scaffold;
     bot.chestIndex = chests;
-    // Find the sender by UUID instead of parsing the name, so team prefixes don't break it.
+    // Find the sender by UUID instead of parsing the name, so team prefixes don't break it. Whispers
+    // are read here too: Mineflayer's whisper event takes the name from the text, which public
+    // chat, a "/me" or a server line can fake, so it is not used.
+    let warnedNoSender = false;
     bot.on('messagestr', (message, position, jsonMsg, sender) => {
-      log(`[chat:${position}] ${message}`);
-      if (position !== 'chat') return;
-      const username = Object.values(bot.players).find((p) => p.uuid === sender)?.username;
-      if (!username) {
+      log(`[chat:${position}] ${auth.mask(message)}`);
+      const line = readChat(bot.players, message, position, sender);
+      if (line?.unknown) {
         log(`[chat] could not tell who sent that (sender id: ${sender ?? 'none'})`);
-        return;
+      } else if (line?.serverWhisper) {
+        if (!warnedNoSender) log('[chat] a whisper came in as a server line with no sender id, so it was not used');
+        warnedNoSender = true;
+      } else if (line) {
+        onMessage(line.username, line.text, line.whisper);
       }
-      // Whispers come this way too, and are handled by the whisper event below.
-      if (isWhisperLine(message, username)) return;
-      onMessage(username, chatBody(message, username), false);
     });
-    bot.on('whisper', (username, message) => onMessage(username, message, true));
+    bot.on('playerLeft', (player) => auth.left(player?.username));
     bot.on('move_stuck', (text) => {
       log(`[move] ${text}`);
       status.noteStuck(text);
@@ -234,10 +253,12 @@ connection = startBot(config, {
   },
   onDeath: () => {
     brain.abortCurrent('death');
+    brain.died();
     reflex.cancel();
     idle.interrupt();
   },
   onEnd: ({ reconnecting }) => {
+    auth.reset();
     reflex.cancel();
     if (!reconnecting) {
       brain.close();

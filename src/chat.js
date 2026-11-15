@@ -66,6 +66,44 @@ export function reflexFor(message, botName) {
   return Object.keys(REFLEXES).find((kind) => REFLEXES[kind].test(words)) ?? null;
 }
 
+const WORK_LEAD = String.raw`^(?:(?:ok|okay|yes|yeah|so|now|then|and|also|just|please|go|start|keep|can you|could you|would you|will you|you can)\s+)*`;
+// "mine" as the pronoun ("mine is the red one") is not an order.
+const WORK_VERB = String.raw`(?:mine(?! (?:is|was|are|has|had|too|either)\b)|mining|dig|digging|tunnel|chop|chopping|gather|collect|craft|smelt|store|deposit|fetch)\b`;
+const WORK = new RegExp(`${WORK_LEAD}${WORK_VERB}`);
+const STRIP_MINE = /(?<!\b(?:stop|quit|no more|don't|dont|do not|never)\s+)\bstrip[ -]?min(?:e|es|ing)\b/;
+const CONTINUE = new RegExp(`${WORK_LEAD}(?:continue|resume|proceed|keep going|carry on)(?: (?:it|that|with it|on|now|please|where you left off))*$`);
+
+// The parts of a message between punctuation, in lower case without the bot's name.
+function clauses(message, name) {
+  return message
+    .toLowerCase()
+    .replace(new RegExp(`@?\\b${name}\\b`, 'gi'), ' ')
+    .split(/[.,;:!]+/)
+    .map((c) => c.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
+
+// 'work' for an obvious order to mine, dig, chop, gather, craft, smelt, store or fetch ("strip mine
+// autonomously", "dig only y -58 and y -59", "continue the strip mine"), 'continue' for a bare
+// "continue", "resume" or "proceed", and null for anything else: questions, chat, rules meant to
+// last and other orders stay with the quick model.
+export function workOrder(message, botName) {
+  if (!message || message.includes('?') || isStandingOrder(message, botName)) return null;
+  const name = escapeRegex(botName);
+  if (QUESTION.test(plainWords(message, name))) return null;
+  const parts = clauses(message, name);
+  if (parts.some((c) => STRIP_MINE.test(c) || WORK.test(c))) return 'work';
+  return parts.length === 1 && CONTINUE.test(parts[0]) ? 'continue' : null;
+}
+
+const THOUGHT_QUESTION = /\b(?:thought process|(?:your|ur) reasoning|chain of thought|what (?:are|were|r) (?:you|u) thinking|(?:disclose|reveal|show)(?: me| us)? (?:your|ur) (?:thinking|thoughts))\b/;
+export const THOUGHT_SUMMARY = 'asked what I was doing';
+
+// A request that asks for her reasoning ("what is your thought process", "reveal your thinking").
+export function asksForThoughts(message) {
+  return THOUGHT_QUESTION.test(String(message ?? '').toLowerCase());
+}
+
 // The chat line can carry team prefixes like "<<Team> Name> hi", so cut everything up to "Name> ".
 export function chatBody(line, username) {
   const marker = `${username}> `;
@@ -79,9 +117,14 @@ export class ChatHistory {
     this.messages = [];
   }
 
-  add(username, message) {
-    this.messages.push({ username, message });
+  add(username, message, now = Date.now()) {
+    this.messages.push({ username, message, time: now });
     if (this.messages.length > this.limit) this.messages.shift();
+  }
+
+  // Drops the lines said up to before.
+  forget(before = Date.now()) {
+    this.messages = this.messages.filter((m) => m.time > before);
   }
 
   list() {
@@ -98,8 +141,9 @@ export class RequestLog {
     this.entries = path && existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : [];
   }
 
+  // A request for her reasoning is kept only as a neutral line, so later jobs don't carry its wording.
   add(player, text, pos, now = Date.now()) {
-    const entry = { time: now, player, text };
+    const entry = { time: now, player, text: asksForThoughts(text) ? THOUGHT_SUMMARY : text };
     if (pos) entry.pos = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
     this.entries = [...this.entries, entry].filter((e) => now - e.time <= KEEP_REQUESTS_MS).slice(-MAX_REQUESTS);
     if (this.path) writeFileSync(this.path, JSON.stringify(this.entries, null, 2));

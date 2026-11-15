@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 // US dollars per million tokens. Cache writes cost more for the 1 hour lifetime than for 5 minutes.
@@ -61,11 +61,13 @@ function addTokens(total, tokens) {
 
 // One job from start to end: every model call (steps, mid-job replies) and every tool.
 export class JobRecord {
-  constructor({ player = null, text = null, self = false, reflex = null } = {}) {
+  constructor({ player = null, text = null, self = false, reflex = null, standing = false } = {}) {
     this.startedAt = Date.now();
     this.player = player;
     this.text = text;
     this.self = self;
+    // A round of the standing job (see standing.js), whose text is that job's task.
+    this.standing = standing;
     // 'come', 'follow' or 'stay' when the body acted on the order before the model was asked.
     this.reflex = reflex;
     // Times the job was put on hold (low health, a lost connection) and how long in all.
@@ -96,7 +98,9 @@ export class JobRecord {
     this.calls.push({ kind, model, ms, tokens, cost: costOf(model, tokens) });
   }
 
-  // firstMs is how long the first text or tool call of the answer took to come in.
+  // firstMs is how long the first text or tool call of the answer took to come in. The brain adds
+  // one entry to tools for each call, { name, ok, ms, error }, with interrupted: true when it
+  // stopped the call from outside (a player's change, a hold, a stop) rather than the tool failing.
   step(model, usage, ms, firstMs = ms) {
     const tokens = meters(usage);
     const step = { model, ms, firstMs, tokens, cost: costOf(model, tokens), tools: [] };
@@ -132,6 +136,7 @@ export class JobRecord {
       ...(this.reply ? { reply: this.reply } : {}),
       ...(this.nudges ? { nudges: this.nudges } : {}),
       ...(this.reflex ? { reflex: this.reflex } : {}),
+      ...(this.standing ? { standing: true } : {}),
       ...(this.refusals.length ? { refusals: { count: this.refusals.length, by: this.refusals, ...(this.leanCured ? { leanCured: true } : {}) } } : {}),
       ms: Date.now() - this.startedAt,
       calls: this.calls,
@@ -154,11 +159,15 @@ export function summaryLine(line) {
   );
 }
 
-// One JSON line per job. A file problem is logged and never stops a job.
+// One JSON line per job. A file problem is logged and never stops a job. The newest lines are
+// kept in memory too, up to keep of them, for recent().
 export class JobLog {
-  constructor(path = 'jobs.jsonl', log = console.log) {
+  constructor(path = 'jobs.jsonl', log = console.log, { keep = 200, tailBytes = 2 * 1024 * 1024 } = {}) {
     this.path = path;
     this.log = log;
+    this.keep = keep;
+    this.tailBytes = tailBytes;
+    this.kept = null;
   }
 
   write(line) {
@@ -167,6 +176,43 @@ export class JobLog {
     } catch (err) {
       this.log(`[joblog] couldn't write ${this.path}: ${err.message}`);
     }
+    if (this.kept) {
+      this.kept.push(line);
+      if (this.kept.length > this.keep) this.kept.shift();
+    }
+  }
+
+  // The newest lines, oldest first. The first call reads the end of the file once, at most
+  // tailBytes of it; after that the lines come from memory.
+  recent() {
+    if (!this.kept) this.kept = readTail(this.path, this.tailBytes).slice(-this.keep);
+    return this.kept;
+  }
+}
+
+function readTail(path, bytes) {
+  let fd = null;
+  try {
+    if (!existsSync(path)) return [];
+    const size = statSync(path).size;
+    const start = Math.max(0, size - bytes);
+    const buffer = Buffer.alloc(size - start);
+    fd = openSync(path, 'r');
+    readSync(fd, buffer, 0, buffer.length, start);
+    const lines = buffer.toString('utf8').split('\n');
+    // The first line is likely cut off when the read starts mid-file.
+    if (start > 0) lines.shift();
+    return lines.flatMap((text) => {
+      try {
+        return text.trim() ? [JSON.parse(text)] : [];
+      } catch {
+        return [];
+      }
+    });
+  } catch {
+    return [];
+  } finally {
+    if (fd !== null) closeSync(fd);
   }
 }
 

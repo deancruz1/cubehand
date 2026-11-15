@@ -66,5 +66,16 @@
     "lessons": true,
     "skills": true
   },
+  "security": {
+    "sessionHours": 12,
+    "maxTries": 5,
+    "lockMinutes": 10
+  },
+  "standing": {
+    "enabled": true,
+    "maxHours": 4,
+    "maxCostUsd": 5,
+    "sayEveryMin": 5
+  },
   "protectedBlocks": ["chest", "barrel", "bed", "shulker_box", "spawner", "furnace", "crafting_table"]
 }

@@ -118,6 +118,38 @@ test('streaming defaults to on and can be turned off', () => {
   assert.equal(validateConfig(raw, env).claude.streaming, false);
 });
 
+test('security defaults to 12 hours, 5 tries and 10 minutes, and each must be above 0', () => {
+  const raw = copy();
+  assert.deepEqual(validateConfig(raw, env).security, { sessionHours: 12, maxTries: 5, lockMinutes: 10 });
+  delete raw.security;
+  assert.deepEqual(validateConfig(raw, env).security, { sessionHours: 12, maxTries: 5, lockMinutes: 10 });
+  raw.security = { sessionHours: 0.5 };
+  assert.deepEqual(validateConfig(raw, env).security, { sessionHours: 0.5, maxTries: 5, lockMinutes: 10 });
+  for (const [key, value] of [['sessionHours', 0], ['lockMinutes', -1], ['lockMinutes', '10'], ['maxTries', 2.5], ['maxTries', 0]]) {
+    raw.security = { [key]: value };
+    assert.throws(() => validateConfig(raw, env), new RegExp(`security\\.${key}`));
+  }
+});
+
+test('standing jobs default to on, 4 hours, $5 and a line every 5 minutes, and each is checked', () => {
+  const raw = copy();
+  const defaults = { enabled: true, maxHours: 4, maxCostUsd: 5, sayEveryMin: 5 };
+  assert.deepEqual(validateConfig(raw, env).standing, defaults);
+  delete raw.standing;
+  assert.deepEqual(validateConfig(raw, env).standing, defaults);
+  raw.standing = { enabled: false, sayEveryMin: 0 };
+  assert.deepEqual(validateConfig(raw, env).standing, { ...defaults, enabled: false, sayEveryMin: 0 });
+  for (const [key, value] of [['enabled', 'no'], ['maxHours', 0], ['maxCostUsd', -1], ['maxCostUsd', '5'], ['sayEveryMin', -1]]) {
+    raw.standing = { [key]: value };
+    assert.throws(() => validateConfig(raw, env), new RegExp(`standing\\.${key}`));
+  }
+});
+
+test('the passphrase never goes into config', () => {
+  const config = validateConfig(copy(), { ...env, CUBEHAND_PASSPHRASE: 'violet-anchor-42' });
+  assert.equal(JSON.stringify(config).includes('violet-anchor-42'), false);
+});
+
 test('empty allowlist is rejected', () => {
   const raw = copy();
   raw.allowlist = [];

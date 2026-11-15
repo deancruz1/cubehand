@@ -17,6 +17,15 @@ test('system prompt says when to save and run skills only when skills are on', (
   assert.doesNotMatch(systemPrompt('Clodine', [], { skills: false }), /skill save|skill run/);
 });
 
+test('system prompt says to answer a question about her thinking as a status report', () => {
+  assert.match(systemPrompt('Clodine'), /asks what you're thinking or why you did something, answer in your own words like a status report: .*Don't narrate or quote your reasoning\./);
+});
+
+test('system prompt says when to start a standing job only when standing jobs are on', () => {
+  assert.match(systemPrompt('Clodine'), /work to go on until told to stop.*standing_job, but never for a one-off job/);
+  assert.doesNotMatch(systemPrompt('Clodine', [], { standing: false }), /standing_job|standing job/);
+});
+
 test('system prompt uses the bot name', () => {
   assert.match(systemPrompt('Clodine'), /You are Clodine/);
 });

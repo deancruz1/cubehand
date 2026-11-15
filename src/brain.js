@@ -5,9 +5,11 @@ import { BRAIN_TOOLS } from './braintools.js';
 import { systemPrompt } from './prompt.js';
 import { JobRecord, summaryLine } from './joblog.js';
 import { ago } from './areas.js';
-import { asText, judgeable, worthLesson, lessonMeta, lessonRequest, parseLesson, CORRECTION_WINDOW_MS } from './lessons.js';
-import { isStandingOrder } from './chat.js';
+import { asText, judgeable, reviewable, worthLesson, lessonMeta, lessonRequest, parseLesson, keywords, CORRECTION_WINDOW_MS } from './lessons.js';
+import { repeatedRoutine, routineHint } from './skills.js';
+import { isStandingOrder, workOrder, asksForThoughts, THOUGHT_SUMMARY } from './chat.js';
 import { isAdmin } from './guard.js';
+import { Standing } from './standing.js';
 
 const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -17,6 +19,23 @@ const BUILD_VERB = /(?<!\b(?:the|your|my|our|this|that|his|her|their|a)\s+)(?<!\
 // "make me a small house", but not "make a door for the house".
 const MAKE_STRUCTURE = /\b(?:make|put up|set up|raise)\b(?:\s+(?!(?:in|at|near|by|to|for|from|of|on|inside|behind|next|beside|around|into|with|under)\b)[\w']+){0,4}?\s+(?:house|hut|cabin|shelter|tower|bridge|castle|barn|shed|wall|fort)s?\b/i;
 const BUILD_TOOLS = new Set(['build_house', 'build_structure']);
+// A build_structure of at most this many blocks, counting every block in the box of each part, is
+// a patch (filling a few ore holes, say), not a build: it runs on the model that asked for it,
+// with the usual budget. A roof is never a patch.
+const PATCH_BLOCKS = 24;
+function isPatch(call) {
+  if (call.name !== 'build_structure') return false;
+  const { parts = [], blocks = [] } = call.input ?? {};
+  if (!Array.isArray(parts) || !Array.isArray(blocks)) return false;
+  let count = blocks.length;
+  for (const part of parts) {
+    if (part?.shape === 'roof' || !part?.from || !part?.to) return false;
+    const side = (k) => Math.abs(Number(part.to[k]) - Number(part.from[k])) + 1;
+    count += side('dx') * side('dy') * side('dz');
+  }
+  return count >= 1 && count <= PATCH_BLOCKS;
+}
+const isBuildCall = (call) => BUILD_TOOLS.has(call.name) && !isPatch(call);
 // Time inside a tool doesn't count against the job, but one call is stopped after this long, so a
 // tool that hangs still ends. Build tools get longer.
 const TOOL_SECONDS = 1800;
@@ -35,14 +54,18 @@ const HOLD_CAUSES = {
 
 const BUSY_INSTRUCTIONS = `Decide what to do with the new message. Reply with exactly one of:
 - QUEUE, if it asks you to do something new once your current job is done, or you can't tell.
-- UPDATE, if it changes or adds to the job you're doing now (a size, a side, a spot, materials, one more thing to include), so you work it in right away.
+- UPDATE, if it changes the job you're doing now so that what you're doing this moment is wrong or wasted (a size, a side, a spot, a level, materials, gone far enough), so you stop and work it in right away.
+- ADD, if it adds to the job you're doing now but what you're doing this moment can finish first (one more thing to do or include, a rule for how to work, something to fix elsewhere, a name or note to keep), so you work it in after that. If unsure which, UPDATE.
 - NOW, if they want you to drop the current job and do the new thing right away.
 - STOP, if they want you to stop or cancel the current job.
 - Otherwise, when it's a question or chat you can answer from the snapshot (what you're doing, how it's going, where something is), your short chat reply to them, one or two sentences.`;
-const BUSY_WORDS = ['QUEUE', 'UPDATE', 'NOW', 'STOP'];
+const BUSY_WORDS = ['QUEUE', 'UPDATE', 'ADD', 'NOW', 'STOP'];
 const REPLY_LABEL = /^\s*(?:chat\s+)?(?:reply|answer|response)\s*:\s*/i;
 const SORTING_TALK = /\bchat (?:answer|reply|message)\b|\bso (?:it's|it is|this is) (?:a |just )?(?:chat|question)\b/i;
-const SORTING_WORD = /\b(?:QUEUE|UPDATE|NOW|STOP)\b/;
+const SORTING_WORD = /\b(?:QUEUE|UPDATE|ADD|NOW|STOP)\b/;
+// A note that can wait goes in with the result of the tool that's running, unless that tool runs
+// on this long after the note came in.
+const NOTE_WAIT_MS = 90000;
 
 // The chat part of a mid-job reply. "Chat reply: their message is a compliment, so it's a chat
 // answer. Thanks!" is only "Thanks!": the label and the sentences about sorting the message aren't
@@ -202,10 +225,34 @@ const REFLEX_DONE = {
   stay: () => "You already stopped and are staying put, so don't call stop_moving. Just reply."
 };
 
-// What came before this job, so a question like "what are you doing?" gets a true answer.
+// Standing jobs (see standing.js): work she keeps doing in rounds, each a short job of its own.
+const STANDING_DEFAULTS = { enabled: true, maxHours: 4, maxCostUsd: 5, sayEveryMin: 5 };
+// Rounds wait this long after the last job, so the chores between them get a turn, and this long
+// after the bot has joined the server.
+const ROUND_GAP_MS = 3000;
+const AFTER_SPAWN_MS = 10000;
+// A round that ends one of these ways got nowhere, and so does one that ends without a progress
+// call. Two in a row pause the standing job.
+const NO_PROGRESS = {
+  done: 'ended without saving any progress',
+  steps: 'ran out of steps',
+  time: 'ran out of time',
+  api_error: "couldn't reach my brain",
+  refusal: 'was refused',
+  max_tokens: 'got cut off',
+  crash: 'crashed'
+};
+const MAX_IDLE_ROUNDS = 2;
+const ROUND = `Do the next unit of this work now, and only one: one tunnel, one row of trees, one batch. First look after what a player would: if your pack is nearly full, put things away where your notes say; make sure you have a working tool; eat if you need to. Then call standing_job with progress (where things stand now and what the next unit is), and finish with one short line. The next round starts on its own, so don't ask whether to carry on.`;
+const RESTARTED = 'You were restarted since the last round, so check where you are and what you carry before you go on.';
+const STOPPED_STANDING = 'Stopped. The standing job is paused too; say continue when you want me to carry on with it.';
+
+// What came before this job, so a question like "what are you doing?" gets a true answer. A request
+// for her reasoning only goes in as the neutral line the request log keeps for it.
 export function lastJobLine(last, now = Date.now()) {
   if (!last) return '';
-  const what = last.self ? 'your own free time' : `${last.player}'s request "${last.text}"`;
+  const text = asksForThoughts(last.text) ? THOUGHT_SUMMARY : last.text;
+  const what = last.self ? 'your own free time' : last.standing ? `a round of the standing job from ${last.player}` : `${last.player}'s request "${text}"`;
   return `Your last job, ${what}, ended ${ago(now - last.at)}: ${ENDS[last.end] ?? last.end.replaceAll('_', ' ')}. No job is running besides this one.`;
 }
 
@@ -239,8 +286,11 @@ export class Brain {
   // as soon as she's about to act or speak on it, or the request ends any other way.
   // lessons, if given, is the Lessons store from lessons.js.
   // refusalLog, if given, gets the full request of every refused step (see joblog.js), and
-  // forgetRequests(before) clears the remembered requests made up to then.
-  constructor({ client, config, runTool, snapshot, say, onStop, onJobStart, beforeStep, watchTool, onThinking, jobLog, refusalLog, forgetRequests, lessons, log = console.log }) {
+  // forgetRequests(before) clears the remembered requests made up to then, and forgetChat(before)
+  // the recent chat said up to then.
+  // standing, if given, is the Standing store from standing.js; without one it lives in memory.
+  // skills, if given, is the Skills store from skills.js, used to point out routines worth saving.
+  constructor({ client, config, runTool, snapshot, say, onStop, onJobStart, beforeStep, watchTool, onThinking, jobLog, refusalLog, forgetRequests, forgetChat, lessons, standing, skills: skillStore, log = console.log }) {
     this.client = client;
     this.config = config;
     this.runTool = runTool;
@@ -255,6 +305,7 @@ export class Brain {
     this.jobLog = jobLog;
     this.refusalLog = refusalLog;
     this.forgetRequests = forgetRequests;
+    this.forgetChat = forgetChat;
     this.lastPlanAt = 0;
     this.queue = [];
     this.current = null;
@@ -272,11 +323,21 @@ export class Brain {
     this.reviews = new Set();
     this.correctionWindowMs = CORRECTION_WINDOW_MS;
     this.closing = false;
+    this.standing = standing ?? new Standing();
+    // When a round's own line was last said, and when rounds may start after the bot joined.
+    this.lastRoundSaid = 0;
+    this.roundAfter = 0;
     const skills = config.learning?.skills !== false;
+    this.skillStore = skills ? (skillStore ?? null) : null;
+    // A routine to point out in the next job like the one that did it, and the routines already
+    // pointed out since the start.
+    this.routine = null;
+    this.routinesShown = new Set();
+    const standingOn = this.standingConfig.enabled !== false;
     // The same lists go with every call, so the cache entry for them holds across models.
-    this.tools = skills ? ALL_TOOLS : ALL_TOOLS.filter((t) => t.name !== 'skill');
+    this.tools = ALL_TOOLS.filter((t) => (skills || t.name !== 'skill') && (standingOn || t.name !== 'standing_job'));
     this.looseTools = this.tools.map(({ strict, ...rest }) => rest);
-    this.system = systemPrompt(config.bot.username, config.admins ?? [], { skills });
+    this.system = systemPrompt(config.bot.username, config.admins ?? [], { skills, standing: standingOn });
     // Every job starts a new conversation, so the tools and system prompt get their own cache
     // entry that lasts between jobs. A 1 hour entry has to come before the 5 minute one that
     // automatic caching puts on the end of the conversation.
@@ -291,6 +352,20 @@ export class Brain {
     return this.holds.size > 0;
   }
 
+  get standingConfig() {
+    return { ...STANDING_DEFAULTS, ...this.config.standing };
+  }
+
+  // The standing job, active or paused, or null when there is none or they are turned off.
+  get standingJob() {
+    return this.standingConfig.enabled === false ? null : this.standing.job;
+  }
+
+  // While this is true, rounds take the place of free time.
+  get standingActive() {
+    return this.standingJob?.state === 'active';
+  }
+
   // Who lines about the running job go to: the player who whispered it, or null for public chat.
   get replyTo() {
     const job = this.current;
@@ -302,6 +377,7 @@ export class Brain {
   enqueue(player, text, whisper = false, reflex = null) {
     const to = whisperTo(player, whisper);
     const request = reflex ? { player, text, whisper, reflex } : { player, text, whisper };
+    if (this.resumeOnContinue(player, text, to)) return;
     // Free time gives way to players right away.
     if (this.current?.self) {
       this.queue.unshift(request);
@@ -354,7 +430,7 @@ export class Brain {
       messages: [
         {
           role: 'user',
-          content: `${this.snapshot()}\n\nYou are busy with a job from ${job?.player}: "${job?.text}".\n${player} just said: ${text}\n\n${BUSY_INSTRUCTIONS}`
+          content: `${this.snapshot()}\n\nYou are busy with ${job?.standing ? 'a round of the standing job' : 'a job'} from ${job?.player}: "${job?.text}".\n${player} just said: ${text}\n\n${BUSY_INSTRUCTIONS}`
         }
       ],
       output_config: { effort: 'low' }
@@ -363,15 +439,15 @@ export class Brain {
     const reply = response.content.filter((b) => b.type === 'text').map((b) => b.text).join(' ').trim();
     let word = reply.replace(/[^A-Za-z]/g, '').toUpperCase();
     // The word can come after a line of reasoning, which isn't for chat.
-    const last = reply.match(/\b(QUEUE|UPDATE|NOW|STOP)\W*$/)?.[1];
+    const last = reply.match(/\b(QUEUE|UPDATE|ADD|NOW|STOP)\W*$/)?.[1];
     if (!BUSY_WORDS.includes(word) && last) word = last;
     // A lasting rule only answered in chat would be lost, so the running job gets it to save.
-    if (reply && !BUSY_WORDS.includes(word) && isStandingOrder(text, this.config.bot.username)) word = 'UPDATE';
+    if (reply && !BUSY_WORDS.includes(word) && isStandingOrder(text, this.config.bot.username)) word = 'ADD';
     if (!reply || word === 'QUEUE') {
       if (this.busy) this.addToQueue(player, text, whisper);
       else this.start({ player, text, whisper });
-    } else if (word === 'UPDATE') {
-      if (job && this.current === job) this.addToJob(job, player, text, whisper);
+    } else if (word === 'UPDATE' || word === 'ADD') {
+      if (job && this.current === job) this.addToJob(job, player, text, whisper, word === 'ADD');
       else if (this.busy) this.addToQueue(player, text, whisper);
       else this.start({ player, text, whisper });
     } else if (word === 'NOW') {
@@ -383,7 +459,7 @@ export class Brain {
         this.start({ player, text, whisper });
       }
     } else if (word === 'STOP') {
-      this.stop(to);
+      this.stop(to, player);
     } else {
       const line = chatPart(reply);
       if (line !== reply) this.log(`[brain] kept the sorting out of a mid-job reply: ${reply}`);
@@ -418,10 +494,12 @@ export class Brain {
 
   // After a player's job: one that went wrong is looked over for a lesson now, and one that went
   // fine waits a while in case the player says otherwise, then counts for the lessons it was shown.
+  // One that only a correction could say anything about (cut off by another job, or every call
+  // stopped from outside) waits too, but never counts for its lessons.
   afterJob(line, job) {
     if (!this.lessons || !line || job.self || this.closing) return;
     try {
-      if (!judgeable(line)) return;
+      if (!reviewable(line)) return;
       this.endWait(job.player, true);
       if (worthLesson(line, job.corrections)) {
         this.review(line, job);
@@ -441,23 +519,60 @@ export class Brain {
     if (!held) return null;
     clearTimeout(held.timer);
     this.waiting.delete(player);
-    if (wentFine) this.lessons.outcome(held.job.lessonIds, { ok: true });
+    if (wentFine && judgeable(held.line)) this.lessons.outcome(held.job.lessonIds, { ok: true });
     return held;
   }
 
   // A player saying the bot got something wrong. It goes with their job if it's running, or
-  // else has their last job, if it ended a moment ago, looked over with it.
+  // else has their last job, if it ended a moment ago, looked over with it. An admin's correction
+  // goes with anyone's job, the running one or else the last one to end.
   correct(player, text) {
     if (!this.lessons || this.closing) return;
+    this.lessons.noteCorrection(text);
+    const admin = isAdmin(this.config, player);
     const job = this.current;
-    if (job && !job.self && job.player === player) {
+    if (job && !job.self && (job.player === player || admin)) {
       job.corrections.push(text);
       return;
     }
-    const held = this.endWait(player, false);
+    const whose = this.waiting.has(player) ? player : admin ? [...this.waiting.keys()].at(-1) : undefined;
+    const held = whose === undefined ? null : this.endWait(whose, false);
     if (!held) return;
     held.job.corrections.push(text);
     this.review(held.line, held.job);
+  }
+
+  // A routine a player's job just did that earlier jobs did too, and no skill holds yet, is
+  // pointed out once, in the first turn of the next job like it (see routineFor).
+  noteRoutine(line, job) {
+    if (!this.skillStore || !line || job.self || this.closing || !this.jobLog?.recent) return;
+    try {
+      const store = this.skillStore;
+      const tools = repeatedRoutine(line, this.jobLog.recent(), { skills: store.skills, usable: (name) => store.schemas.has(name) });
+      if (!tools || this.routinesShown.has(tools.join(' '))) return;
+      this.routine = { tools, words: keywords(line.request, new Set([this.config.bot.username.toLowerCase()])), standing: job.standing?.started ?? null };
+    } catch (err) {
+      this.log(`[skills] couldn't look for a routine: ${err.message}`);
+    }
+  }
+
+  // The routine line for a job's first turn, or ''. A round gets it when the last round of the
+  // same standing job did the routine, and a player's job when its request shares two keywords
+  // (or its one keyword) with the request that did it.
+  routineFor(job, text) {
+    const routine = this.routine;
+    if (!routine || job.self) return '';
+    let fits;
+    if (job.standing) fits = routine.standing === job.standing.started;
+    else {
+      const want = keywords(text, new Set([this.config.bot.username.toLowerCase()]));
+      const shared = want.filter((w) => routine.words.includes(w)).length;
+      fits = routine.standing === null && want.length > 0 && shared >= Math.min(2, want.length);
+    }
+    if (!fits) return '';
+    this.routine = null;
+    this.routinesShown.add(routine.tools.join(' '));
+    return routineHint(routine.tools);
   }
 
   // Each job is looked over at most once, and never holds up the jobs after it.
@@ -484,7 +599,8 @@ export class Brain {
     const asked = Date.now();
     let response;
     try {
-      response = await this.client.beta.messages.create({ model, ...lessonRequest(line, corrections, { names }), output_config: { effort: 'low' } }, { signal: controller.signal });
+      const times = this.lessons.timesSaid(corrections);
+      response = await this.client.beta.messages.create({ model, ...lessonRequest(line, corrections, { names, times }), output_config: { effort: 'low' } }, { signal: controller.signal });
     } finally {
       this.reviews.delete(controller);
     }
@@ -532,11 +648,21 @@ export class Brain {
   }
 
   // More instructions for the job in progress. The tool that's running stops, so the model sees
-  // them before it does anything else.
-  addToJob(job, player, text, whisper = false) {
+  // them before it does anything else, unless they can wait: then they go in with its result,
+  // or once it has run NOTE_WAIT_MS past the first of them.
+  addToJob(job, player, text, whisper = false, canWait = false) {
     job.notes.push({ player, text, whisper });
-    job.tool?.abort('update');
-    this.say(`Okay ${player}, I'll work that in.`, whisperTo(player, whisper));
+    const tool = job.tool;
+    const waits = Boolean(canWait && tool && !tool.signal.aborted);
+    if (!waits) tool?.abort('update');
+    else if (!job.noteTimer) {
+      this.log(`[brain] the note from ${player} waits for the running tool to finish`);
+      job.noteTimer = setTimeout(() => {
+        this.log(`[brain] the tool ran ${NOTE_WAIT_MS / 1000}s past a waiting note, stopping it`);
+        tool.abort('update');
+      }, NOTE_WAIT_MS);
+    }
+    this.say(waits ? `Okay ${player}, I'll work that in after this step.` : `Okay ${player}, I'll work that in.`, whisperTo(player, whisper));
   }
 
   // What the model was told is kept, so a job that starts over on another model hears it too.
@@ -592,11 +718,13 @@ export class Brain {
     appendBlocks(messages.at(-1), [{ type: 'text', text: notice.content }]);
   }
 
-  stop(to = null) {
+  // A stop pauses the standing job too. by is who said it, when known.
+  stop(to = null, by = null) {
     this.queue = [];
     this.abortCurrent('stop');
     this.onStop();
-    this.say('Stopped.', to);
+    const paused = this.pauseStanding(by ? `${by} said stop` : 'a player said stop');
+    this.say(paused ? STOPPED_STANDING : 'Stopped.', to);
   }
 
   abortCurrent(reason) {
@@ -631,6 +759,7 @@ export class Brain {
   // report says what happened during the hold, for the job to read when it carries on.
   resume(reason = 'danger', report = null) {
     this.holds.delete(reason);
+    if (reason === 'offline') this.roundAfter = Date.now() + AFTER_SPAWN_MS;
     const job = this.current;
     if (report && job?.hold) job.reports.push(report);
     if (this.paused) return;
@@ -673,10 +802,155 @@ export class Brain {
 
   // A job the bot picks for itself when nobody needs it.
   freeTime() {
-    if (this.busy || this.paused || this.queue.length > 0) return false;
+    if (this.busy || this.paused || this.queue.length > 0 || this.standingActive) return false;
     this.lastFreeTime = Date.now();
     this.start({ player: null, text: null, self: true });
     return true;
+  }
+
+  // The next round of the standing job, once nothing else is going on: no job, nothing queued, no
+  // hold, and a moment after the last job. Returns whether one started.
+  standingRound(now = Date.now()) {
+    const sj = this.standingJob;
+    if (sj?.state !== 'active' || this.busy || this.paused || this.queue.length > 0) return false;
+    if (now < this.roundAfter || now - this.lastJobEnd < ROUND_GAP_MS || this.standingLimit(now)) return false;
+    const round = { by: sj.by, task: sj.task, progress: sj.progress, number: sj.rounds + 1, started: sj.started, restarted: this.standing.restarted };
+    this.standing.restarted = false;
+    this.start({ player: sj.by, text: sj.task, standing: round });
+    return true;
+  }
+
+  // Pauses the standing job when it has reached standing.maxHours or standing.maxCostUsd since it
+  // started or was last resumed, and says so. Returns whether it did.
+  standingLimit(now = Date.now()) {
+    const sj = this.standingJob;
+    if (sj?.state !== 'active') return false;
+    const { maxHours, maxCostUsd } = this.standingConfig;
+    const cost = sj.cost - (sj.countCost ?? 0);
+    let why = null;
+    if (maxHours > 0 && now - Date.parse(sj.countFrom ?? sj.started) >= maxHours * 3600000) why = `it has run for ${maxHours} hours`;
+    else if (maxCostUsd > 0 && cost >= maxCostUsd) why = `it has cost $${cost.toFixed(2)}`;
+    if (!why) return false;
+    this.standing.pause(why);
+    this.log(`[standing] paused: ${why}`);
+    this.say(`I've paused the standing job: ${why}. Say continue if you want me to keep going.`);
+    return true;
+  }
+
+  // Returns whether there was an active standing job to pause.
+  pauseStanding(reason) {
+    if (!this.standingActive) return false;
+    this.standing.pause(reason);
+    this.log(`[standing] paused: ${reason}`);
+    return true;
+  }
+
+  // Dying pauses the standing job, and she says so once.
+  died() {
+    if (this.pauseStanding('I died')) this.say("I died, so I've paused the standing job. Say continue when you want me to pick it up again.");
+  }
+
+  // A bare "continue" from an admin while the standing job is paused carries it on, with no model
+  // call. Returns whether it did.
+  resumeOnContinue(player, text, to = null) {
+    if (this.standingJob?.state !== 'paused' || !isAdmin(this.config, player) || workOrder(text, this.config.bot.username) !== 'continue') return false;
+    this.standing.resume();
+    this.log(`[standing] resumed by ${player}`);
+    this.say(`Okay ${player}, carrying on with the standing job.`, to);
+    if (this.current?.self) this.abortCurrent('replaced');
+    return true;
+  }
+
+  // After a round: what it cost, and whether it got anywhere. Two in a row that didn't pause the
+  // standing job, and she says why.
+  endRound(job, end) {
+    const sj = this.standing.job;
+    if (!sj || sj.started !== job.standing.started) return;
+    const counts = sj.state === 'active' && end in NO_PROGRESS;
+    const progressed = counts ? end === 'done' && job.standingProgress : null;
+    this.standing.addRound(job.record.cost, progressed);
+    if (progressed === false && sj.idle >= MAX_IDLE_ROUNDS) {
+      const why = NO_PROGRESS[end];
+      this.pauseStanding(`${MAX_IDLE_ROUNDS} rounds in a row made no progress, the last one ${why}`);
+      this.say(`I've paused the standing job: ${MAX_IDLE_ROUNDS} rounds in a row made no progress, the last one ${why}. Say continue when you want me to try again.`);
+      return;
+    }
+    this.standingLimit();
+  }
+
+  // A round's own line is said at most once every standing.sayEveryMin, unless the round paused or
+  // ended the standing job. Returns whether line is kept out of chat.
+  keptQuiet(job, line) {
+    if (!job.standing) return false;
+    const now = Date.now();
+    if (job.standingChanged || now - this.lastRoundSaid >= this.standingConfig.sayEveryMin * 60000) {
+      this.lastRoundSaid = now;
+      return false;
+    }
+    this.log(`[standing] not said: ${line}`);
+    return true;
+  }
+
+  // The standing_job tool. Only an admin's job may start or resume one or change its task: the
+  // same player a remember call would be saved for, so a note from someone else never gets more say.
+  standingTool(job, input = {}) {
+    const fail = (message) => ({ ok: false, message });
+    const done = (message) => ({ ok: true, message });
+    if (this.standingConfig.enabled === false) return fail('Not done: standing jobs are turned off.');
+    if (job.self) return fail('Not done: free time leaves the standing job alone.');
+    const { action } = input;
+    const task = String(input.task ?? '').trim();
+    const progress = String(input.progress ?? '').trim();
+    const who = this.rememberFor(job) ?? job.player;
+    const admin = isAdmin(this.config, who);
+    const refuse = (what) => fail(`Not done: only an admin can ${what} a standing job, and ${who} isn't one. Tell them that plainly.`);
+    const sj = this.standing.job;
+    if (action === 'start') {
+      if (!task || !progress) return fail('Not done: start needs task and progress.');
+      if (!admin) return refuse('start');
+      const old = this.standing.start({ task, progress, by: who, admin });
+      this.log(`[standing] started by ${who}: ${task}`);
+      const replaced = old ? ` It replaces the one from ${old.by} ("${old.task.slice(0, 100)}"), so say so in your reply.` : '';
+      return done(`Started the standing job.${replaced} The first round starts on its own once this job ends, so finish now unless the player asked for something else too.`);
+    }
+    if (!sj) return fail('Not done: there is no standing job.');
+    if (action === 'progress') {
+      if (!progress) return fail('Not done: progress needs progress.');
+      if (task && task !== sj.task && !admin) return refuse('change the task of');
+      this.standing.setProgress(progress, task || null);
+      job.standingProgress = true;
+      return done(task && task !== sj.task ? 'Saved the progress and the new task.' : 'Saved the progress.');
+    }
+    if (action === 'pause') {
+      if (sj.state === 'paused') return done('It was already paused.');
+      this.pauseStanding(String(input.reason ?? '').trim() || `${who} asked to pause it`);
+      job.standingChanged = true;
+      return done('Paused the standing job. Say so in your reply; an admin can resume it.');
+    }
+    if (action === 'resume') {
+      if (!admin) return refuse('resume');
+      if (sj.state === 'active') return done('It is already running.');
+      this.standing.resume();
+      this.log(`[standing] resumed by ${who}`);
+      return done('Resumed the standing job: the next round starts on its own once this job ends.');
+    }
+    if (action === 'end') {
+      this.standing.end();
+      this.log(`[standing] ended at ${who}'s word`);
+      job.standingChanged = true;
+      return done('Ended the standing job.');
+    }
+    return fail('Not done: action must be start, progress, pause, resume or end.');
+  }
+
+  // The first turn's ask for a round.
+  roundAsk(round) {
+    return [
+      `This is round ${round.number} of your standing job from ${round.by}.${round.restarted ? ` ${RESTARTED}` : ''}`,
+      `Task: ${round.task}`,
+      `Where it stands: ${round.progress}`,
+      ROUND
+    ].join('\n');
   }
 
   start(request) {
@@ -693,6 +967,11 @@ export class Brain {
       self: Boolean(request.self),
       whisper: Boolean(request.whisper),
       reflex: request.reflex ?? null,
+      // For a round of the standing job, what it was when the round began, whether the round
+      // called progress, and whether it paused or ended the standing job.
+      standing: request.standing ?? null,
+      standingProgress: false,
+      standingChanged: false,
       notes: [...(request.notes ?? [])],
       reports: [],
       // Notes and hold reports the model has been given, and the actions the job has run.
@@ -700,6 +979,7 @@ export class Brain {
       ran: [],
       tool: null,
       running: null,
+      noteTimer: null,
       clock: null,
       hold: null,
       heldFor: null,
@@ -715,7 +995,7 @@ export class Brain {
       lessonTools: new Set(),
       reviewed: false,
       // Lasting rules players gave in this job, and how many of them a remember call came after.
-      rules: !request.self && isStandingOrder(request.text, this.config.bot.username) ? [{ player: request.player, text: request.text }] : [],
+      rules: !request.self && !request.standing && isStandingOrder(request.text, this.config.bot.username) ? [{ player: request.player, text: request.text }] : [],
       savedRules: 0,
       // Who gave the notes delivered since the last remember call.
       heard: [],
@@ -728,7 +1008,7 @@ export class Brain {
       leanTry: null,
       carriedAt: null
     };
-    job.record = new JobRecord({ player: request.player, text: request.text, self: job.self, reflex: job.reflex });
+    job.record = new JobRecord({ player: request.player, text: request.text, self: job.self, reflex: job.reflex, standing: Boolean(job.standing) });
     this.current = job;
     job.done = Promise.resolve()
       .then(() => this.onJobStart?.(job))
@@ -745,12 +1025,23 @@ export class Brain {
         const end = controller.signal.aborted ? controller.signal.reason : (job.record.end ?? 'done');
         const line = this.writeRecord(job.record, end);
         this.afterJob(line, job);
-        this.lastJob = { player: job.player, text: job.text, self: job.self, end, at: Date.now() };
+        this.noteRoutine(line, job);
+        if (job.standing) {
+          try {
+            this.endRound(job, end);
+          } catch (err) {
+            this.log(`[standing] couldn't count the round: ${err.message}`);
+          }
+        }
+        this.lastJob = { player: job.player, text: job.text, self: job.self, standing: Boolean(job.standing), end, at: Date.now(), tier: job.tier };
         this.current = null;
         this.lastJobEnd = Date.now();
         // Instructions the job never got to, like when it ran out of time, become requests of their own.
+        // On a replacement they go after the job that took its place.
         const reason = controller.signal.aborted ? controller.signal.reason : null;
-        if (reason === null || reason === 'time') this.queue.unshift(...job.notes.map(({ player, text, whisper }) => ({ player, text, whisper })));
+        const left = job.notes.map(({ player, text, whisper }) => ({ player, text, whisper }));
+        if (reason === null || reason === 'time') this.queue.unshift(...left);
+        else if (reason === 'replaced') this.queue.splice(1, 0, ...left);
         if (this.paused) return;
         const next = this.queue.shift();
         if (next) this.start(next);
@@ -770,13 +1061,18 @@ export class Brain {
   }
 
   // The tier a new job starts on. With routing on, a player's job starts on the quick model,
-  // which does simple jobs itself and hands the rest up (builds skip that), and free time runs
-  // on the everyday model.
-  firstTier({ text, self, tier }) {
+  // which does simple jobs itself and hands the rest up (builds skip that, and so does an obvious
+  // work order, or a bare "continue" after one, which goes to the everyday model), and free time
+  // and rounds of the standing job run on the everyday model.
+  firstTier({ text, self, tier, reflex, standing }) {
     if (tier) return tier;
     if (this.config.claude.routing !== true) return 'complex';
-    if (self) return 'normal';
-    return isBuildRequest(text) ? 'complex' : 'simple';
+    if (self || standing) return 'normal';
+    if (isBuildRequest(text)) return 'complex';
+    if (reflex) return 'simple';
+    const order = workOrder(text, this.config.bot.username);
+    const afterWork = this.lastJob && !this.lastJob.self && this.lastJob.tier === 'normal';
+    return order === 'work' || (order === 'continue' && afterWork) ? 'normal' : 'simple';
   }
 
   // With claude.streaming on, the answer streams in and onEvent(event, message so far) hears each
@@ -891,10 +1187,16 @@ export class Brain {
       if (!signal.aborted) this.say(line, to);
     };
     job.tell = tell;
-    const ended = () => this.endedByAbort(signal, self, (line) => this.say(line, to));
+    // A round's own lines, which are said less often (see keptQuiet).
+    const speak = async (line) => {
+      if (!this.keptQuiet(job, line)) await tell(line);
+    };
+    const ended = () => this.endedByAbort(signal, self, (line) => this.keptQuiet(job, line) || this.say(line, to));
     await this.waitWhileHeld(job, signal);
     if (signal.aborted) return ended();
     let tier = this.firstTier(request);
+    // A work order that skipped the quick model goes on as if that model had handed it up.
+    if (!self && !request.tier && tier === 'normal') job.handedOver = true;
     // The quick model can hand the job up until it does, or until another model takes it over.
     let sorting = claude.routing === true && !request.tier && tier === 'simple';
     // Whether the conversation still asks for sorting with nothing saying it's over.
@@ -916,7 +1218,13 @@ export class Brain {
     if (job.hold) clock.hold('hold');
     clock.start();
     const using = claude.routing === true ? ` [${tier}, ${model}]` : '';
-    this.log(self ? `[brain] free time${using}` : `[brain] request from ${player}: ${text}${build ? ' (build)' : ''}${whisper ? ' (whispered)' : ''}${using}`);
+    this.log(
+      self
+        ? `[brain] free time${using}`
+        : job.standing
+          ? `[brain] standing job round ${job.standing.number} for ${player}${using}`
+          : `[brain] request from ${player}: ${text}${build ? ' (build)' : ''}${whisper ? ' (whispered)' : ''}${using}`
+    );
     let nudges = 0;
     let warned = false;
     // On a reflex job the first "On my way, I'll be right there" is about what the body is
@@ -940,7 +1248,7 @@ export class Brain {
     };
 
     try {
-      const ask = self ? FREE_TIME : `Request from ${player}${whisper ? ' (whispered)' : ''}: ${text}`;
+      const ask = self ? FREE_TIME : job.standing ? this.roundAsk(job.standing) : `Request from ${player}${whisper ? ' (whispered)' : ''}: ${text}`;
       const before = self || !this.lastJob ? '' : `\n\n${lastJobLine(this.lastJob)}`;
       const reflexDone = job.reflex ? `\n\n${REFLEX_DONE[job.reflex](player)}` : '';
       // Picked once a job, so one that starts over on another model gets the same ones.
@@ -949,13 +1257,17 @@ export class Brain {
         job.lessonIds.push(...job.lessons.map((l) => l.id));
       }
       const advice = asText(job.lessons);
+      job.routineLine ??= this.routineFor(job, text);
       const snapshot = this.snapshot();
       if (!job.lean) job.carriedAt = Date.now();
       // The start of the first turn, and the same without what was carried over from before the job.
       const leanHead = leanSnapshot(snapshot);
       const head = job.lean ? leanHead : `${snapshot}${before}`;
       const messages = [
-        { role: 'user', content: `${head}\n\n${ask}${carriedOver(job)}${advice ? `\n\n${advice}` : ''}${reflexDone}${sorting ? `\n\n${SORTING}` : ''}` }
+        {
+          role: 'user',
+          content: `${head}\n\n${ask}${carriedOver(job)}${advice ? `\n\n${advice}` : ''}${job.routineLine ? `\n\n${job.routineLine}` : ''}${reflexDone}${sorting ? `\n\n${SORTING}` : ''}`
+        }
       ];
       // Takes the carried-over parts out of the first turn for the rest of the job. Editing that
       // turn makes every later thinking block invalid, so those go too, as the API docs say to.
@@ -1090,8 +1402,8 @@ export class Brain {
         const sayPlan = (plan, aloud = true) => {
           if (!plan) return;
           this.log(`[brain] plan: ${plan}`);
-          // A plan made before a hold won't be carried out, so it isn't said.
-          if (aloud && !self && !outdated() && !signal.aborted && Date.now() - this.lastPlanAt >= PLAN_GAP_MS) {
+          // A plan made before a hold won't be carried out, so it isn't said. A round doesn't narrate.
+          if (aloud && !self && !job.standing && !outdated() && !signal.aborted && Date.now() - this.lastPlanAt >= PLAN_GAP_MS) {
             doneThinking();
             this.say(plan, to);
             this.lastPlanAt = Date.now();
@@ -1143,6 +1455,15 @@ export class Brain {
               notDone(block, NOT_YOURS);
               continue;
             }
+            if (block.name === 'standing_job') {
+              const result = this.standingTool(job, block.input ?? {});
+              this.log(`[tool] standing_job ${JSON.stringify(block.input)} -> ${result.ok ? 'ok' : 'failed'}: ${result.message}`);
+              toolLog.push({ name: 'standing_job', ok: result.ok, ms: 0, action: block.input?.action, ...(result.ok ? {} : { error: result.message.slice(0, 300) }) });
+              job.ran.push(`standing_job ${block.input?.action ?? ''}${result.ok ? '' : ' (failed)'}`);
+              if (!result.ok) failed = true;
+              results.push({ type: 'tool_result', tool_use_id: block.id, content: result.message, ...(result.ok ? {} : { is_error: true }) });
+              continue;
+            }
             // Everything before it worked, so the job ends here without another model call.
             if (block.name === 'finish') {
               if (i < calls.length - 1) {
@@ -1158,7 +1479,8 @@ export class Brain {
                 continue;
               }
               // Same as a plain reply: a line that promises more work isn't said, and she's sent on.
-              if (!self && nudges < MAX_NUDGES && promisesMore(line)) {
+              // In a round the next round is the more.
+              if (!self && !job.standing && nudges < MAX_NUDGES && promisesMore(line)) {
                 nudges++;
                 if (record) record.nudges = nudges;
                 toolLog.push({ name: 'finish', ok: false, ms: 0, error: `held back: ${line}`.slice(0, 300) });
@@ -1170,11 +1492,11 @@ export class Brain {
               this.log(`[brain] finish: ${line}`);
               if (line && !(self && /^nothing\W*$/i.test(line))) {
                 if (record) record.reply = line.slice(0, 300);
-                await tell(line);
+                await speak(line);
               }
               return 'finished';
             }
-            const building = !self && BUILD_TOOLS.has(block.name);
+            const building = !self && isBuildCall(block);
             this.log(`[tool] ${block.name} ${JSON.stringify(block.input)}`);
             // A job that turns into a build, like "carry on", gets the build budget from here on.
             if (building && !build) {
@@ -1202,6 +1524,8 @@ export class Brain {
               result = await running;
             } finally {
               clearTimeout(ceiling);
+              clearTimeout(job.noteTimer);
+              job.noteTimer = null;
               watch?.stop();
               job.tool = null;
               job.running = null;
@@ -1225,7 +1549,17 @@ export class Brain {
               job.heard = [];
             }
             const action = block.name === 'skill' ? { action: block.input?.action } : {};
-            toolLog.push({ name: block.name, ok, ms: Date.now() - ran, ...action, ...(ok ? {} : { error: String(content).slice(0, 300) }) });
+            // Stopped from outside (a change, a hold, a stop, a response that won't be carried
+            // out), so the result says nothing about the tool itself.
+            const interrupted = signal.aborted || (why !== null && why !== 'stuck' && why !== 'too_long');
+            toolLog.push({
+              name: block.name,
+              ok,
+              ms: Date.now() - ran,
+              ...action,
+              ...(ok ? {} : { error: String(content).slice(0, 300) }),
+              ...(interrupted ? { interrupted: true } : {})
+            });
             // A tool that failed on its own, not because of a change, a hold or a stop, gets what
             // earlier jobs learned about it, once a job.
             if (!ok && !self && this.lessons && why !== 'update' && !HOLD_CAUSES[why] && !signal.aborted && !job.lessonTools.has(block.name)) {
@@ -1321,7 +1655,7 @@ export class Brain {
           if (signal.aborted || err instanceof Anthropic.APIUserAbortError) return ended();
           this.log(`[brain] API error: ${err.message}`);
           if (record) Object.assign(record, { end: 'api_error', error: err.message });
-          if (!self) await tell(errorMessage(err));
+          if (!self) await speak(errorMessage(err));
           return;
         }
         this.logUsage(step, response.usage);
@@ -1346,25 +1680,31 @@ export class Brain {
             if (retry) return retry;
           }
           if (record) record.end = 'refusal';
-          if (!self) await tell("I can't help with that one.");
+          if (!self) await speak("I can't help with that one.");
           return;
         }
         // The same model took the step once the carried-over parts were gone, so they were what it
-        // refused, and the next job would pay for the same refusal unless the requests are cleared.
+        // refused, and the next job would pay for the same refusal unless the requests and the chat
+        // it carried are cleared.
         if (job.leanTry) {
           job.leanTry = null;
           if (record) record.leanCured = true;
-          this.log('[brain] the step went through without the carried-over parts, so this job stays without them and the remembered requests are cleared');
+          this.log('[brain] the step went through without the carried-over parts, so this job stays without them and the remembered requests and recent chat are cleared');
           try {
             this.forgetRequests?.(job.carriedAt);
           } catch (err) {
             this.log(`[brain] couldn't clear the remembered requests: ${err.message}`);
           }
+          try {
+            this.forgetChat?.(job.carriedAt);
+          } catch (err) {
+            this.log(`[brain] couldn't clear the recent chat: ${err.message}`);
+          }
         }
         if (response.stop_reason === 'max_tokens') {
           await drop('max_tokens');
           if (record) record.end = 'max_tokens';
-          if (!self) await tell('My answer got cut off. Try asking for something smaller.');
+          if (!self) await speak('My answer got cut off. Try asking for something smaller.');
           return;
         }
 
@@ -1384,7 +1724,7 @@ export class Brain {
           if (reply) this.log(`[brain] reply: ${reply}`);
           if (reply && !(self && /^nothing\W*$/i.test(reply))) {
             if (record) record.reply = reply.slice(0, 300);
-            await tell(reply);
+            await speak(reply);
           }
           if (signal.aborted) return ended();
           // Something a player added during the last step still has to be worked in.
@@ -1394,7 +1734,7 @@ export class Brain {
           }
           // A reply that only says what comes next would leave her standing there, so she
           // gets sent on to do it.
-          if (!self && nudges < MAX_NUDGES && promisesMore(reply)) {
+          if (!self && !job.standing && nudges < MAX_NUDGES && promisesMore(reply)) {
             nudges++;
             if (record) record.nudges = nudges;
             this.log('[brain] she said what comes next, sending her on');
@@ -1416,7 +1756,7 @@ export class Brain {
 
         // A job on a smaller model that turns out to be a build goes to the main model, which
         // makes the build call itself.
-        const wantsBuild = !self && response.content.some((b) => b.type === 'tool_use' && BUILD_TOOLS.has(b.name));
+        const wantsBuild = !self && response.content.some((b) => b.type === 'tool_use' && isBuildCall(b));
         if (wantsBuild && tier !== 'complex' && model !== claude.model) {
           const restarted = handOver('complex', 'this needs building');
           if (restarted) return restarted;
@@ -1436,7 +1776,7 @@ export class Brain {
       }
 
       if (record) record.end = 'steps';
-      if (!self) await tell('I ran out of steps on that one.');
+      if (!self) await speak('I ran out of steps on that one.');
     } finally {
       clock.end();
     }

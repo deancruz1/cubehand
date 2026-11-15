@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 const TROUBLE_ENDS = ['steps', 'time', 'api_error', 'crash', 'refusal', 'max_tokens'];
 const TIER_ORDER = ['simple', 'normal', 'complex'];
 // Tools that steer the job rather than act in the world, left out of sequences.
-const CONTROL_TOOLS = new Set(['escalate', 'finish']);
+const CONTROL_TOOLS = new Set(['escalate', 'finish', 'standing_job']);
 const DAY = 24 * 60 * 60 * 1000;
 
 // Each rule looks at one field of every row in a section and trips when the value passes its
@@ -50,7 +50,7 @@ export function quantile(values, q) {
 
 const median = (values) => quantile(values, 0.5);
 
-function asJob(raw) {
+export function asJob(raw) {
   if (!isObject(raw)) return null;
   const startMs = Date.parse(raw.start);
   if (Number.isNaN(startMs)) return null;
@@ -60,7 +60,7 @@ function asJob(raw) {
     firstMs: typeof s.firstMs === 'number' ? s.firstMs : null,
     tokens: isObject(s.tokens) ? s.tokens : {},
     cost: typeof s.cost === 'number' ? s.cost : null,
-    tools: (Array.isArray(s.tools) ? s.tools : []).filter(isObject).map((t) => ({ ...t, ok: t.ok !== false, ms: num(t.ms) }))
+    tools: (Array.isArray(s.tools) ? s.tools : []).filter(isObject).map((t) => ({ ...t, ok: t.ok !== false, interrupted: t.interrupted === true, ms: num(t.ms) }))
   }));
   const calls = (Array.isArray(raw.calls) ? raw.calls : []).filter(isObject);
   const tools = steps.flatMap((s) => s.tools);
@@ -75,6 +75,7 @@ function asJob(raw) {
     tier: raw.tier ?? null,
     model: raw.model ?? null,
     reflex: typeof raw.reflex === 'string' ? raw.reflex : null,
+    standing: raw.standing === true,
     lesson: typeof raw.lesson === 'string' ? raw.lesson : null,
     end: raw.end ?? 'unknown',
     ms: num(raw.ms),
@@ -91,13 +92,18 @@ function asJob(raw) {
   };
 }
 
+// Ends of lines that are a side call of their own rather than a job.
+export const SIDE_ENDS = new Set(['lesson', 'busy_reply', 'tidy']);
+
 // Lines that don't parse or aren't a job (a line cut off mid-write, say) are counted and skipped.
-// Lines from the review call after a job (end 'lesson') and replies sorted after their job was
-// logged (end 'busy_reply') aren't jobs and are kept apart.
+// Lines from the review call after a job (end 'lesson'), replies sorted after their job was
+// logged (end 'busy_reply') and the free-time call that tidies the notes (end 'tidy') aren't
+// jobs and are kept apart.
 export function parseLog(text) {
   const jobs = [];
   const lessons = [];
   const busyReplies = [];
+  const tidies = [];
   let bad = 0;
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
@@ -107,11 +113,12 @@ export function parseLog(text) {
     } catch {}
     if (job?.end === 'lesson') lessons.push(job);
     else if (job?.end === 'busy_reply') busyReplies.push(job);
+    else if (job?.end === 'tidy') tidies.push(job);
     else if (job) jobs.push(job);
     else bad++;
   }
-  for (const list of [jobs, lessons, busyReplies]) list.sort((a, b) => a.startMs - b.startMs);
-  return { jobs, bad, lessons, busyReplies };
+  for (const list of [jobs, lessons, busyReplies, tidies]) list.sort((a, b) => a.startMs - b.startMs);
+  return { jobs, bad, lessons, busyReplies, tidies };
 }
 
 // A bare date means local midnight; anything else is read as a time.
@@ -183,12 +190,13 @@ const dayKey = (ms) => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
-// Busy replies and lesson reviews on their own lines aren't jobs, but what they cost is in the
-// cost in all.
-function totalsOf(jobs, busyReplies = [], lessons = []) {
+// Busy replies, lesson reviews and note tidies on their own lines aren't jobs, but what they cost
+// is in the cost in all.
+function totalsOf(jobs, busyReplies = [], lessons = [], tidies = []) {
   const costs = jobs.map((j) => j.cost).filter((c) => c !== null);
   const busyCost = sum(busyReplies.map((b) => num(b.cost)));
   const lessonCost = sum(lessons.map((l) => num(l.cost)));
+  const tidyCost = sum(tidies.map((t) => num(t.cost)));
   const days = countBy(jobs.map((j) => dayKey(j.startMs))).sort((a, b) => a[0].localeCompare(b[0]));
   const first = new Date(jobs[0].startMs);
   const last = new Date(jobs[jobs.length - 1].startMs);
@@ -199,7 +207,7 @@ function totalsOf(jobs, busyReplies = [], lessons = []) {
     from: jobs[0].start,
     to: jobs[jobs.length - 1].start,
     ends: Object.fromEntries(countBy(jobs.map((j) => j.end))),
-    cost: sum(costs) + busyCost + lessonCost,
+    cost: sum(costs) + busyCost + lessonCost + tidyCost,
     jobCost: sum(costs),
     medianCost: median(costs),
     unknownCost: jobs.length - costs.length,
@@ -210,7 +218,11 @@ function totalsOf(jobs, busyReplies = [], lessons = []) {
     busyReplies: busyReplies.length,
     busyCost,
     lessonCost,
+    tidies: tidies.length,
+    tidyCost,
     reflex: Object.fromEntries(countBy(jobs.map((j) => j.reflex).filter(Boolean))),
+    rounds: jobs.filter((j) => j.standing).length,
+    roundCost: sum(jobs.filter((j) => j.standing).map((j) => num(j.cost))),
     perDay: jobs.length / span,
     days: days.map(([day, count]) => ({ day, jobs: count }))
   };
@@ -324,13 +336,15 @@ function byTool(jobs) {
   }
   return [...groups]
     .map(([name, tools]) => {
-      // Only a skill run can fail at the task; saving, listing and forgetting are bookkeeping.
-      const counted = name === 'skill' ? tools.filter((t) => t.action === 'run') : tools;
+      // Only a skill run can fail at the task; saving, listing and forgetting are bookkeeping. A
+      // call stopped from outside (a player's change, a hold, a stop) says nothing either way.
+      const counted = (name === 'skill' ? tools.filter((t) => t.action === 'run') : tools).filter((t) => !t.interrupted);
       const failed = counted.filter((t) => !t.ok);
       const ms = tools.map((t) => t.ms);
       return {
         name,
         calls: tools.length,
+        interrupted: tools.filter((t) => t.interrupted).length,
         failed: failed.length,
         failRate: counted.length ? failed.length / counted.length : null,
         msMedian: median(ms),
@@ -347,14 +361,15 @@ function byTool(jobs) {
 function skillsOf(jobs) {
   const calls = jobs.flatMap((j) => j.tools.filter((t) => t.name === 'skill'));
   const runs = calls.filter((t) => t.action === 'run');
-  const failed = runs.filter((t) => !t.ok).length;
+  const judged = runs.filter((t) => !t.interrupted);
+  const failed = judged.filter((t) => !t.ok).length;
   const worked = (action) => calls.filter((t) => t.action === action && t.ok).length;
   return {
     calls: calls.length,
     jobs: jobs.filter((j) => j.tools.some((t) => t.name === 'skill' && t.action === 'run')).length,
     runs: runs.length,
     failed,
-    failRate: runs.length ? failed / runs.length : null,
+    failRate: judged.length ? failed / judged.length : null,
     saves: worked('save'),
     forgets: worked('forget'),
     lists: calls.filter((t) => t.action === 'list').length
@@ -400,23 +415,29 @@ function trouble(jobs) {
   };
 }
 
-// Runs of successful calls in a row, with a tool repeated back to back counted once. Every
-// stretch of 3 to maxLength tools in a run is counted, and a stretch inside a longer one that
-// came up just as often is dropped.
-export function findSequences(jobs, { minLength = 3, maxLength = 6, minCount = 3, top = 10 } = {}) {
+// A job's runs of successful calls in a row, each a list of tool names with a tool repeated back
+// to back counted once.
+export function toolRuns(job) {
+  const runs = [];
+  let run = [];
+  for (const tool of job.tools) {
+    if (CONTROL_TOOLS.has(tool.name)) continue;
+    if (!tool.ok) {
+      runs.push(run);
+      run = [];
+    } else if (run[run.length - 1] !== tool.name) run.push(tool.name);
+  }
+  runs.push(run);
+  return runs;
+}
+
+// Runs of successful calls in a row (see toolRuns). Every stretch of 3 to maxLength tools in a
+// run is counted, and unless keepInside, a stretch inside a longer one that came up just as often
+// is dropped. Only stretches in minJobs jobs or more are kept.
+export function findSequences(jobs, { minLength = 3, maxLength = 6, minCount = 3, minJobs = 2, top = 10, keepInside = false } = {}) {
   const found = new Map();
   jobs.forEach((job, index) => {
-    const runs = [];
-    let run = [];
-    for (const tool of job.tools) {
-      if (CONTROL_TOOLS.has(tool.name)) continue;
-      if (!tool.ok) {
-        runs.push(run);
-        run = [];
-      } else if (run[run.length - 1] !== tool.name) run.push(tool.name);
-    }
-    runs.push(run);
-    for (const names of runs) {
+    for (const names of toolRuns(job)) {
       for (let length = minLength; length <= Math.min(maxLength, names.length); length++) {
         for (let i = 0; i + length <= names.length; i++) {
           const key = names.slice(i, i + length).join(' > ');
@@ -428,10 +449,10 @@ export function findSequences(jobs, { minLength = 3, maxLength = 6, minCount = 3
       }
     }
   });
-  const kept = [...found.values()].filter((e) => e.count >= minCount && e.jobs.size >= 2);
+  const kept = [...found.values()].filter((e) => e.count >= minCount && e.jobs.size >= minJobs);
   const inside = (short, long) => long.tools.length > short.tools.length && ` ${long.tools.join(' ')} `.includes(` ${short.tools.join(' ')} `);
   return kept
-    .filter((e) => !kept.some((other) => other.count === e.count && inside(e, other)))
+    .filter((e) => keepInside || !kept.some((other) => other.count === e.count && inside(e, other)))
     .sort((a, b) => b.count - a.count || b.tools.length - a.tools.length || a.tools.join().localeCompare(b.tools.join()))
     .slice(0, top)
     .map((e) => ({ tools: e.tools, count: e.count, jobs: e.jobs.size }));
@@ -463,13 +484,13 @@ export function standOut(report, rules = RULES) {
   return found;
 }
 
-export function buildReport(jobs, { bad = 0, lessons = [], busyReplies = [], botName = null, rules = RULES } = {}) {
+export function buildReport(jobs, { bad = 0, lessons = [], busyReplies = [], tidies = [], botName = null, rules = RULES } = {}) {
   const tiers = startTiers(jobs);
   const report = {
     jobs: jobs.length,
     badLines: bad,
     lessons: lessonsOf(lessons),
-    totals: totalsOf(jobs, busyReplies, lessons),
+    totals: totalsOf(jobs, busyReplies, lessons, tidies),
     byModel: byModel(jobs),
     byTier: byTier(jobs, tiers),
     handovers: handovers(jobs, tiers, botName),
@@ -581,7 +602,8 @@ export function formatReport(report, path = 'jobs.jsonl') {
   out.push(`Job report for ${path}: ${totals.jobs} jobs, ${when(totals.from)} to ${when(totals.to)}`);
   const apart = [
     [report.lessons.reviews, 'lesson line'],
-    [totals.busyReplies, 'busy reply line']
+    [totals.busyReplies, 'busy reply line'],
+    [totals.tidies, 'note tidy line']
   ].filter(([n]) => n);
   if (apart.length) {
     const one = sum(apart.map(([n]) => n)) === 1;
@@ -611,8 +633,10 @@ export function formatReport(report, path = 'jobs.jsonl') {
         `in the cost above but not ${one ? 'a job' : 'jobs'}`
     );
   }
+  if (totals.tidies) totalLines.push(`  Note tidies  ${totals.tidies}, ${money(totals.tidyCost)}, in the cost above but not jobs`);
   const reflexes = Object.entries(totals.reflex ?? {});
   if (reflexes.length) totalLines.push(`  Reflex jobs  ${reflexes.map(([kind, n]) => `${kind} ${n}`).join(', ')}`);
+  if (totals.rounds) totalLines.push(`  Rounds       ${totals.rounds} of standing jobs, ${money(totals.roundCost)}`);
   if (totals.days.length > 1) totalLines.push(`  By day       ${totals.days.slice(-14).map((d) => `${d.day.slice(5)} ${d.jobs}`).join(', ')}`);
   section('Totals', totalLines);
 
@@ -643,8 +667,8 @@ export function formatReport(report, path = 'jobs.jsonl') {
 
   if (report.tools.length) {
     const lines = table(
-      ['tool', 'calls', 'failed', 'med s', 'p90 s', 'total s'],
-      report.tools.map((r) => [r.name, r.calls, r.failed ? pct(r.failRate) : '-', secs(r.msMedian), secs(r.msP90), secs(r.msTotal)])
+      ['tool', 'calls', 'interrupted', 'failed', 'med s', 'p90 s', 'total s'],
+      report.tools.map((r) => [r.name, r.calls, r.interrupted || '-', r.failed ? pct(r.failRate) : '-', secs(r.msMedian), secs(r.msP90), secs(r.msTotal)])
     );
     const failing = report.tools.filter((r) => r.failures.length);
     if (failing.length) {
@@ -712,7 +736,7 @@ export function main(argv, { out = console.log, now = Date.now(), configPath = '
     out(`No job log at ${args.path}, so nothing to report.`);
     return 0;
   }
-  const { jobs, bad, lessons, busyReplies } = parseLog(readFileSync(args.path, 'utf8'));
+  const { jobs, bad, lessons, busyReplies, tidies } = parseLog(readFileSync(args.path, 'utf8'));
   if (!jobs.length) {
     out(`No jobs in ${args.path}${bad ? ` (${bad} line${bad === 1 ? '' : 's'} could not be read)` : ''}, so nothing to report.`);
     return 0;
@@ -726,6 +750,7 @@ export function main(argv, { out = console.log, now = Date.now(), configPath = '
     bad,
     lessons: filterJobs(lessons, { ...args, now }),
     busyReplies: filterJobs(busyReplies, { ...args, now }),
+    tidies: filterJobs(tidies, { ...args, now }),
     botName: args.bot ?? botNameFrom(configPath)
   });
   out(args.json ? JSON.stringify(report, null, 2) : formatReport(report, args.path));

@@ -9,6 +9,8 @@ import { DigSpot } from './actions/mining.js';
 import { sleep, canSleepNow, ownBed } from './actions/bed.js';
 import { smelt, readyJob, rawFoodToCook } from './actions/furnace.js';
 import { needsFood, hasFood, eatBest, isThreat, isDeadly, threatsNear, flee, getFood } from './survival.js';
+import { tidyDue, tidyNotes } from './memory.js';
+import { JobRecord } from './joblog.js';
 
 const { GoalNear, GoalFollow } = pathfinderPkg.goals;
 
@@ -16,13 +18,17 @@ const { GoalNear, GoalFollow } = pathfinderPkg.goals;
 // together the blocks one go takes down are.
 const TIDY_RANGE = 48;
 const TIDY_GROUP = 6;
+// Where the notes from before a tidy go, and how long between looks at whether one is due.
+const NOTE_BACKUPS = 'logs/memory-backups';
+const NOTES_CHECK_MS = 10 * 60000;
 
 // What the bot does on its own between jobs, one chore at a time, most urgent first. A player's
 // request stops the chore right away.
 export class Idle {
   // reflexWalking() is true while a walk started on a player's "come here" is still going.
-  // scaffold is the ScaffoldLog of blocks her walks left standing.
-  constructor({ getBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold = null, reflexWalking = () => false }) {
+  // scaffold is the ScaffoldLog of blocks her walks left standing, and memory the notes, which
+  // she tidies once in a while (see tidyNotes in memory.js) into noteBackups.
+  constructor({ getBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold = null, memory = null, noteBackups = NOTE_BACKUPS, reflexWalking = () => false }) {
     this.getBot = getBot;
     this.brain = brain;
     this.survival = survival;
@@ -33,6 +39,8 @@ export class Idle {
     this.smeltJobs = smeltJobs;
     this.placed = placed;
     this.scaffold = scaffold;
+    this.memory = memory;
+    this.noteBackups = noteBackups;
     this.running = null;
     this.until = new Map();
     this.skipMobs = new Set();
@@ -70,8 +78,13 @@ export class Idle {
   tick() {
     const bot = this.getBot();
     if (this.brain.busy) this.anchor = null;
-    if (!this.config.idle.enabled || !bot?.entity || this.running || this.brain.busy || this.brain.paused) return;
+    if (!bot?.entity || this.running || this.brain.busy || this.brain.paused) return;
     if (this.survival.recovering || bot.isSleeping || bot.health <= 0 || Date.now() < this.holdUntil || this.reflexWalking()) return;
+    // With chores off, a standing job still gets its rounds.
+    if (!this.config.idle.enabled) {
+      if (this.brain.standingActive && !bot.pathfinder?.goal) this.brain.standingRound();
+      return;
+    }
     this.anchor ??= bot.entity.position.clone();
     const chore = this.pick(bot);
     if (!chore) return;
@@ -170,6 +183,16 @@ export class Idle {
     const tops = this.ready('tidy') ? this.scaffoldTops(bot) : [];
     if (tops.length && threatsNear(bot, 12).length === 0) {
       return { name: 'take down scaffolding I left', run: (ctx) => this.tidy(ctx, tops) };
+    }
+    if (this.memory && !this.brain.standingActive && this.ready('notes')) {
+      this.later('notes', NOTES_CHECK_MS);
+      if (tidyDue(this.memory.notes, { dir: this.noteBackups })) return { name: 'tidy my notes', run: (ctx) => this.tidyNotes(ctx) };
+    }
+
+    // A standing job takes the place of free time and strolls, once the chores above are done.
+    if (this.brain.standingActive) {
+      this.brain.standingRound();
+      return null;
     }
 
     const minutes = idle.freeTimeMinutes;
@@ -287,6 +310,28 @@ export class Idle {
       if (below) queue.push(below);
     }
     if (removed) this.log(`[idle] took down ${removed} blocks of scaffolding`);
+  }
+
+  // One call to the everyday model that merges notes about the same place or task. The call goes
+  // in the job log as a side line of its own, like a lesson review.
+  async tidyNotes(ctx) {
+    const { signal } = ctx;
+    const brain = this.brain;
+    const model = brain.modelFor('normal');
+    let record = null;
+    const ask = async (request) => {
+      const asked = Date.now();
+      const response = await brain.client.beta.messages.create({ model, ...request, output_config: { effort: 'low' } }, { signal });
+      record = new JobRecord({ text: 'tidy the notes', self: true });
+      record.call('tidy', response.model ?? model, response.usage, Date.now() - asked);
+      return response.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+    };
+    let merges = null;
+    try {
+      merges = await tidyNotes(this.memory, { ask, dir: this.noteBackups, log: this.log, signal });
+    } finally {
+      if (record) brain.writeRecord(record, 'tidy', { merged: merges?.length ?? 0 });
+    }
   }
 
   // A few steps to an open spot close by, then a look around, like a player waiting for something.

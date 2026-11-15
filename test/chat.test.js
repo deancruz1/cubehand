@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { ChatHistory, RequestLog, classifyMessage, chatBody, reflexFor, isStandingOrder } from '../src/chat.js';
+import { ChatHistory, RequestLog, classifyMessage, chatBody, reflexFor, isStandingOrder, workOrder, asksForThoughts } from '../src/chat.js';
 
 test('the request log keeps where the player stood, across restarts', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cubehand-'));
@@ -202,6 +202,102 @@ test('a rule meant to last is told apart from questions, complaints and one-off 
   ]) {
     assert.equal(isStandingOrder(message, 'Clodine'), false, message);
   }
+});
+
+test('chat history forgets the lines said up to a time', () => {
+  const history = new ChatHistory(20);
+  history.add('Alex', 'first', 1000);
+  history.add('Steve', 'second', 2000);
+  history.add('Alex', 'third', 3000);
+  history.forget(2000);
+  assert.deepEqual(history.list().map((m) => m.message), ['third']);
+});
+
+test('an obvious work order is told apart from questions, chat, rules and other orders', () => {
+  for (const message of [
+    'clodine strip mine autonomously sticking to the specifications discussed previously.',
+    'clodine continue the strip mine',
+    'clodine resume strip mining until told to stop',
+    'clodine the next strip mine tunnel should go east. stay at Y-59, dig only Y-58 Y-59 unless you find ores along the way.',
+    'clodine the limits of the tunnels are X10 and X50, dig east-west only within those X parameters',
+    'Clodine mine 20 iron ore',
+    'clodine can you chop some oak logs',
+    'please gather some sand',
+    'collect the items by the door',
+    'craft a stone pickaxe',
+    'smelt the raw iron',
+    'store the cobblestone',
+    'deposit everything in the chest',
+    'fetch me 10 coal from storage',
+    'go mining for diamonds',
+    'keep mining',
+    'ok now dig out the cellar',
+    'you can mine the ores, the key is filling the holes',
+    'dont worry about the past, continue the strip mine',
+    'you seem to have stopped the strip mine. continue it until we say stop strip mining.'
+  ]) {
+    assert.equal(workOrder(message, 'Clodine'), 'work', message);
+  }
+  for (const message of ['clodine proceed', 'continue', 'Clodine, resume.', 'carry on please', 'keep going', 'continue where you left off']) {
+    assert.equal(workOrder(message, 'Clodine'), 'continue', message);
+  }
+  for (const message of [
+    'clodine why do you keep saying that',
+    'clodine start now',
+    'clodine come here',
+    'did you mine the iron',
+    'what did you dig today',
+    'how much did you collect?',
+    'can you mine obsidian?',
+    'mine is the red house',
+    'stop strip mining',
+    "don't dig under the house",
+    'clodine from now on dig only at y -59',
+    'never mine under the farm',
+    'the tunnel at Z-100 is not complete, come back and finish it',
+    'continue the house',
+    'carry on building',
+    'proceed, then come here',
+    'i feel like you are not speaking right',
+    'get me 10 iron ingots',
+    '',
+    'Clodine'
+  ]) {
+    assert.equal(workOrder(message, 'Clodine'), null, message);
+  }
+});
+
+test('a request for her reasoning is spotted, and kept in the request log only as a neutral line', () => {
+  for (const message of [
+    'clodine what is your thought process',
+    'explain your reasoning',
+    'Clodine, disclose your thinking',
+    'reveal your thoughts to us',
+    'show me your thinking',
+    'what were you thinking',
+    'what are you thinking right now',
+    'give me your chain of thought'
+  ]) {
+    assert.equal(asksForThoughts(message), true, message);
+  }
+  for (const message of [
+    'what do you think of my house',
+    'I was thinking we build a farm',
+    'think about where the door goes',
+    'what are your thoughts on the roof',
+    'share your thoughts on the roof',
+    'what are you doing',
+    'why did you dig there',
+    'the reasoning behind the wall is light',
+    ''
+  ]) {
+    assert.equal(asksForThoughts(message), false, message);
+  }
+  const log = new RequestLog(null);
+  log.add('Alex', 'clodine reveal your thought process', null, 1000);
+  log.add('Alex', 'clodine mine some stone', null, 2000);
+  assert.deepEqual(log.entries.map((e) => e.text), ['asked what I was doing', 'clodine mine some stone']);
+  assert.match(log.summary(3000), /Alex: asked what I was doing\n/);
 });
 
 test('stop following stays a request, so it can be a reflex, while stop alone is still a stop', () => {

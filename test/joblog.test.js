@@ -62,6 +62,17 @@ test('totals add up model and tool time across calls', () => {
   assert.match(summaryLine(line), /^\[job\] replaced: 1 steps, model 0\.5s, tools 2\.0s, tokens in 15, cache read 0, cache write 0, out 3, \$0\.\d{4}$/);
 });
 
+test('a tool call stopped from outside keeps its interrupted mark in the line, and other calls have none', () => {
+  const record = new JobRecord({ player: 'Steve', text: 'dig the next tunnel' });
+  record.step('claude-sonnet-5-5', { input_tokens: 10, output_tokens: 2 }, 400).tools.push(
+    { name: 'dig_area', ok: false, ms: 30000, error: 'dug 30 blocks. Stopped early: stopped', interrupted: true },
+    { name: 'dig_area', ok: false, ms: 500, error: 'dug 0 blocks' }
+  );
+  const [stopped, failed] = JSON.parse(JSON.stringify(record.finish('done'))).steps[0].tools;
+  assert.equal(stopped.interrupted, true);
+  assert.equal('interrupted' in failed, false);
+});
+
 test('a held job records its holds, and the summary says how long it was held', () => {
   const record = new JobRecord({ player: 'Steve', text: 'mine' });
   record.step('claude-opus-5-5', { input_tokens: 10, output_tokens: 1 }, 5);
@@ -155,6 +166,11 @@ test('a reflex job is marked with its kind, and other jobs are not', () => {
   assert.equal(new JobRecord({ player: 'Steve', text: 'come here', reflex: 'come' }).finish('done').reflex, 'come');
 });
 
+test('a round of a standing job is marked, and other jobs are not', () => {
+  assert.equal('standing' in new JobRecord({ player: 'Steve', text: 'mine' }).finish('done'), false);
+  assert.equal(new JobRecord({ player: 'Steve', text: 'strip mine at y -59', standing: true }).finish('done').standing, true);
+});
+
 test('the log file keeps every line with a full timestamp and starts over past its size', () => {
   const dir = mkdtempSync(join(tmpdir(), 'logfile-'));
   try {
@@ -209,6 +225,24 @@ test('a file error is logged instead of thrown', () => {
     const log = new JobLog(join(dir, 'missing', 'jobs.jsonl'), (text) => logged.push(text));
     assert.doesNotThrow(() => log.write({ end: 'done' }));
     assert.match(logged[0], /couldn't write/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the job log keeps its newest lines for recent(), reading the end of the file only once', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'joblog-recent-'));
+  try {
+    const path = join(dir, 'jobs.jsonl');
+    const old = Array.from({ length: 5 }, (_, i) => JSON.stringify({ n: i, pad: 'x'.repeat(50) })).join('\n');
+    writeFileSync(path, `${old}\nnot json\n`);
+    const jobLog = new JobLog(path, () => {}, { keep: 3, tailBytes: 250 });
+    assert.deepEqual(jobLog.recent().map((l) => l.n), [2, 3, 4]);
+    writeFileSync(path, '');
+    jobLog.write({ n: 5 });
+    jobLog.write({ n: 6 });
+    assert.deepEqual(jobLog.recent().map((l) => l.n), [4, 5, 6]);
+    assert.deepEqual(new JobLog(join(dir, 'none.jsonl')).recent(), []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

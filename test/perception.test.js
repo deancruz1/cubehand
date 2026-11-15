@@ -11,8 +11,20 @@ import {
   entitiesSummary,
   statusSummary,
   facingFromYaw,
-  scaffoldSummary
+  scaffoldSummary,
+  standingSummary
 } from '../src/perception.js';
+
+test('the standing job gets one line, cut short, and nothing when there is none', () => {
+  assert.equal(standingSummary(null), null);
+  const job = { task: `Strip mine at y -59, ${'one tunnel every 3 blocks, '.repeat(10)}`, by: 'Steve', progress: 'Tunnel at z 3 dug; next is z 6.', rounds: 2, state: 'active', reason: null };
+  const line = standingSummary(job);
+  assert.match(line, /^Standing job \(active; from Steve, 2 rounds so far\): Strip mine at y -59, one tunnel/);
+  assert.match(line, /\.\.\. Progress: Tunnel at z 3 dug; next is z 6\.$/);
+  assert.ok(line.length < 400);
+  assert.equal(line.includes('\n'), false);
+  assert.match(standingSummary({ ...job, state: 'paused', reason: 'Steve said stop' }), /^Standing job \(paused: Steve said stop; from Steve/);
+});
 
 test('inventory groups items by name', () => {
   const items = [

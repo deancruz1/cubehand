@@ -217,6 +217,22 @@ test('reflex jobs are counted by kind', () => {
   assert.doesNotMatch(formatReport(buildReport(parseLog(log(...routed())).jobs)), /Reflex jobs/);
 });
 
+test('rounds of standing jobs are counted with their cost, and old records still load', () => {
+  const jobs = [
+    ...routed(),
+    job({ standing: true, tier: 'normal', model: SONNET, steps: [step(SONNET, [tool('dig_area'), tool('standing_job'), tool('finish')], { cost: 0.2 })] }),
+    job({ standing: true, tier: 'normal', model: SONNET, steps: [step(SONNET, [], { cost: 0.3 })] })
+  ];
+  const report = buildReport(parseLog(log(...jobs)).jobs);
+  assert.equal(report.totals.rounds, 2);
+  near(report.totals.roundCost, 0.5);
+  assert.match(formatReport(report), /\n {2}Rounds {7}2 of standing jobs, \$0\.500\n/);
+  const old = buildReport(parseLog(log(...routed())).jobs);
+  assert.equal(old.totals.rounds, 0);
+  assert.equal(parseLog(log(...routed())).jobs.every((j) => j.standing === false), true);
+  assert.doesNotMatch(formatReport(old), /Rounds/);
+});
+
 test('totals count jobs, ends, cost, time and jobs a day', () => {
   const jobs = parseLog(log(...routed())).jobs;
   const { totals } = buildReport(jobs);
@@ -321,6 +337,35 @@ test('by tool counts calls, failures, times and the commonest failure texts', ()
   const craft = rows.find((r) => r.name === 'craft');
   assert.equal(craft.failures.length, 3);
   assert.deepEqual(craft.failures[0], { text: 'b N', count: 2 });
+});
+
+test('calls stopped from outside are counted apart and left out of failure rates and common failures', () => {
+  const stopped = { interrupted: true, error: 'dug 29 blocks. Stopped early: stopped' };
+  const tools = [
+    tool('dig_area', true, 60000),
+    tool('dig_area', false, 30000, stopped),
+    tool('dig_area', false, 20000, stopped),
+    tool('dig_area', false, 5000, { error: 'dug 0 blocks. Left 3 blocks that would not break' }),
+    tool('skill', false, 100, { action: 'run', ...stopped }),
+    tool('skill', true, 100, { action: 'run' })
+  ];
+  const report = buildReport(parseLog(log(job({ steps: [step(OPUS, tools)] }))).jobs);
+  const dig = report.tools.find((r) => r.name === 'dig_area');
+  assert.deepEqual([dig.calls, dig.interrupted, dig.failed, dig.failRate, dig.msTotal], [4, 2, 1, 0.5, 115000]);
+  assert.deepEqual(dig.failures, [{ text: 'dug N blocks. Left N blocks that would not break', count: 1 }]);
+  const skill = report.tools.find((r) => r.name === 'skill');
+  assert.deepEqual([skill.calls, skill.interrupted, skill.failed, skill.failRate], [2, 1, 0, 0]);
+  assert.deepEqual([report.skills.runs, report.skills.failed, report.skills.failRate], [2, 0, 0]);
+  const text = formatReport(report);
+  assert.match(text, /\n {2}tool +calls +interrupted +failed +med s +p90 s +total s\n/);
+  assert.match(text, /\n {2}dig_area +4 +2 +50% /);
+  assert.match(text, /\n {2}skill +2 +1 +- /);
+
+  // Lines from before the mark load as they did.
+  const old = tools.map(({ interrupted, ...rest }) => rest);
+  const before = buildReport(parseLog(log(job({ steps: [step(OPUS, old)] }))).jobs).tools.find((r) => r.name === 'dig_area');
+  assert.deepEqual([before.interrupted, before.failed, before.failRate], [0, 3, 0.75]);
+  assert.match(formatReport(buildReport(parseLog(log(job({ steps: [step(OPUS, old)] }))).jobs)), /\n {2}dig_area +4 +- +75% /);
 });
 
 test('trouble lists jobs that ended badly, were nudged, held or warned, and the dearest and slowest', () => {
@@ -510,4 +555,27 @@ test('--json prints the numbers as data, with the bot name from the config', (t)
   assert.deepEqual(Object.keys(data.trouble), ['ended', 'nudged', 'held', 'warned', 'expensive', 'slowest']);
   assert.deepEqual(data.handovers.words, [{ words: 'fix the', count: 2 }]);
   assert.equal(data.standOut[0].rule, 'escalation rate');
+});
+
+test('note tidy lines are counted apart and are not jobs, and their cost is in the cost in all', () => {
+  const tidy = sideLine('tidy', 'tidy', 0.004, { freeTime: true, merged: 2 });
+  const parsed = parseLog(log(...routed(), tidy));
+  assert.equal(parsed.jobs.length, 4);
+  assert.equal(parsed.tidies.length, 1);
+  const report = buildReport(parsed.jobs, parsed);
+  assert.equal(report.totals.ends.tidy, undefined);
+  assert.equal(report.totals.tidies, 1);
+  near(report.totals.tidyCost, 0.004);
+  near(report.totals.cost, 0.001 + 0.0605 + 0.0044 + 0.06 + 0.004);
+  const text = formatReport(report);
+  assert.match(text, /\nLeft out 1 note tidy line, which is not a job\.\n/);
+  assert.match(text, /\n {2}Note tidies {2}1, \$0\.0040, in the cost above but not jobs\n/);
+});
+
+test('sequences can keep stretches inside longer ones and ask for more jobs', () => {
+  const jobs = [1, 2, 3].map(() => job({ steps: [step(OPUS, ['a', 'b', 'c', 'd'].map((n) => tool(n)))] }));
+  const parsed = parseLog(log(...jobs)).jobs;
+  assert.deepEqual(findSequences(parsed), [{ tools: ['a', 'b', 'c', 'd'], count: 3, jobs: 3 }]);
+  assert.equal(findSequences(parsed, { keepInside: true, top: Infinity }).length, 3);
+  assert.deepEqual(findSequences(parsed, { minJobs: 4 }), []);
 });
