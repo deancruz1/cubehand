@@ -1,5 +1,5 @@
-import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 // US dollars per million tokens. Cache writes cost more for the 1 hour lifetime than for 5 minutes.
 const PRICES = {
@@ -61,11 +61,13 @@ function addTokens(total, tokens) {
 
 // One job from start to end: every model call (steps, mid-job replies) and every tool.
 export class JobRecord {
-  constructor({ player = null, text = null, self = false } = {}) {
+  constructor({ player = null, text = null, self = false, reflex = null } = {}) {
     this.startedAt = Date.now();
     this.player = player;
     this.text = text;
     this.self = self;
+    // 'come', 'follow' or 'stay' when the body acted on the order before the model was asked.
+    this.reflex = reflex;
     // Times the job was put on hold (low health, a lost connection) and how long in all.
     this.holds = 0;
     this.heldMs = 0;
@@ -79,6 +81,10 @@ export class JobRecord {
     // The job's last line to the player, and how often it was sent on for only saying what's next.
     this.reply = null;
     this.nudges = 0;
+    // The model and category of each refusal the job got, retried or not, and whether leaving out
+    // the carried-over parts of the first turn got a refused step through.
+    this.refusals = [];
+    this.leanCured = false;
     this.calls = [];
     this.steps = [];
     this.finished = false;
@@ -90,9 +96,10 @@ export class JobRecord {
     this.calls.push({ kind, model, ms, tokens, cost: costOf(model, tokens) });
   }
 
-  step(model, usage, ms) {
+  // firstMs is how long the first text or tool call of the answer took to come in.
+  step(model, usage, ms, firstMs = ms) {
     const tokens = meters(usage);
-    const step = { model, ms, tokens, cost: costOf(model, tokens), tools: [] };
+    const step = { model, ms, firstMs, tokens, cost: costOf(model, tokens), tools: [] };
     this.steps.push(step);
     return step;
   }
@@ -124,6 +131,8 @@ export class JobRecord {
       ...(this.error ? { error: this.error } : {}),
       ...(this.reply ? { reply: this.reply } : {}),
       ...(this.nudges ? { nudges: this.nudges } : {}),
+      ...(this.reflex ? { reflex: this.reflex } : {}),
+      ...(this.refusals.length ? { refusals: { count: this.refusals.length, by: this.refusals, ...(this.leanCured ? { leanCured: true } : {}) } } : {}),
       ms: Date.now() - this.startedAt,
       calls: this.calls,
       steps: this.steps,
@@ -157,6 +166,35 @@ export class JobLog {
       appendFileSync(this.path, JSON.stringify(line) + '\n');
     } catch (err) {
       this.log(`[joblog] couldn't write ${this.path}: ${err.message}`);
+    }
+  }
+}
+
+// Each refused request goes to a file of its own in dir, so the exact context it was sent with can
+// be read afterwards. Only the newest keep files are kept. A file problem is logged and never
+// stops a job.
+export class RefusalLog {
+  constructor(dir = 'logs/refusals', keep = 20, log = console.log) {
+    this.dir = dir;
+    this.keep = keep;
+    this.log = log;
+    this.count = 0;
+  }
+
+  // Returns the path it wrote, or null.
+  write(entry, now = new Date()) {
+    try {
+      mkdirSync(this.dir, { recursive: true });
+      this.count++;
+      const model = String(entry.model ?? 'unknown').replace(/[^\w.-]/g, '');
+      const path = join(this.dir, `${now.toISOString().replace(/[:.]/g, '-')}-${String(this.count).padStart(4, '0')}-${model}.json`);
+      writeFileSync(path, JSON.stringify(entry, null, 2));
+      const files = readdirSync(this.dir).filter((f) => f.endsWith('.json')).sort();
+      for (const old of files.slice(0, Math.max(files.length - this.keep, 0))) rmSync(join(this.dir, old), { force: true });
+      return path;
+    } catch (err) {
+      this.log(`[joblog] couldn't save the refused request: ${err.message}`);
+      return null;
     }
   }
 }

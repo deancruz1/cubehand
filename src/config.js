@@ -64,22 +64,41 @@ export function validateConfig(raw, env) {
   if (scale !== undefined && !(typeof scale === 'number' && scale >= 0)) {
     throw new ConfigError('config.json bot.pauseScale must be a number, 0 or more.');
   }
+  if (raw.bot.gestures !== undefined && typeof raw.bot.gestures !== 'boolean') {
+    throw new ConfigError('config.json bot.gestures must be true or false.');
+  }
+  if (raw.bot.reflexes !== undefined && typeof raw.bot.reflexes !== 'boolean') {
+    throw new ConfigError('config.json bot.reflexes must be true or false.');
+  }
+  if (raw.bot.xray !== undefined && typeof raw.bot.xray !== 'boolean') {
+    throw new ConfigError('config.json bot.xray must be true or false.');
+  }
+  for (const key of ['lessons', 'skills']) {
+    const value = raw.learning?.[key];
+    if (value !== undefined && typeof value !== 'boolean') throw new ConfigError(`config.json learning.${key} must be true or false.`);
+  }
 
   return {
     ...raw,
     // Players who may give standing orders and confirm breaking protected blocks.
     admins: raw.admins ?? raw.allowlist,
-    // pauseScale scales the short human-like waits between actions, 0 for none.
-    bot: { pauseScale: 1, ...raw.bot },
+    // pauseScale scales the short human-like waits between actions, 0 for none. gestures is the
+    // head movement, nods and turning to players while she waits on the model. reflexes start
+    // her moving on a plain "come here", "follow me" or "stay" before the model answers. xray lets
+    // mine and find_block go for ore buried in the rock, which no player could see.
+    bot: { pauseScale: 1, gestures: true, reflexes: true, xray: false, ...raw.bot },
     claude: {
-      fallback: true, strictTools: true, maxTokens: 16000, maxRetries: 2, busyReplies: true, buildEffort: 'high',
+      fallback: true, strictTools: true, streaming: true, maxTokens: 16000, maxRetries: 2, busyReplies: true, buildEffort: 'high',
       routing: true, everydayModel: 'claude-sonnet-5-5', quickModel: 'claude-haiku-5-5', ...raw.claude
     },
     // maxDigBlocks is the biggest box dig_area takes. warnCostUsd is the job cost that gets a
     // warning (and again each time it doubles), 0 for none. It never stops a job.
     limits: { buildMaxSteps: 40, buildMaxSeconds: 1200, stuckSeconds: 45, quietSeconds: 60, maxDigBlocks: 1000, warnCostUsd: 2, ...raw.limits },
     idle: { enabled: true, freeTimeMinutes: 15, freeTimeSteps: 8, freeTimeSeconds: 240, defendRadius: 10, ...raw.idle },
-    survival: { criticalHealth: 8, eatAtFood: 14, ...raw.survival }
+    survival: { criticalHealth: 8, eatAtFood: 14, ...raw.survival },
+    // lessons are one-line notes she writes after a job goes wrong, shown to later jobs that fit.
+    // skills are routines of her own tool calls she saves and runs again in one call.
+    learning: { lessons: true, skills: true, ...raw.learning }
   };
 }
 

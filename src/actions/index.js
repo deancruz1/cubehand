@@ -18,6 +18,7 @@ import { sleep } from './bed.js';
 import { equip, unequip, dropItem } from './inventory.js';
 import { fail } from './util.js';
 import { takeStock, stateLine } from '../perception.js';
+import { skillAction } from '../skills.js';
 
 export const ACTIONS = {
   say,
@@ -56,7 +57,8 @@ export const ACTIONS = {
   sleep,
   equip,
   unequip,
-  drop_item: dropItem
+  drop_item: dropItem,
+  skill: skillAction(runAction)
 };
 
 export async function runAction(ctx, name, input) {

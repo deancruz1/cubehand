@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { ChatHistory, RequestLog, classifyMessage, chatBody } from '../src/chat.js';
+import { ChatHistory, RequestLog, classifyMessage, chatBody, reflexFor, isStandingOrder } from '../src/chat.js';
 
 test('the request log keeps where the player stood, across restarts', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cubehand-'));
@@ -110,4 +110,101 @@ test('a stop word that asks for something else is still a request', () => {
 
 test('a name that only contains the bot name is not a mention', () => {
   assert.equal(classifyMessage({ username: 'Steve', message: 'Clodines are cool' }, opts).type, 'history');
+});
+
+test('plain come, follow and stay orders are reflexes, with the name and punctuation anywhere', () => {
+  const orders = {
+    come: ['come', 'Clodine come here', 'come here!', 'COME HERE Clodine', '@Clodine, come over.', 'come over here please', 'please come to me', 'clodine over here', 'come  here'],
+    follow: ['follow', 'follow me', 'Clodine, follow me!', 'follow me please clodine', 'please come with me', 'come with me?'],
+    stay: ['stay', 'stay here', 'Clodine wait', 'wait here please', 'stop following', 'clodine, stop following me.', 'please stay']
+  };
+  for (const [kind, messages] of Object.entries(orders)) {
+    for (const message of messages) assert.equal(reflexFor(message, 'Clodine'), kind, message);
+  }
+});
+
+test('anything more, a typo or another language is not a reflex', () => {
+  for (const message of [
+    'come here and bring the wood',
+    'follow jouleano6',
+    'come to the farm',
+    'come here when you are done',
+    'follow me to the mine',
+    'stay here and guard the door',
+    'wait for me at the house',
+    'hey clodine come here',
+    'come here now',
+    'here',
+    'with me',
+    'over',
+    'comee here',
+    'cmoe here',
+    'folow me',
+    'follwo me',
+    'sty here',
+    'ven aqui',
+    'komm her',
+    'suis-moi',
+    'viens ici',
+    'sígueme',
+    'please',
+    '',
+    'Clodine',
+    'stop'
+  ]) {
+    assert.equal(reflexFor(message, 'Clodine'), null, message);
+  }
+});
+
+test('a rule meant to last is told apart from questions, complaints and one-off orders', () => {
+  for (const message of [
+    // Seen live, answered "Understood" and never saved.
+    'clodine from now on, if you see an iron door, look for a button or switch around it and do not burrow around it',
+    'Clodine, this is an instruction, never deviate from y-59, unless its for the purpose of mining high quality ores exposed during your strip mining. after completely mining out the vein, return back to your normal strip mine operation at y -59.',
+    'clodine, in your strip mine operation, never deviate from y -59. if you suddenly find yourself deviating, adjust back to y -59 immediately.',
+    'clodine never EVER burrow across tunnels and return to -59',
+    'Clodine always close the door behind you',
+    'whenever you see a creeper, warn us',
+    'every time you finish a tunnel, come back to the main shaft',
+    'clodine remember that the farm gate stays shut',
+    'remember to replant saplings',
+    'do not ever take from my chest',
+    "Clodine don't ever break the glass",
+    'in future put wood in the wood chest',
+    'going forward, store ores in the ore chest',
+    'never mind that, from now on stay at y -59',
+    'this is a rule: no digging under the house'
+  ]) {
+    assert.equal(isStandingOrder(message, 'Clodine'), true, message);
+  }
+  for (const message of [
+    'clodine tell me why you jump up from -59 constantly',
+    'clodine why does it take you longer to break ore blocks than other blocks',
+    'why do you always jump up from -59?',
+    'do you always mine like that',
+    'is it always this dark down here',
+    'will you always stay at -59?',
+    'never mind',
+    'Clodine nevermind, come here',
+    'I never said that',
+    'you never listen',
+    'you always dig up',
+    "she's always digging up",
+    'always wanted to ask, how do you mine so fast',
+    'I always wanted a castle',
+    'clodine dig a tunnel going east from where im standing, it should end at the X level of the right corner',
+    'clodine continue the strip mining pattern at -59 strictly.',
+    'clodine stop',
+    'Clodine come here',
+    'remember',
+    '',
+    'Clodine'
+  ]) {
+    assert.equal(isStandingOrder(message, 'Clodine'), false, message);
+  }
+});
+
+test('stop following stays a request, so it can be a reflex, while stop alone is still a stop', () => {
+  assert.equal(classifyMessage({ username: 'Steve', message: 'Clodine stop following me' }, opts).type, 'request');
+  assert.equal(classifyMessage({ username: 'Steve', message: 'Clodine stop' }, opts).type, 'stop');
 });

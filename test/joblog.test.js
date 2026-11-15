@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { meters, costOf, JobRecord, JobLog, LogFile, summaryLine } from '../src/joblog.js';
+import { meters, costOf, JobRecord, JobLog, LogFile, RefusalLog, summaryLine } from '../src/joblog.js';
 
 test('meters keep the cache write split when the API gives one', () => {
   assert.deepEqual(meters({ input_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 3, output_tokens: 4 }), {
@@ -47,7 +47,9 @@ test('a model with no known price gets a null cost but keeps its tokens', () => 
 test('totals add up model and tool time across calls', () => {
   const record = new JobRecord({ self: true });
   record.call('router', 'claude-haiku-5-5', { input_tokens: 5, output_tokens: 1 }, 100);
-  const step = record.step('claude-sonnet-5-5', { input_tokens: 10, output_tokens: 2 }, 400);
+  const step = record.step('claude-sonnet-5-5', { input_tokens: 10, output_tokens: 2 }, 400, 150);
+  assert.equal(step.firstMs, 150);
+  assert.equal(new JobRecord().step('claude-sonnet-5-5', undefined, 300).firstMs, 300);
   step.tools.push({ name: 'mine', ok: true, ms: 1500 }, { name: 'craft', ok: false, ms: 500 });
   const line = record.finish('replaced');
   assert.equal(line.freeTime, true);
@@ -104,6 +106,53 @@ test('the final line and nudges go in the line only when there are any', () => {
   assert.equal(line.reply, 'Mined.');
   assert.equal(line.nudges, 1);
   assert.doesNotMatch(summaryLine(line), /Mined|nudge/);
+});
+
+test('refusals go in the line with their count and models only when there are any', () => {
+  assert.equal('refusals' in new JobRecord({ player: 'Steve', text: 'mine' }).finish('done'), false);
+  const record = new JobRecord({ player: 'Steve', text: 'mine' });
+  record.refusals.push({ model: 'claude-sonnet-5-5', category: null }, { model: 'claude-opus-5-5', category: 'cyber' });
+  assert.deepEqual(record.finish('refusal').refusals, {
+    count: 2,
+    by: [
+      { model: 'claude-sonnet-5-5', category: null },
+      { model: 'claude-opus-5-5', category: 'cyber' }
+    ]
+  });
+});
+
+test('the refusal log writes one file per refusal and keeps only the newest', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'refusals-'));
+  try {
+    const log = new RefusalLog(join(dir, 'refusals'), 3, () => {});
+    const paths = [];
+    for (let i = 0; i < 5; i++) paths.push(log.write({ model: 'claude-sonnet-5-5', n: i }, new Date(2026, 10, 15, 17, 39, 44)));
+    const files = readdirSync(join(dir, 'refusals')).sort();
+    assert.equal(files.length, 3);
+    assert.deepEqual(files.map((f) => JSON.parse(readFileSync(join(dir, 'refusals', f), 'utf8')).n), [2, 3, 4]);
+    assert.ok(paths.every((p) => p.endsWith('claude-sonnet-5-5.json')));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a refusal log that cannot be written logs it and never throws', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'refusals-'));
+  try {
+    const blocked = join(dir, 'blocked');
+    writeFileSync(blocked, '');
+    const logged = [];
+    const log = new RefusalLog(join(blocked, 'refusals'), 20, (text) => logged.push(text));
+    assert.equal(log.write({ model: 'x' }), null);
+    assert.match(logged[0], /couldn't save the refused request/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a reflex job is marked with its kind, and other jobs are not', () => {
+  assert.equal('reflex' in new JobRecord({ player: 'Steve', text: 'mine' }).finish('done'), false);
+  assert.equal(new JobRecord({ player: 'Steve', text: 'come here', reflex: 'come' }).finish('done').reflex, 'come');
 });
 
 test('the log file keeps every line with a full timestamp and starts over past its size', () => {

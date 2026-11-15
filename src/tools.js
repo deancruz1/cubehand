@@ -1,3 +1,5 @@
+import { SKILL_TOOL } from './skills.js';
+
 const int = { type: 'integer' };
 const str = { type: 'string' };
 const itemList = {
@@ -192,14 +194,14 @@ export const TOOLS = [
   ),
   tool(
     'mine',
-    'Mine natural blocks of a type nearby like a player: terrain (stone, deepslate, dirt, sand, gravel...), ores, and natural blocks that double as build materials (sandstone, red_sandstone, obsidian, ice, packed_ice, blue_ice, basalt, blackstone, terracotta, glowstone, magma_block, amethyst_block...). Picks the easiest visible ones first, walks around to reach them, follows veins, grabs ores it passes, avoids lava, and picks up the drops. Never takes blocks you placed or anything in or next to a build, and skips build materials like sandstone or obsidian with anything built within 5 blocks. Crafted blocks like planks, glass, bricks or cobblestone are refused: use break_block on specific blocks once a player has confirmed. Searches 32 blocks around you, so walk to the right area first. Leave block out for stone, count out for 16 (max 64). Use a short name like coal_ore or ore to match every kind. For logs use chop_tree.',
+    'Mine natural blocks of a type nearby like a player: terrain (stone, deepslate, dirt, sand, gravel...), ores, and natural blocks that double as build materials (sandstone, red_sandstone, obsidian, ice, packed_ice, blue_ice, basalt, blackstone, terracotta, glowstone, magma_block, amethyst_block...). Only takes blocks exposed to open space you can walk to, nearest and easiest first, never ore buried in rock; takes the whole vein of an ore and comes back. It eats into any exposed wall, the walls of dug tunnels too, so use dig_area for tunnels and strip mines. Grabs ores it passes, avoids lava, and picks up the drops. Never takes blocks you placed or anything in or next to a build, and skips build materials like sandstone or obsidian with anything built within 5 blocks. Crafted blocks like planks, glass, bricks or cobblestone are refused: use break_block on specific blocks once a player has confirmed. Searches 32 blocks around you, so walk to the right area first. Leave block out for stone, count out for 16 (max 64). Use a short name like coal_ore or ore to match every kind. For logs use chop_tree.',
     { block: str, count: int },
     []
   ),
   tool(
     'dig_area',
-    'Dig out every block in the box between x1 y1 z1 and x2 y2 z2 in one call: clearing a spot, a hole (a 5x5 hole 3 deep is the box from the top layer down 3), a trench from one point to another, or flattening ground (the box over everything above the new ground level). Works the top layer first and each layer nearest block first, never digs the block it stands on, and picks up the drops. Takes natural terrain like mine does (dirt, stone, sand, gravel, ores, and build materials like sandstone only away from builds) plus grass, flowers, snow and other plants. Leaves everything else and lists it with the reason and where: built or crafted blocks, protected blocks, blocks you placed, logs (use chop_tree), terrain touching a build, blocks with lava next to them or a cave right under them, and blocks your tools can\'t harvest; use break_block for those only once a player confirms. Sand or gravel falling in from above is dug too. Big boxes are refused with the limit, then do it in parts. Returns how many it dug of what, what was left and why, what it picked up and where you are.',
-    { x1: int, y1: int, z1: int, x2: int, y2: int, z2: int },
+    'Dig out exactly the box between x1 y1 z1 and x2 y2 z2 and nothing outside it: a tunnel, strip mine, room, a hole (a 5x5 hole 3 deep is the box from the top layer down 3), a trench, or flattening ground (the box over everything above the new ground level). y is the floor where feet go, so a tunnel you can walk is 2 high: y1 = y, y2 = y+1; a 1-high box can\'t be walked into. Walks round through open space to reach it; tunnels and rooms are dug face by face standing on the floor from the end it gets to, holes from the top layer down. Never digs the block it stands on, and picks up the drops. Takes natural terrain like mine does (dirt, stone, sand, gravel, ores, and build materials like sandstone only away from builds) plus grass, flowers, snow and other plants. Leaves everything else and lists it with the reason and where: built or crafted blocks, protected blocks, blocks you placed, logs (use chop_tree), terrain touching a build, blocks with lava next to them or a cave right under them, and blocks your tools can\'t harvest; use break_block for those only once a player confirms. Sand or gravel falling in from above is dug too. ores true also mines out ore veins the dig uncovers in the walls, floor and ceiling, then carries on; without it they are listed with where they are. Big boxes are refused with the limit, then do it in parts. Returns how many it dug of what, what was left and why, what it picked up and where you are.',
+    { x1: int, y1: int, z1: int, x2: int, y2: int, z2: int, ores: { type: 'boolean' } },
     ['x1', 'y1', 'z1', 'x2', 'y2', 'z2']
   ),
   tool(
@@ -272,8 +274,9 @@ export const TOOLS = [
   ),
   tool(
     'find_block',
-    'Find the nearest blocks of a type, up to 128 blocks away (default 64). Give a full name like oak_log, or a short one like log, chest, or stone to match every kind.',
+    'Find the nearest blocks of a type, up to 128 blocks away (default 64). Give a full name like oak_log, or a short one like log, chest, or stone to match every kind. Ores only count when exposed to open space you can walk to.',
     { block: str, maxDistance: int },
     ['block']
-  )
+  ),
+  SKILL_TOOL
 ];

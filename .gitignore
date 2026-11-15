@@ -4,8 +4,14 @@ node_modules/
 memory.json
 placed.json
 placed.json.tmp
+scaffold.json
+scaffold.json.tmp
 chests.json
 chests.json.tmp
 requests.json
 jobs.jsonl
+lessons.json
+lessons.json.tmp
+skills.json
+skills.json.tmp
 logs/

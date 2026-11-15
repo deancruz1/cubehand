@@ -48,6 +48,50 @@ test('pauseScale defaults to 1 and must be a number, 0 or more', () => {
   assert.throws(() => validateConfig(raw, env), /pauseScale/);
 });
 
+test('gestures default to on and must be true or false', () => {
+  const raw = copy();
+  delete raw.bot.gestures;
+  assert.equal(validateConfig(raw, env).bot.gestures, true);
+  raw.bot.gestures = false;
+  assert.equal(validateConfig(raw, env).bot.gestures, false);
+  raw.bot.gestures = 'no';
+  assert.throws(() => validateConfig(raw, env), /bot\.gestures/);
+});
+
+test('xray defaults to off and must be true or false', () => {
+  const raw = copy();
+  assert.equal(validateConfig(raw, env).bot.xray, false);
+  delete raw.bot.xray;
+  assert.equal(validateConfig(raw, env).bot.xray, false);
+  raw.bot.xray = true;
+  assert.equal(validateConfig(raw, env).bot.xray, true);
+  raw.bot.xray = 'yes';
+  assert.throws(() => validateConfig(raw, env), /bot\.xray/);
+});
+
+test('reflexes default to on and must be true or false', () => {
+  const raw = copy();
+  delete raw.bot.reflexes;
+  assert.equal(validateConfig(raw, env).bot.reflexes, true);
+  raw.bot.reflexes = false;
+  assert.equal(validateConfig(raw, env).bot.reflexes, false);
+  raw.bot.reflexes = 'no';
+  assert.throws(() => validateConfig(raw, env), /bot\.reflexes/);
+});
+
+test('lessons and skills default to on and must be true or false', () => {
+  const raw = copy();
+  assert.deepEqual(validateConfig(raw, env).learning, { lessons: true, skills: true });
+  delete raw.learning;
+  assert.deepEqual(validateConfig(raw, env).learning, { lessons: true, skills: true });
+  raw.learning = { skills: false };
+  assert.deepEqual(validateConfig(raw, env).learning, { lessons: true, skills: false });
+  for (const key of ['lessons', 'skills']) {
+    raw.learning = { [key]: 'no' };
+    assert.throws(() => validateConfig(raw, env), new RegExp(`learning\\.${key}`));
+  }
+});
+
 test('warnCostUsd defaults to 2 and must be a number, 0 or more', () => {
   const raw = copy();
   assert.equal(validateConfig(raw, env).limits.warnCostUsd, 2);
@@ -63,6 +107,15 @@ test('warnCostUsd defaults to 2 and must be a number, 0 or more', () => {
   assert.throws(() => validateConfig(raw, env), /warnCostUsd/);
   raw.limits.warnCostUsd = '2';
   assert.throws(() => validateConfig(raw, env), /warnCostUsd/);
+});
+
+test('streaming defaults to on and can be turned off', () => {
+  const raw = copy();
+  assert.equal(validateConfig(raw, env).claude.streaming, true);
+  delete raw.claude.streaming;
+  assert.equal(validateConfig(raw, env).claude.streaming, true);
+  raw.claude.streaming = false;
+  assert.equal(validateConfig(raw, env).claude.streaming, false);
 });
 
 test('empty allowlist is rejected', () => {

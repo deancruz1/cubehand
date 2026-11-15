@@ -5,7 +5,7 @@ import { ChatHistory, RequestLog, classifyMessage, chatBody } from './chat.js';
 import { buildSnapshot } from './perception.js';
 import { Brain } from './brain.js';
 import { Memory } from './memory.js';
-import { PlacedLog } from './placed.js';
+import { PlacedLog, ScaffoldLog } from './placed.js';
 import { ChestIndex } from './chests.js';
 import { runAction } from './actions/index.js';
 import { chatLines } from './actions/chat.js';
@@ -16,7 +16,12 @@ import { AreaRecorder, TravelLog } from './areas.js';
 import { Survival } from './survival.js';
 import { Idle } from './idle.js';
 import { Status } from './status.js';
-import { JobLog, LogFile } from './joblog.js';
+import { Gestures } from './gestures.js';
+import { Reflex } from './reflex.js';
+import { JobLog, LogFile, RefusalLog } from './joblog.js';
+import { Lessons, isCorrection } from './lessons.js';
+import { Skills } from './skills.js';
+import { TOOLS } from './tools.js';
 
 const logFile = new LogFile('logs/bot.log');
 
@@ -42,10 +47,13 @@ const history = new ChatHistory(config.perception.chatHistory);
 const requests = new RequestLog();
 const memory = new Memory();
 const placed = new PlacedLog();
+const scaffold = new ScaffoldLog();
 const chests = new ChestIndex();
 const areas = new AreaRecorder();
 const travel = new TravelLog();
 const smeltJobs = new Map();
+const lessons = config.learning.lessons ? new Lessons('lessons.json', { ignore: [config.bot.username, ...config.allowlist], log }) : null;
+const skills = config.learning.skills ? new Skills({ tools: TOOLS }) : null;
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, maxRetries: config.claude.maxRetries });
 
 let connection;
@@ -68,6 +76,7 @@ function say(text, to = null) {
   }
   for (const part of parts) send(part);
   status.spoke();
+  gestures.said(brain.current);
 }
 
 const status = new Status({
@@ -79,11 +88,11 @@ const status = new Status({
   quietSeconds: config.limits.quietSeconds
 });
 // requester is the player whose job is running, or null for the bot's own chores.
-const makeCtx = (signal) => ({ bot: currentBot(), config, signal, memory, placed, areas, smeltJobs, status, log, requester: brain.current?.self ? null : brain.current?.player ?? null });
+const makeCtx = (signal) => ({ bot: currentBot(), config, signal, memory, placed, areas, smeltJobs, status, skills, log, requester: brain.current?.self ? null : brain.current?.player ?? null });
 
 function snapshot() {
   const bot = currentBot();
-  const notes = [status.summary(), memory.summary(bot.entity.position), requests.summary(), areas.status(), travel.summary(), smeltSummary(smeltJobs)].filter(Boolean).join('\n\n');
+  const notes = [status.summary(), memory.summary(bot.entity.position), skills?.summary(), requests.summary(), areas.status(), travel.summary(), smeltSummary(smeltJobs)].filter(Boolean).join('\n\n');
   return buildSnapshot(bot, config, history.list(), notes);
 }
 
@@ -104,21 +113,42 @@ const brain = new Brain({
   config,
   log,
   jobLog: new JobLog('jobs.jsonl', log),
+  refusalLog: new RefusalLog('logs/refusals', 20, log),
+  forgetRequests: (before) => requests.forget(before),
+  lessons,
   say,
   snapshot,
-  runTool: (name, input, signal) => runAction(makeCtx(signal), name, input),
+  runTool: (name, input, signal, requester) => {
+    reflex.toolStarting(brain.current);
+    const ctx = makeCtx(signal);
+    return runAction(requester ? { ...ctx, requester } : ctx, name, input);
+  },
   onStop: () => currentBot()?.pathfinder?.setGoal(null),
   onJobStart: async () => {
     await idle.interrupt();
     await wakeUp();
   },
   beforeStep: () => survival.eatIfHungry(),
-  watchTool: (name, controller) => status.watch(name, controller)
+  watchTool: (name, controller) => status.watch(name, controller),
+  onThinking: (active, job) => gestures.think(active, job)
 });
 // Nothing starts before the bot has spawned.
 brain.pause('offline');
-const survival = new Survival({ getBot: currentBot, brain, config, makeCtx, log, say, stopChores: () => idle.interrupt() });
-const idle = new Idle({ getBot: currentBot, brain, survival, config, makeCtx, log, smeltJobs, placed });
+const survival = new Survival({
+  getBot: currentBot,
+  brain,
+  config,
+  makeCtx,
+  log,
+  say,
+  stopChores: () => {
+    reflex.cancel();
+    return idle.interrupt();
+  }
+});
+const idle = new Idle({ getBot: currentBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold, reflexWalking: () => reflex.walking });
+const reflex = new Reflex({ getBot: currentBot, brain, idle, config, makeCtx, log, say });
+const gestures = new Gestures({ getBot: currentBot, brain, survival, idle, config, toolRunning: () => Boolean(status.run || brain.current?.tool || reflex.walking) });
 survival.start();
 idle.start();
 status.start();
@@ -132,26 +162,23 @@ function onMessage(username, message, whisper) {
   // Keep the bot's own lines too, so the next request knows what it last said.
   if (!whisper) history.add(username, message);
   if (result.type === 'ignore') return;
-  lookAtPlayer(username);
+  // "no, the other chest" counts against the job it's about, named or not. It goes in before the
+  // message itself, which can start a new job of theirs.
+  const allowed = config.allowlist.some((p) => p.toLowerCase() === username.toLowerCase());
+  if (allowed && result.type !== 'stop' && isCorrection(message, [config.bot.username])) brain.correct(username, message);
+  gestures.notice(username);
   if (result.type === 'stop') {
     // Stand still for a bit instead of going straight back to chores.
     idle.hold(60000);
+    reflex.cancel();
     brain.stop(whisper ? username : null);
   } else if (result.type === 'request') {
     // Where they stood, so "here" or "this hill" still means something later.
     const bot = currentBot();
     requests.add(username, result.text, bot?.entity ? findPlayer(bot, username)?.position : null);
-    brain.enqueue(username, result.text, whisper);
-  }
-}
-
-// Turn to whoever is talking, like a player would. Walking turns the head back on its own.
-function lookAtPlayer(username) {
-  const bot = currentBot();
-  if (!bot?.entity) return;
-  const entity = findPlayer(bot, username);
-  if (entity && entity.position.distanceTo(bot.entity.position) <= 32) {
-    bot.lookAt(entity.position.offset(0, entity.height ?? 1.6, 0)).catch(() => {});
+    // A plain come, follow or stay starts moving now, before the model has answered.
+    const kind = reflex.fire(username, result, whisper);
+    brain.enqueue(username, result.text, whisper, kind);
   }
 }
 
@@ -168,6 +195,7 @@ connection = startBot(config, {
   },
   onCreate: (bot) => {
     bot.placedLog = placed;
+    bot.walkScaffold = scaffold;
     bot.chestIndex = chests;
     // Find the sender by UUID instead of parsing the name, so team prefixes don't break it.
     bot.on('messagestr', (message, position, jsonMsg, sender) => {
@@ -193,7 +221,7 @@ connection = startBot(config, {
 
     // Standing around between jobs, now and then look at a player close by.
     const glance = setInterval(() => {
-      if (brain.busy || idle.running || !bot.entity || bot.pathfinder?.isMoving() || Math.random() < 0.4) return;
+      if (brain.busy || idle.running || reflex.walking || !bot.entity || bot.pathfinder?.isMoving() || Math.random() < 0.4) return;
       const here = bot.entity.position;
       const near = Object.values(bot.players)
         .map((p) => p.entity)
@@ -206,24 +234,32 @@ connection = startBot(config, {
   },
   onDeath: () => {
     brain.abortCurrent('death');
+    reflex.cancel();
     idle.interrupt();
   },
   onEnd: ({ reconnecting }) => {
-    if (!reconnecting) return brain.abortCurrent('shutdown');
+    reflex.cancel();
+    if (!reconnecting) {
+      brain.close();
+      return brain.abortCurrent('shutdown');
+    }
     offlineSince ??= Date.now();
     brain.pause('offline');
   },
   // The job that was running gets a moment to end and write its log line, and nothing new starts.
   onStopped: async () => {
     log('Bot stopped.');
+    brain.close();
     brain.queue = [];
     await brain.settle(2000);
+    lessons?.save();
     process.exit(0);
   }
 });
 
 process.on('uncaughtException', (err) => {
   log(`Crash: ${err.stack ?? err}`);
+  lessons?.save();
   process.exit(1);
 });
 process.on('unhandledRejection', (err) => {
@@ -231,11 +267,18 @@ process.on('unhandledRejection', (err) => {
 });
 
 process.on('SIGINT', () => {
-  if (stopping) process.exit(0);
+  if (stopping) {
+    lessons?.save();
+    process.exit(0);
+  }
   stopping = true;
   log('Shutting down...');
+  brain.close();
   brain.queue = [];
   brain.abortCurrent('shutdown');
   connection.shutdown();
-  setTimeout(() => process.exit(0), 3000).unref();
+  setTimeout(() => {
+    lessons?.save();
+    process.exit(0);
+  }, 3000).unref();
 });

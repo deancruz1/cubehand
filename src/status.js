@@ -21,7 +21,8 @@ const LABELS = {
   place_block: 'placing a block',
   find_block: 'looking for blocks',
   survey: 'looking around the building',
-  attack: 'fighting'
+  attack: 'fighting',
+  skill: 'running a saved routine'
 };
 const label = (name) => LABELS[name] ?? name.replaceAll('_', ' ');
 
