@@ -3,6 +3,7 @@ import { TOOLS } from './tools.js';
 import { BRAIN_TOOLS } from './braintools.js';
 import { systemPrompt } from './prompt.js';
 import { JobRecord, summaryLine } from './joblog.js';
+import { ago } from './areas.js';
 
 const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
@@ -47,7 +48,8 @@ export function isBuildRequest(text) {
 // hands the rest up. It can't go in the system prompt, which every model shares.
 const SORTING = `Before you start, sort this request by how much thinking it needs:
 - Simple, one or two obvious actions (come here, follow me, stop following, look at something, give or drop an item, eat, sleep, or just chatting and answering a question): do it yourself now.
-- Otherwise call escalate as the only call in your response: normal for everyday jobs of a few steps (mining, chopping, gathering, crafting, smelting, storing or fetching items, fighting, going somewhere, recording an area), complex for anything that needs a plan or taste (building, designing, changing or fixing a build, decorating, carrying on with a build, or a long job with many parts). When unsure, complex.`;
+- Otherwise call escalate as the only call in your response: normal for everyday jobs of a few steps (mining, chopping, gathering, crafting, smelting, storing or fetching items, fighting, going somewhere, recording an area), complex for anything that needs a plan or taste (building, designing, changing or fixing a build, decorating, carrying on with a build, or a long job with many parts). When unsure, complex.
+- If a job you started yourself turns out to need more than that, call escalate then, the same way.`;
 const HANDED_OVER = 'This job has been handed to you, so do it yourself from here and leave the sorting above aside: escalate is not for you.';
 const NOT_YOURS = 'Not done: this job is yours to do. Carry on with it yourself.';
 const EARLIER_FAILED = 'Not done, because an earlier action in this response failed (see above).';
@@ -135,11 +137,36 @@ class JobClock {
 const MAX_NUDGES = 2;
 const CARRY_ON = "You ended your turn by saying what you'll do next, but nothing happens until you do it. Carry on now with your tools, and only reply when the whole job is done or you really need an answer from a player. If you are in fact finished, or waiting on the players, reply with one short sentence saying so.";
 
+const FINISH_MORE = "Not done: you said you'd carry on, so do it now with your tools. If you are in fact finished or waiting on a player, finish with a line that says so. Your message wasn't sent.";
+const OR_ESCALATE = 'If it needs a model that thinks more, call escalate as the only call.';
+
+const SAYS_NEXT = /\b(next|then|after that)\b[^.!]{0,40}\b(I'll|I will|I'm|I am)\b|\b(I'll|I will|I'm going to|I am going to)\b[^.!]{0,20}\b(next|now)\b|\b(is|are) next\b|\bnext (up|is|are)\b/i;
+const GETS_ON = /\b(I'll|I will|I'm going to|I am going to|let me)\s+(?:just |now |then |also |first )?(?:go ahead|get (?:started|going|to work)|start|begin|carry on|continue|keep going|head|build|make(?! sure)|craft|mine|chop|dig|gather|grab|fetch|bring|put|place|add|use|fill|patch|fix|finish|work on|take|store|smelt)\b/i;
+// "If you drop me some dirt, I'll build it", "I'll take the ingots out later".
+const WAITS = /\bif\b|\b(when|once|whenever) you\b|\blater\b/i;
+
 // A final reply that only says what comes next ("Next I'll do the shutters.", "The west wall is
-// next.") rather than finishing or asking something.
+// next.", "I'll go ahead and build it.") rather than finishing, asking something, or waiting on
+// someone.
 export function announcesMore(reply) {
   if (!reply || reply.includes('?')) return false;
-  return /\b(next|then|after that)\b[^.!]{0,40}\b(I'll|I will|I'm|I am)\b|\b(I'll|I will|I'm going to|I am going to)\b[^.!]{0,20}\b(next|now)\b|\b(is|are) next\b|\bnext up\b/i.test(reply);
+  return reply.split(/(?<=[.!])\s+/).some((s) => !WAITS.test(s) && (SAYS_NEXT.test(s) || GETS_ON.test(s)));
+}
+
+const ENDS = {
+  done: 'you ended it with your reply',
+  stop: 'a player stopped it',
+  time: 'it ran out of time',
+  steps: 'it ran out of steps',
+  replaced: 'it gave way to another job',
+  death: 'you died'
+};
+
+// What came before this job, so a question like "what are you doing?" gets a true answer.
+export function lastJobLine(last, now = Date.now()) {
+  if (!last) return '';
+  const what = last.self ? 'your own free time' : `${last.player}'s request "${last.text}"`;
+  return `Your last job, ${what}, ended ${ago(now - last.at)}: ${ENDS[last.end] ?? last.end.replaceAll('_', ' ')}. No job is running besides this one.`;
 }
 
 export function errorMessage(err) {
@@ -177,6 +204,7 @@ export class Brain {
     this.systemMessages = true;
     this.lastJobEnd = Date.now();
     this.lastFreeTime = Date.now();
+    this.lastJob = null;
     this.system = systemPrompt(config.bot.username, config.admins ?? []);
     // Every job starts a new conversation, so the tools and system prompt get their own cache
     // entry that lasts between jobs. A 1 hour entry has to come before the 5 minute one that
@@ -499,7 +527,9 @@ export class Brain {
       })
       .finally(() => {
         if (job.hold) this.release(job);
-        this.writeRecord(job.record, controller.signal.aborted ? controller.signal.reason : (job.record.end ?? 'done'));
+        const end = controller.signal.aborted ? controller.signal.reason : (job.record.end ?? 'done');
+        this.writeRecord(job.record, end);
+        this.lastJob = { player: job.player, text: job.text, self: job.self, end, at: Date.now() };
         this.current = null;
         this.lastJobEnd = Date.now();
         // Instructions the job never got to, like when it ran out of time, become requests of their own.
@@ -612,7 +642,8 @@ export class Brain {
 
     try {
       const ask = self ? FREE_TIME : `Request from ${player}${whisper ? ' (whispered)' : ''}: ${text}`;
-      const messages = [{ role: 'user', content: `${this.snapshot()}\n\n${ask}${carriedOver(job)}${sorting ? `\n\n${SORTING}` : ''}` }];
+      const before = self || !this.lastJob ? '' : `\n\n${lastJobLine(this.lastJob)}`;
+      const messages = [{ role: 'user', content: `${this.snapshot()}${before}\n\n${ask}${carriedOver(job)}${sorting ? `\n\n${SORTING}` : ''}` }];
 
       // A bigger model takes the job over. It carries on in the same conversation, without the
       // turn that handed it over, as long as the system prompt and tools stay byte-identical: the
@@ -706,7 +737,10 @@ export class Brain {
             .map((b) => b.text)
             .join(' ')
             .trim();
-          if (reply && !(self && /^nothing\W*$/i.test(reply))) await tell(reply);
+          if (reply && !(self && /^nothing\W*$/i.test(reply))) {
+            if (record) record.reply = reply.slice(0, 300);
+            await tell(reply);
+          }
           if (signal.aborted) return ended();
           // Something a player added during the last step still has to be worked in.
           if (job.notes.length) {
@@ -717,6 +751,7 @@ export class Brain {
           // gets sent on to do it.
           if (!self && nudges < MAX_NUDGES && announcesMore(reply)) {
             nudges++;
+            if (record) record.nudges = nudges;
             this.log('[brain] she said what comes next, sending her on');
             messages.push({ role: 'user', content: CARRY_ON });
             continue;
@@ -784,7 +819,7 @@ export class Brain {
             continue;
           }
           if (block.name === 'escalate') {
-            logged?.tools.push({ name: 'escalate', ok: false, ms: 0 });
+            logged?.tools.push({ name: 'escalate', ok: false, ms: 0, error: NOT_YOURS });
             notDone(block, NOT_YOURS);
             continue;
           }
@@ -794,10 +829,22 @@ export class Brain {
               notDone(block, "Not done: finish has to be the last call in a response. Your message wasn't sent.");
               continue;
             }
-            logged?.tools.push({ name: 'finish', ok: true, ms: 0 });
             const line = String(block.input?.message ?? '').trim();
+            // Same as a plain reply: a line that promises more work isn't said, and she's sent on.
+            if (!self && nudges < MAX_NUDGES && announcesMore(line)) {
+              nudges++;
+              if (record) record.nudges = nudges;
+              logged?.tools.push({ name: 'finish', ok: false, ms: 0, error: `held back: ${line}`.slice(0, 300) });
+              this.log(`[brain] finish said what comes next, sending her on: ${line}`);
+              notDone(block, sorting ? `${FINISH_MORE} ${OR_ESCALATE}` : FINISH_MORE);
+              continue;
+            }
+            logged?.tools.push({ name: 'finish', ok: true, ms: 0 });
             this.log(`[brain] finish: ${line}`);
-            if (line && !(self && /^nothing\W*$/i.test(line))) await tell(line);
+            if (line && !(self && /^nothing\W*$/i.test(line))) {
+              if (record) record.reply = line.slice(0, 300);
+              await tell(line);
+            }
             return;
           }
           const building = !self && BUILD_TOOLS.has(block.name);
@@ -843,7 +890,8 @@ export class Brain {
             content += ` (Stopped because ${HOLD_CAUSES[why]}, see below.)`;
           }
           this.log(`[tool] -> ${result.ok && !why ? 'ok' : 'failed'}: ${result.message}${why ? ` (${why})` : ''}`);
-          logged?.tools.push({ name: block.name, ok: Boolean(result.ok && !why), ms: Date.now() - ran });
+          const ok = Boolean(result.ok && !why);
+          logged?.tools.push({ name: block.name, ok, ms: Date.now() - ran, ...(ok ? {} : { error: String(content).slice(0, 300) }) });
           const input = JSON.stringify(block.input ?? {});
           job.ran.push(`${block.name} ${input.length > 100 ? `${input.slice(0, 100)}...` : input}${result.ok && !why ? '' : ' (failed)'}`);
           if (!result.ok || why) failed = true;

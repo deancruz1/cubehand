@@ -258,7 +258,10 @@ export class Survival {
       this.log(`[survival] done: health ${Math.round(bot.health)}/20, food ${bot.food}/20${fine ? '' : ', still not good'}`);
     } finally {
       // A player out of view right now is picked up again by the goal when they're back.
-      if (follow) bot.pathfinder.setGoal(follow, true);
+      if (follow) {
+        useMoveMode(bot, false);
+        bot.pathfinder.setGoal(follow, true);
+      }
       this.recovering = false;
       this.brain.resume('danger', recoveryReport({ critical, before, done, health: bot.health, food: bot.food, position: bot.entity?.position }));
     }

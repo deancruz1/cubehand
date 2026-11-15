@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Vec3 } from 'vec3';
 import { parseBlock, blockText, stateProblem, matchesState, placementOptions, itemFor } from '../src/actions/states.js';
 import { EventEmitter } from 'node:events';
-import { expandParts, planBuild, nearestFirst, buildSite, buildStructure, watchBuildScaffold } from '../src/actions/build.js';
+import { expandParts, planBuild, nearestFirst, buildSite, buildStructure, watchBuildScaffold, groupBlocks, fromHere, groundUnder, buildZone } from '../src/actions/build.js';
 import { setPauseScale } from '../src/actions/util.js';
 import { planHouse, buildHouse } from '../src/actions/house.js';
 import { placeOne } from '../src/actions/blocks.js';
@@ -264,6 +264,199 @@ test('everything in reach is placed before the bot walks on', () => {
     order.push(p);
   }
   assert.deepEqual(order.map((p) => p.x), [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]);
+});
+
+test('blocks are grouped by what lies together: a wall with a window is one group, two gable ends are two', () => {
+  const wall = expandParts([
+    { shape: 'fill', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 8, dy: 3, dz: 0 }, block: 'oak_planks' },
+    { shape: 'fill', from: { dx: 3, dy: 1, dz: 0 }, to: { dx: 4, dy: 2, dz: 0 }, block: 'air' }
+  ]).map((b) => ({ x: b.dx, y: b.dy, z: b.dz }));
+  assert.equal(groupBlocks(wall).length, 1);
+  const ends = [0, 12].flatMap((x) => [0, 1, 2, 3, 4].map((i) => ({ x, y: 80 + Math.min(i, 4 - i), z: i })));
+  const groups = groupBlocks(ends);
+  assert.equal(groups.length, 2);
+  assert.ok(groups.every((g) => g.length === 5 && new Set(g.map((p) => p.x)).size === 1));
+  // One empty block between two blocks still joins them, two don't.
+  assert.equal(groupBlocks([{ x: 0, y: 0, z: 0 }, { x: 2, y: 0, z: 0 }]).length, 1);
+  assert.equal(groupBlocks([{ x: 0, y: 0, z: 0 }, { x: 3, y: 0, z: 0 }]).length, 2);
+});
+
+test('a wall goes up section by section from where the bot stands, each block after the one under it', () => {
+  const blocks = expandParts([{ shape: 'fill', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 15, dy: 3, dz: 0 }, block: 'oak_planks' }]);
+  const plan = planBuild({ origin: { x: 0, y: 64, z: 0 }, blocks, botPos: { x: 0, y: 64, z: 2 }, getName: () => 'air', inventory: new Map(), maxBlocks: 500, isKnownBlock: () => true });
+  const start = { x: 0.5, y: 64, z: 2.5 };
+  const byLayer = walkThrough((eye) => {
+    const layers = [...new Set(plan.placements.map((p) => p.y))].map((y) => plan.placements.filter((p) => p.y === y));
+    return layers.flatMap((layer) => [...nearestFirst(layer, eye)]);
+  }, start);
+  const order = [];
+  const now = walkThrough((eye) => (function* () {
+    for (const p of fromHere(plan.placements, eye)) {
+      order.push(p);
+      yield p;
+    }
+  })(), start);
+  assert.equal(order.length, 64);
+  for (const [i, p] of order.entries()) {
+    if (p.y > 64) assert.ok(order.slice(0, i).some((q) => q.x === p.x && q.y === p.y - 1), `${p.x} ${p.y} before the block under it`);
+  }
+  assert.ok(now.walks < byLayer.walks, `${now.walks} walks against ${byLayer.walks} layer by layer`);
+  assert.ok(now.walks <= 4, `walked ${now.walks} times`);
+  // A ring of walls still goes round once.
+  const ring = expandParts([{ shape: 'walls', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 10, dy: 0, dz: 10 }, block: 'oak_planks' }])
+    .map((b) => ({ x: b.dx, y: 64 + b.dy, z: b.dz }));
+  assert.ok(walkThrough((eye) => fromHere(ring, eye), { x: 5.5, y: 64, z: -1.5 }).walks <= 8);
+});
+
+// A bot on flat stone at y 63 that places whatever it is asked to and walks by jumping to a
+// spot two blocks south of the target, unless canReach(target) says no. Records each placement
+// and each walk.
+function builderBot({ items, canReach = () => true, start, extra = [], noRoute = false }) {
+  const world = new Map();
+  const solid = (name, pos) => ({ name, position: pos, boundingBox: 'block', shapes: [[0, 0, 0, 1, 1, 1]], getProperties: () => ({}) });
+  for (let x = -4; x <= 24; x++) for (let z = -4; z <= 6; z++) world.set(`${x},63,${z}`, solid('stone', new Vec3(x, 63, z)));
+  for (const p of extra) world.set(`${p.x},${p.y},${p.z}`, solid('stone', new Vec3(p.x, p.y, p.z)));
+  const events = [];
+  const bot = Object.assign(new EventEmitter(), {
+    entity: { position: start, height: 1.62 },
+    registry: { blocksByName: { oak_planks: {}, dirt: {} }, itemsByName: { oak_planks: { id: 5 }, dirt: { id: 3 } } },
+    inventory: { items: () => items },
+    blockAt: (p) => world.get(`${p.x},${p.y},${p.z}`) ?? { name: 'air', position: p, boundingBox: 'empty', shapes: [], getProperties: () => ({}) },
+    equip: async () => {},
+    placeBlock: async (ref, face) => {
+      const pos = ref.position.plus(face);
+      world.set(`${pos.x},${pos.y},${pos.z}`, solid('oak_planks', pos));
+      events.push({ placed: pos });
+    },
+    canDigBlock: () => true,
+    pathfinder: {
+      goto: async (goal) => {
+        events.push({ walk: goal.pos });
+        if (canReach(goal.pos)) bot.entity.position = new Vec3(goal.pos.x + 0.5, 64, goal.pos.z + 2.5);
+        else if (noRoute) throw Object.assign(new Error('no route found, so nothing was dug or placed'), { name: 'NoRoute' });
+      },
+      setGoal: () => {},
+      isMining: () => false,
+      isBuilding: () => false,
+      bestHarvestTool: () => null
+    }
+  });
+  bot.world = { getBlock: (p) => bot.blockAt(p), raycast: () => null };
+  const ctx = { bot, config: { limits: { maxBuildBlocks: 500, moveTimeoutSeconds: 90 } } };
+  return { bot, ctx, events };
+}
+
+test('build_structure finishes one group before walking to the next', async () => {
+  setPauseScale(0);
+  const { ctx, events } = builderBot({ items: [{ name: 'oak_planks', count: 64 }], start: new Vec3(1.5, 64, 2.5) });
+  const wall = (dx) => ({ shape: 'fill', from: { dx, dy: 0, dz: 0 }, to: { dx: dx + 2, dy: 1, dz: 0 }, block: 'oak_planks' });
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, parts: [wall(0), wall(14)] });
+  setPauseScale(1);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^placed 12, skipped 0, failed 0$/);
+  const placed = events.filter((e) => e.placed).map((e) => e.placed.x);
+  // Layer by layer it would have done the bottom of both, then come back for the tops.
+  assert.deepEqual(placed.map((x) => (x < 7 ? 'near' : 'far')), [...Array(6).fill('near'), ...Array(6).fill('far')]);
+  assert.equal(events.filter((e) => e.walk).length, 1);
+});
+
+test('build_structure places everything it can reach before it walks', async () => {
+  setPauseScale(0);
+  const { bot, ctx, events } = builderBot({ items: [{ name: 'oak_planks', count: 64 }], start: new Vec3(0.5, 64, 2.5) });
+  const walkedWithWorkInReach = [];
+  const goto = bot.pathfinder.goto;
+  bot.pathfinder.goto = async (goal) => {
+    const eye = bot.entity.position.offset(0, 1.6, 0);
+    for (let x = 0; x <= 11; x++) {
+      for (const y of [64, 65]) {
+        const free = bot.blockAt(new Vec3(x, y, 0)).name === 'air';
+        const supported = y === 64 || bot.blockAt(new Vec3(x, y - 1, 0)).name !== 'air';
+        if (free && supported && eye.distanceTo(new Vec3(x + 0.5, y + 0.5, 0.5)) <= 4.5) walkedWithWorkInReach.push(`${x} ${y}`);
+      }
+    }
+    return goto(goal);
+  };
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, parts: [{ shape: 'fill', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 11, dy: 1, dz: 0 }, block: 'oak_planks' }] });
+  setPauseScale(1);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^placed 24,/);
+  assert.deepEqual(walkedWithWorkInReach, []);
+  const walks = events.filter((e) => e.walk).length;
+  assert.ok(walks >= 1 && walks <= 3, `walked ${walks} times`);
+});
+
+test('build_structure skips a group it cannot get to after a few tries, finishes the rest, and says what is left', async () => {
+  setPauseScale(0);
+  // Five blocks up on a ledge at y 80 the bot can't get to, and a short wall on the ground.
+  const high = [0, 1, 2, 3, 4].map((i) => ({ x: 2 + i, y: 79, z: 0 }));
+  const parts = [
+    { shape: 'line', from: { dx: 2, dy: 16, dz: 0 }, to: { dx: 6, dy: 16, dz: 0 }, block: 'oak_planks' },
+    { shape: 'line', from: { dx: 20, dy: 0, dz: 0 }, to: { dx: 22, dy: 0, dz: 0 }, block: 'oak_planks' }
+  ];
+  const run = async (items) => {
+    const built = builderBot({ items, canReach: (p) => p.y < 70, start: new Vec3(4.5, 64, 2.5), extra: high });
+    const result = await buildStructure(built.ctx, { origin: { x: 0, y: 64, z: 0 }, parts });
+    return { result, events: built.events };
+  };
+  const { result, events } = await run([{ name: 'oak_planks', count: 64 }, { name: 'dirt', count: 20 }]);
+  const bare = await run([{ name: 'oak_planks', count: 64 }]);
+  setPauseScale(1);
+  // The ledge is closer, so it goes first, but only three walks are spent on it.
+  const walks = events.filter((e) => e.walk);
+  assert.equal(walks.filter((w) => w.walk.y === 80).length, 3);
+  assert.ok(walks.slice(0, 3).every((w) => w.walk.y === 80));
+  assert.deepEqual(events.filter((e) => e.placed).map((e) => e.placed.x), [20, 21, 22]);
+  // Part of it got built, so it counts as done, with what is left grouped.
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^placed 3, skipped 0, failed 3\. Left to do, 5 blocks in 1 group: 5 blocks around 4 80 0 \(5 oak_planks, from 2 80 0 to 6 80 0\): couldn't get up there, the lowest is 16 blocks above where I got to \(3 tries, last: could not get close enough to \d 80 0: could not get all the way there, now at 4 64 2\); I have 20 dirt, so scaffolding up is possible\. build_structure with the same plan again skips what is already in place$/);
+  assert.match(bare.result.message, /; I have no blocks to scaffold with \(dirt, cobblestone and the like\)\./);
+});
+
+test('a group whose first block has no route is skipped after that one walk', async () => {
+  setPauseScale(0);
+  const high = [0, 1, 2, 3, 4].map((i) => ({ x: 2 + i, y: 79, z: 0 }));
+  const parts = [
+    { shape: 'line', from: { dx: 2, dy: 16, dz: 0 }, to: { dx: 6, dy: 16, dz: 0 }, block: 'oak_planks' },
+    { shape: 'line', from: { dx: 20, dy: 0, dz: 0 }, to: { dx: 22, dy: 0, dz: 0 }, block: 'oak_planks' }
+  ];
+  const { ctx, events } = builderBot({ items: [{ name: 'oak_planks', count: 64 }], canReach: (p) => p.y < 70, start: new Vec3(4.5, 64, 2.5), extra: high, noRoute: true });
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, parts });
+  setPauseScale(1);
+  assert.equal(events.filter((e) => e.walk && e.walk.y === 80).length, 1);
+  assert.deepEqual(events.filter((e) => e.placed).map((e) => e.placed.x), [20, 21, 22]);
+  assert.match(result.message, /couldn't get up there, the lowest is 16 blocks above where I got to \(1 try, last: could not get close enough to \d 80 0: no route found/);
+});
+
+test('scaffolding for a build that starts high up may go up from the ground, and only the bot\'s own is claimed', () => {
+  // Roof trim at y 82 on a house whose walls end at y 81, on ground at y 63.
+  let building = true;
+  const solid = (p) => p.y <= 63 || (p.x >= 0 && p.x <= 4 && p.z >= 0 && p.z <= 4 && p.y <= 81);
+  const bot = Object.assign(new EventEmitter(), {
+    entity: { position: new Vec3(-1.5, 70, 0.5) },
+    registry: { itemsByName: {} },
+    blockAt: (p) => ({ name: solid(p) ? 'stone' : 'air', position: p, boundingBox: solid(p) ? 'block' : 'empty' }),
+    pathfinder: { isBuilding: () => building }
+  });
+  const site = { min: new Vec3(0, 82, 0), max: new Vec3(4, 82, 4) };
+  site.ground = groundUnder(bot, site.min, site.max);
+  assert.equal(site.ground, 64);
+  assert.equal(buildZone(site, site.ground).min.y, 63);
+  const scaffold = watchBuildScaffold(bot, site, new Set());
+  const put = (x, y, z) => bot.emit('blockUpdate', { name: 'air', boundingBox: 'empty' }, { name: 'dirt', position: new Vec3(x, y, z) });
+  put(-2, 69, 0);
+  building = false;
+  put(-2, 69, 1);
+  scaffold.stop();
+  assert.deepEqual(scaffold.leftover([]).map((p) => `${p.x} ${p.y} ${p.z}`), ['-2 69 0']);
+});
+
+test('build_structure fails when it could place nothing', async () => {
+  setPauseScale(0);
+  const { ctx } = builderBot({ items: [{ name: 'oak_planks', count: 64 }], canReach: () => false, start: new Vec3(0.5, 64, 12.5) });
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, parts: [{ shape: 'line', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 7, dy: 0, dz: 0 }, block: 'oak_planks' }] });
+  setPauseScale(1);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /^placed 0, skipped 0, failed 3\. Left to do, 8 blocks in 1 group: 8 blocks around 4 64 0 \(8 oak_planks, from 0 64 0 to 7 64 0\): couldn't get close enough \(3 tries/);
 });
 
 test('the site of a structure is the box its blocks fill', () => {

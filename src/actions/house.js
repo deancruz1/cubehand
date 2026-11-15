@@ -2,7 +2,7 @@ import { Vec3 } from 'vec3';
 import { ok, fail, posText } from './util.js';
 import { isNaturalBlock } from './movement.js';
 import { digBlock, removeScaffold, isReplaceable, isProtected } from './blocks.js';
-import { placeAll, inventoryCounts, expandParts, watchBuildScaffold } from './build.js';
+import { placeAll, inventoryCounts, expandParts, watchBuildScaffold, groundUnder, buildZone } from './build.js';
 import { collectDrops } from './items.js';
 import { parseBlock, dirVector, opposite, matchesState } from './states.js';
 
@@ -444,9 +444,10 @@ export async function buildHouse(ctx, input) {
 
   // While building, the bot may stand on scaffolding near its own walls, but never use the
   // building materials for it.
-  bot.buildZone = { min: plan.min.offset(-2, -1, -2), max: plan.max.offset(2, 2, 2) };
+  const ground = groundUnder(bot, plan.min, plan.max);
+  bot.buildZone = buildZone(plan, ground);
   bot.buildKeep = new Set(Object.values(materials).filter(Boolean).map((n) => bot.registry.itemsByName[n]?.id).filter((id) => id !== undefined));
-  const scaffold = watchBuildScaffold(bot, plan, planned);
+  const scaffold = watchBuildScaffold(bot, { min: plan.min, max: plan.max, ground }, planned);
   let result = { placed: 0, failures: [], wrong: [], stoppedReason: null };
   let digProblem = null;
   try {

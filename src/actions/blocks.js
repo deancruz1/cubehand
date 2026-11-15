@@ -166,8 +166,8 @@ export async function placeOne(ctx, name, pos, { attach, props } = {}) {
 
   if (!inReach(bot, pos) || standingIn(bot, pos)) {
     const walked = await walkTo(ctx, new GoalPlaceBlock(pos, bot.world, { range: 4 }), { place: 'climb' });
-    if (standingIn(bot, pos)) return fail(`could not step out of the way of ${posText(pos)}: ${walked.message}`);
-    if (!walked.ok && !inReach(bot, pos)) return fail(`could not get close enough to ${posText(pos)}: ${walked.message}`);
+    if (standingIn(bot, pos)) return { ...fail(`could not step out of the way of ${posText(pos)}: ${walked.message}`), reason: walked.reason ?? 'in_the_way' };
+    if (!walked.ok && !inReach(bot, pos)) return { ...fail(`could not get close enough to ${posText(pos)}: ${walked.message}`), reason: walked.reason };
   }
 
   // Re-check after walking, the pathfinder may have changed things nearby.
@@ -267,7 +267,7 @@ export async function digBlock(ctx, pos, { anyTool = false } = {}) {
   if (AIR.has(block.name)) return fail(`nothing to break at ${posText(pos)}`);
 
   if (!inReach(bot, pos)) {
-    const walked = await walkTo(ctx, new GoalLookAtBlock(pos, bot.world, { reach: 4 }), { place: 'climb' });
+    const walked = await walkTo(ctx, new GoalLookAtBlock(pos, bot.world, { reach: 4 }), { place: 'climb', dig: true });
     if (!walked.ok && !inReach(bot, pos)) {
       const above = y - Math.floor(bot.entity.position.y);
       const height = above > 3 ? ` It is ${above} blocks above your feet, too high to reach from the ground.` : '';

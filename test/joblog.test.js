@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { meters, costOf, JobRecord, JobLog, summaryLine } from '../src/joblog.js';
+import { meters, costOf, JobRecord, JobLog, LogFile, summaryLine } from '../src/joblog.js';
 
 test('meters keep the cache write split when the API gives one', () => {
   assert.deepEqual(meters({ input_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 3, output_tokens: 4 }), {
@@ -91,6 +91,52 @@ test('cost warnings go in the line, and the summary counts them', () => {
   assert.doesNotMatch(summaryLine(quiet), /cost warnings/);
   record.costWarnings = 2;
   assert.match(summaryLine(record.finish('done')), /, cost warnings 2$/);
+});
+
+test('the final line and nudges go in the line only when there are any', () => {
+  const record = new JobRecord({ player: 'Steve', text: 'mine' });
+  const quiet = record.finish('done');
+  assert.equal('reply' in quiet, false);
+  assert.equal('nudges' in quiet, false);
+  record.reply = 'Mined.';
+  record.nudges = 1;
+  const line = record.finish('done');
+  assert.equal(line.reply, 'Mined.');
+  assert.equal(line.nudges, 1);
+  assert.doesNotMatch(summaryLine(line), /Mined|nudge/);
+});
+
+test('the log file keeps every line with a full timestamp and starts over past its size', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'logfile-'));
+  try {
+    const path = join(dir, 'logs', 'bot.log');
+    const file = new LogFile(path, 100);
+    file.write('[brain] first', new Date(2026, 10, 15, 14, 58, 13));
+    assert.equal(readFileSync(path, 'utf8'), '2026-11-15 14:58:13 [brain] first\n');
+    file.write('x'.repeat(80));
+    assert.match(readFileSync(`${path}.1`, 'utf8'), /^\S+ \S+ \[brain\] first\n$/);
+    assert.match(readFileSync(path, 'utf8'), /^\S+ \S+ x{80}\n$/);
+    // Only one old file is kept.
+    file.write('[brain] third');
+    assert.match(readFileSync(`${path}.1`, 'utf8'), /^\S+ \S+ x{80}\n$/);
+    assert.match(readFileSync(path, 'utf8'), /^\S+ \S+ \[brain\] third\n$/);
+    // Picks up the size of a file that's already there.
+    assert.equal(new LogFile(path, 100).size, readFileSync(path).length);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a log file that cannot be written never throws', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'logfile-'));
+  try {
+    const blocked = join(dir, 'blocked');
+    writeFileSync(blocked, '');
+    const file = new LogFile(join(blocked, 'bot.log'));
+    assert.doesNotThrow(() => file.write('hello'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('the job log appends one JSON line per job', () => {

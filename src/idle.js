@@ -1,6 +1,6 @@
 import pathfinderPkg from 'mineflayer-pathfinder';
 import { pause, delay } from './actions/util.js';
-import { walkTo } from './actions/movement.js';
+import { walkTo, useMoveMode } from './actions/movement.js';
 import { attackEntity } from './actions/combat.js';
 import { collectDrops, dropsNear, leftThere } from './actions/items.js';
 import { findNearest } from './actions/blocks.js';
@@ -74,7 +74,10 @@ export class Idle {
       .finally(() => {
         const follow = run.follow;
         // A player out of view right now is picked up again by the goal when they're back.
-        if (follow && !bot.pathfinder.goal) bot.pathfinder.setGoal(follow, true);
+        if (follow && !bot.pathfinder.goal) {
+          useMoveMode(bot, false);
+          bot.pathfinder.setGoal(follow, true);
+        }
         if (this.running === run) this.running = null;
       });
     this.running = run;

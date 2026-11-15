@@ -509,6 +509,105 @@ test('replies that finish or ask something end the job', async () => {
   assert.equal(announcesMore("I'm fine."), false);
 });
 
+test('lines that promise more work are caught, and harmless closers and waits on a player are not', async () => {
+  const { announcesMore } = await import('../src/brain.js');
+  // Seen live: the bot ended its job with these and stood idle.
+  assert.equal(announcesMore('The chest has 58 dirt and 440 cobblestone, and I already carry 20 dirt, so I have enough scaffolding for the chimney cap. I\'ll go ahead and build it.'), true);
+  assert.equal(announcesMore("The roof and walls are done. Next is the chimney cap, which needs a scaffold, so I'll use the 20 dirt I'm carrying and build it up from the attic."), true);
+  // Waiting on a player is a real end; asking for what she already had is left to the prompt.
+  assert.equal(announcesMore("The house is done, but I couldn't do the chimney cap: there's no way out onto the roof from the attic and I couldn't climb up the outside. If you drop me about 16 dirt or cobblestone, I'll build a scaffold and add it."), false);
+  assert.equal(announcesMore("Let me grab the planks from the chest."), true);
+  for (const closer of [
+    "All done. I'll be here if you need me.",
+    'Let me know if you want anything else.',
+    'Want me to add a porch too?',
+    "The iron is still cooking, I'll take it out later.",
+    "Here are your logs. I'll stay put.",
+    'Done, the house has a porch now.'
+  ]) {
+    assert.equal(announcesMore(closer), false, closer);
+  }
+});
+
+test('a finish that promises more is held back and the job goes on, within the nudge limit', async () => {
+  const lines = [];
+  const promise = "I'll go ahead and build it.";
+  const client = fakeClient([
+    reply('tool_use', [toolUse('a', 'open_container', { x: 1, y: 64, z: 1 }), toolUse('b', 'finish', { message: promise })]),
+    reply('tool_use', [toolUse('c', 'build_structure', { parts: [] }), toolUse('d', 'finish', { message: 'Chimney cap is on.' })])
+  ]);
+  const { brain, said, toolCalls } = makeBrain({ client, jobLog: { write: (line) => lines.push(line) } });
+  await brain.start({ player: 'Steve', text: 'check the chest for dirt' });
+  assert.deepEqual(toolCalls.map((t) => t.name), ['open_container', 'build_structure']);
+  assert.deepEqual(said, ['Chimney cap is on.']);
+  const held = client.calls[1].params.messages.at(-1).content[1];
+  assert.equal(held.is_error, true);
+  assert.match(held.content, /^Not done: you said you'd carry on, so do it now.*Your message wasn't sent\.$/);
+  assert.doesNotMatch(held.content, /escalate/);
+  assert.equal(lines[0].nudges, 1);
+  assert.equal(lines[0].reply, 'Chimney cap is on.');
+  assert.deepEqual(lines[0].steps[0].tools[1], { name: 'finish', ok: false, ms: 0, error: `held back: ${promise}` });
+
+  const stubborn = fakeClient(() => reply('tool_use', [toolUse('a', 'finish', { message: promise })]));
+  const again = makeBrain({ client: stubborn });
+  await again.brain.start({ player: 'Steve', text: 'build the chimney' });
+  assert.equal(stubborn.calls.length, 3);
+  assert.deepEqual(again.said, [promise]);
+
+  const free = makeBrain({ client: fakeClient([reply('tool_use', [toolUse('a', 'finish', { message: promise })])]), config: routedIdle });
+  await free.brain.start({ player: null, text: null, self: true });
+  assert.deepEqual(free.said, [promise]);
+});
+
+test('a quick-model job that turns out to need real work can still be handed up after a step', async () => {
+  const client = fakeClient([
+    reply('tool_use', [toolUse('a', 'open_container', { x: 1, y: 64, z: 1 }), toolUse('b', 'finish', { message: "Next is the chimney cap, so I'll use the dirt I carry." })]),
+    reply('tool_use', [toolUse('c', 'escalate', { to: 'complex' })]),
+    reply('tool_use', [toolUse('d', 'build_structure', { parts: [] }), toolUse('e', 'finish', { message: 'Chimney cap is on.' })])
+  ]);
+  const { brain, said, toolCalls } = makeBrain({ client, config: routed });
+  await brain.start({ player: 'Steve', text: 'check the chest for dirt and scaffolding materials' });
+  assert.deepEqual(client.calls.map((c) => c.params.model), ['claude-haiku-5-5', 'claude-haiku-5-5', 'claude-opus-5-5']);
+  assert.match(textOf(client.calls[0].params.messages[0].content), /If a job you started yourself turns out to need more than that, call escalate then/);
+  const held = client.calls[1].params.messages.at(-1).content[1];
+  assert.match(held.content, /call escalate as the only call/);
+  assert.match(textOf(client.calls[2].params.messages[0].content), /already ran: open_container/);
+  assert.deepEqual(toolCalls.map((t) => t.name), ['open_container', 'build_structure']);
+  assert.deepEqual(said, ['Chimney cap is on.']);
+});
+
+test('the next job hears how the last one ended', async () => {
+  const client = fakeClient([
+    reply('tool_use', [toolUse('a', 'open_container'), toolUse('b', 'finish', { message: 'The chest has 58 dirt.' })]),
+    reply('end_turn', [{ type: 'text', text: "Nothing right now. I checked the chest, and the chimney cap isn't done." }])
+  ]);
+  const { brain } = makeBrain({ client });
+  await brain.start({ player: 'Steve', text: 'check the chest' });
+  assert.doesNotMatch(client.calls[0].params.messages[0].content, /Your last job/);
+  await brain.start({ player: 'Alex', text: 'what are you doing' });
+  assert.match(
+    client.calls[1].params.messages[0].content,
+    /^SNAPSHOT\n\nYour last job, Steve's request "check the chest", ended just now: you ended it with your reply\. No job is running besides this one\.\n\nRequest from Alex: what are you doing$/
+  );
+
+  const { lastJobLine } = await import('../src/brain.js');
+  assert.equal(lastJobLine({ self: true, end: 'steps', at: 0 }, 5 * 60000), 'Your last job, your own free time, ended 5 min ago: it ran out of steps. No job is running besides this one.');
+  assert.match(lastJobLine({ player: 'Steve', text: 'mine', end: 'api_error', at: 0 }, 0), /ended just now: api error\./);
+});
+
+test('a failed tool keeps its failure text in the job record', async () => {
+  const lines = [];
+  const client = fakeClient([reply('tool_use', [toolUse('a', 'move_to', { x: 0, y: 0, z: 0 })]), reply('end_turn', [{ type: 'text', text: "I can't get there." }])]);
+  const { brain } = makeBrain({ client, jobLog: { write: (line) => lines.push(line) }, runTool: async () => ({ ok: false, message: `no path ${'x'.repeat(400)}` }) });
+  await brain.start({ player: 'Steve', text: 'go' });
+  const [tool] = lines[0].steps[0].tools;
+  assert.equal(tool.ok, false);
+  assert.equal(tool.error.length, 300);
+  assert.match(tool.error, /^no path x/);
+  assert.equal(lines[0].reply, "I can't get there.");
+  assert.equal('nudges' in lines[0], false);
+});
+
 const routed = { ...baseConfig, claude: { ...baseConfig.claude, routing: true, everydayModel: 'claude-sonnet-5-5', quickModel: 'claude-haiku-5-5' } };
 
 const textOf = (content) => (typeof content === 'string' ? content : content.map((b) => b.text ?? '').join('\n'));

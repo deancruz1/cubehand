@@ -8,3 +8,4 @@ chests.json
 chests.json.tmp
 requests.json
 jobs.jsonl
+logs/

@@ -402,15 +402,24 @@ function hurtBot(extra = {}) {
   return bot;
 }
 
+// Left in the everyday walking mode by the last walk, which may put blocks down.
+function walking(bot) {
+  bot.moveModes = { walk: 'walk', noPlace: 'noPlace' };
+  bot.moveMode = 'walk';
+  bot.pathfinder.setMovements = (m) => bot.pathfinder.set.push(m);
+}
+
 const fakeBrain = (holds = []) => ({ busy: true, holds: new Set(holds), pause: async () => {}, resume: () => {} });
 
 test('recovery puts following back even when the player is out of view', async () => {
   const bot = hurtBot();
   const follow = new GoalFollowPlayer(bot, 'Steve', { id: 7, position: new Vec3(5, 64, 5) }, 2);
   bot.pathfinder.goal = follow;
+  walking(bot);
   const survival = new Survival({ getBot: () => bot, brain: fakeBrain(), config: { survival: { criticalHealth: 8 } }, makeCtx: () => ({ bot }), log: () => {}, say: () => {} });
   await survival.recover(bot, true);
-  assert.deepEqual(bot.pathfinder.set, [follow]);
+  // Back in the mode that never places blocks first.
+  assert.deepEqual(bot.pathfinder.set, ['noPlace', follow]);
 });
 
 test('a chore puts following back even when the player is out of view', async () => {
@@ -421,6 +430,7 @@ test('a chore puts following back even when the player is out of view', async ()
   bot.equip = async () => {
     bot.pathfinder.goal = null;
   };
+  walking(bot);
   const idle = new Idle({
     getBot: () => bot,
     brain: { busy: false, paused: false, queue: [] },
@@ -431,7 +441,7 @@ test('a chore puts following back even when the player is out of view', async ()
   });
   idle.tick();
   await idle.running.done;
-  assert.deepEqual(bot.pathfinder.set, [follow]);
+  assert.deepEqual(bot.pathfinder.set, ['noPlace', follow]);
 });
 
 test('the line about backing off goes to whoever whispered the job', async () => {

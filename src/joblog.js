@@ -1,4 +1,5 @@
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 // US dollars per million tokens. Cache writes cost more for the 1 hour lifetime than for 5 minutes.
 const PRICES = {
@@ -75,6 +76,9 @@ export class JobRecord {
     this.effort = null;
     this.end = null;
     this.error = null;
+    // The job's last line to the player, and how often it was sent on for only saying what's next.
+    this.reply = null;
+    this.nudges = 0;
     this.calls = [];
     this.steps = [];
     this.finished = false;
@@ -118,6 +122,8 @@ export class JobRecord {
       effort: this.effort,
       end,
       ...(this.error ? { error: this.error } : {}),
+      ...(this.reply ? { reply: this.reply } : {}),
+      ...(this.nudges ? { nudges: this.nudges } : {}),
       ms: Date.now() - this.startedAt,
       calls: this.calls,
       steps: this.steps,
@@ -152,5 +158,41 @@ export class JobLog {
     } catch (err) {
       this.log(`[joblog] couldn't write ${this.path}: ${err.message}`);
     }
+  }
+}
+
+const pad = (n) => String(n).padStart(2, '0');
+const stamp = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+// Every console line also goes to a file, so a run can be read after the terminal is closed.
+// Past maxBytes the file starts over and the old one is kept as <path>.1. A file problem is
+// never thrown into the bot, and the line is just lost.
+export class LogFile {
+  constructor(path = 'logs/bot.log', maxBytes = 5 * 1024 * 1024) {
+    this.path = path;
+    this.maxBytes = maxBytes;
+    this.size = 0;
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      if (existsSync(path)) this.size = statSync(path).size;
+    } catch {}
+  }
+
+  write(message, now = new Date()) {
+    try {
+      const line = `${stamp(now)} ${message}\n`;
+      const bytes = Buffer.byteLength(line);
+      if (this.size > 0 && this.size + bytes > this.maxBytes) this.rotate();
+      appendFileSync(this.path, line);
+      this.size += bytes;
+    } catch {}
+  }
+
+  rotate() {
+    try {
+      rmSync(`${this.path}.1`, { force: true });
+      renameSync(this.path, `${this.path}.1`);
+    } catch {}
+    this.size = 0;
   }
 }

@@ -292,7 +292,7 @@ export async function mine(ctx, { block, count }) {
     }
 
     if (holdsUp(bot.entity.position, pick.pos, getName) || !inReach(bot, pick.pos)) {
-      const walked = await walkTo(ctx, new DigSpot(pick.pos, bot.world, { reach: 4 }), { place: false });
+      const walked = await walkTo(ctx, new DigSpot(pick.pos, bot.world, { reach: 4 }), { place: false, dig: true });
       if (!walked.ok && !inReach(bot, pick.pos)) {
         skip.add(pick.pos.toString());
         if (++failures >= 5) {
@@ -486,7 +486,7 @@ async function chopOne(ctx, logs) {
       if (!isLogName(bot.blockAt(pick, false)?.name ?? '')) continue;
 
       if (!inReach(bot, pick)) {
-        const walked = await walkTo(ctx, new GoalLookAtBlock(pick, bot.world, { reach: 4 }), { place: 'climb' });
+        const walked = await walkTo(ctx, new GoalLookAtBlock(pick, bot.world, { reach: 4 }), { place: 'climb', dig: true });
         if (!walked.ok && !inReach(bot, pick)) {
           if (++failures >= 4) {
             const hint = hasScaffoldItems(bot) ? '' : ', I have no dirt or cobblestone to climb on';

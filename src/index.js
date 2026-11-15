@@ -16,11 +16,14 @@ import { AreaRecorder, TravelLog } from './areas.js';
 import { Survival } from './survival.js';
 import { Idle } from './idle.js';
 import { Status } from './status.js';
-import { JobLog } from './joblog.js';
+import { JobLog, LogFile } from './joblog.js';
+
+const logFile = new LogFile('logs/bot.log');
 
 function log(message) {
   const time = new Date().toLocaleTimeString();
   console.log(`[${time}] ${message}`);
+  logFile.write(message);
 }
 
 let config;

@@ -165,7 +165,7 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2 }) {
   // when the block stays.
   const digOne = async (p) => {
     if (holdsUp(bot.entity.position, p, getName) || !inReach(bot, p)) {
-      await walkTo(ctx, new DigSpot(p, bot.world, { reach: 4 }), { place: 'climb' });
+      await walkTo(ctx, new DigSpot(p, bot.world, { reach: 4 }), { place: 'climb', dig: true });
       if (signal?.aborted) return 'stopped';
       if (holdsUp(bot.entity.position, p, getName)) return 'standing on it';
       if (!inReach(bot, p)) return 'out of reach';

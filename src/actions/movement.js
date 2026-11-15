@@ -2,7 +2,7 @@ import { Vec3 } from 'vec3';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import AStar from 'mineflayer-pathfinder/lib/astar.js';
 import Move from 'mineflayer-pathfinder/lib/move.js';
-import { ok, fail, botPos, guarded, customName, TimeoutError, AbortedError, StalledError } from './util.js';
+import { ok, fail, botPos, posText, guarded, customName, TimeoutError, AbortedError, StalledError } from './util.js';
 import { leaveDrops } from './items.js';
 
 const { GoalNear, GoalFollow } = pathfinderPkg.goals;
@@ -72,9 +72,10 @@ class DoorMovements extends Movements {
   }
 
   // Never dig what the bot built itself, even when it's made of something that looks natural,
-  // like a tuff wall.
+  // like a tuff wall, or what a player just put down (see watchPlayerBlocks).
   safeToBreak(block) {
     if (block.position && this.bot.placedLog?.has(block.position, block.name)) return false;
+    if (block.position && playerPlaced(this.bot, block.position)) return false;
     return super.safeToBreak(block);
   }
 
@@ -280,21 +281,38 @@ function nearBuild(bot, pos) {
   return false;
 }
 
-// Walking prefers existing paths and the ground: a dug block costs about 3 steps and, on an
-// everyday walk, a placed block about 40, so the bot walks around or jumps up and only builds
-// a pillar or bridge when there's no other way. Jobs that have to reach high places (tall
-// trees, building) use the climb mode, where scaffolding costs about 12. Nothing is ever
-// placed next to builds.
+// Costs are in blocks of walking. The pathfinder charges (1 + 3 x seconds to break) x digCost
+// for a dug block, and most blocks take about half a second with the right tool, so a digCost
+// of 8 makes breaking a block worth about 20 blocks of walking: the bot goes round anything
+// shorter. Slow blocks cost more, and a step over 100 is never taken, so it never digs stone
+// by hand. Jobs that have to reach high places (tall trees, building) use climb, where a dug
+// block is worth about 7. Nothing is ever placed next to builds.
+//
+// MODES are for the pathfinder's own searches, which follow a moving goal (a player, a mob)
+// as they go; a placed block costs 40 there so following never builds. Walks to a fixed spot
+// are planned in full first (planRoute) with PLAN_MODES: on foot first, so digging and placing
+// only come in when no existing way is short enough, and then a placed block can be cheap (one
+// extra block of walking). The search has to rule out everything cheaper before it settles on
+// a climb: at a placeCost of 12 an 18 block pillar isn't found in 20 s, at 1 in about a second.
 const MODES = {
-  walk: { placeCost: 40, place: true },
-  climb: { placeCost: 12, place: true },
-  noPlace: { placeCost: 12, place: false }
+  walk: { digCost: 8, placeCost: 40, place: true },
+  climb: { digCost: 3, placeCost: 12, place: true },
+  noPlace: { digCost: 8, place: false }
 };
 
-function makeMovements(bot, cantBreak, { placeCost, place }) {
+const PLAN_MODES = {
+  onFoot: { dig: false, place: false },
+  walk: { digCost: 8, placeCost: 1, place: true },
+  climb: { digCost: 3, placeCost: 1, place: true },
+  noPlace: { digCost: 8, place: false },
+  digClimb: { digCost: 2, placeCost: 1, place: true },
+  digNoPlace: { digCost: 2, place: false }
+};
+
+function makeMovements(bot, cantBreak, { digCost = 0, placeCost = 0, place, dig = true }) {
   const m = new DoorMovements(bot);
-  m.canDig = true;
-  m.digCost = 3;
+  m.canDig = dig;
+  m.digCost = digCost;
   m.placeCost = placeCost;
   // Plan around players and mobs where there's room, so someone standing in one half of a
   // double door doesn't block the way.
@@ -303,7 +321,11 @@ function makeMovements(bot, cantBreak, { placeCost, place }) {
   m.allow1by1towers = place;
   m.scafoldingBlocks = place ? SCAFFOLD_BLOCKS.map((name) => bot.registry.itemsByName[name]?.id).filter((id) => id !== undefined) : [];
   // Inside the area of a house it is building, the bot may put up scaffolding next to its own walls.
-  m.exclusionAreasPlace = [(block) => (!inZone(bot.buildZone, block.position) && nearBuild(bot, block.position) ? 100 : 0)];
+  m.exclusionAreasPlace = [(block) => {
+    if (inZone(bot.buildZone, block.position) || !nearBuild(bot, block.position)) return 0;
+    m.onRefusedPlace?.(block.position);
+    return 100;
+  }];
   // Steps the bot recently got stuck on cost more, so the next path tries another way.
   m.exclusionAreasStep = [(block) => {
     const a = block.position && bot.avoidSteps?.get(block.position.toString());
@@ -425,20 +447,89 @@ function watchStalls(bot) {
   });
 }
 
+// Steps after the first one that digs or places keep the pathfinder's raw block coordinates,
+// which are the corner of the block, not its middle, because it normally plans again after
+// every dig or place. When it doesn't (the block was already gone, so nothing changed, or a
+// planned walk carries on with the rest of its steps), the bot heads for the corner: on a step
+// down it stays on the edge of the blocks around and never drops.
+export function centreRawSteps(path) {
+  const first = path.findIndex((n) => n.toBreak.length > 0 || n.toPlace.length > 0);
+  if (first < 0) return;
+  for (const n of path.slice(first)) {
+    n.x = Math.floor(n.x) + 0.5;
+    n.z = Math.floor(n.z) + 0.5;
+  }
+}
+
+// A block that fills an empty spot with a player close by, like dirt patched into a hole. It
+// looks like terrain, so walks would dig it, but someone put it there: walks leave it for an
+// hour. Not while the pathfinder is putting down scaffolding right there itself.
+const PLAYER_BLOCK_MS = 3600000;
+const PLAYER_BLOCK_MAX = 5000;
+
+function watchPlayerBlocks(bot) {
+  const blocks = new Map();
+  bot.playerBlocks = blocks;
+  bot.on('blockUpdate', (oldBlock, newBlock) => {
+    if (!oldBlock || !newBlock?.position || !bot.entity) return;
+    const key = cellKey(newBlock.position);
+    if (newBlock.boundingBox !== 'block') {
+      blocks.delete(key);
+      return;
+    }
+    if (oldBlock.boundingBox !== 'empty') return;
+    const centre = newBlock.position.offset(0.5, 0.5, 0.5);
+    if (bot.pathfinder.isBuilding() && bot.entity.position.distanceTo(centre) <= 6) return;
+    if (!Object.values(bot.players).some((p) => p.entity && p.entity !== bot.entity && p.entity.position.distanceTo(centre) <= 6)) return;
+    blocks.delete(key);
+    blocks.set(key, Date.now() + PLAYER_BLOCK_MS);
+    if (blocks.size > PLAYER_BLOCK_MAX) blocks.delete(blocks.keys().next().value);
+  });
+}
+
+export function playerPlaced(bot, pos) {
+  const key = cellKey(pos);
+  const until = bot.playerBlocks?.get(key);
+  if (until === undefined) return false;
+  if (until > Date.now()) return true;
+  bot.playerBlocks.delete(key);
+  return false;
+}
+
 export function setupMovements(bot) {
   const cantBreak = new Set(bot.registry.blocksArray.filter((b) => !isNaturalBlock(b.name)).map((b) => b.id));
   bot.moveModes = Object.fromEntries(Object.entries(MODES).map(([name, mode]) => [name, makeMovements(bot, cantBreak, mode)]));
+  bot.planModes = Object.fromEntries(Object.entries(PLAN_MODES).map(([name, mode]) => [name, makeMovements(bot, cantBreak, mode)]));
   bot.pathfinder.setMovements(bot.moveModes.walk);
   bot.moveMode = 'walk';
   bot.pathfinder.thinkTimeout = 10000;
+  // A planned walk hands the pathfinder its own steps instead of a search of its own.
+  const getPathTo = bot.pathfinder.getPathTo;
+  if (getPathTo) {
+    bot.pathfinder.getPathTo = (movements, goal, timeout) => {
+      const walk = bot.plannedWalk;
+      return walk && walk.goal === goal ? walk.handOut() : getPathTo(movements, goal, timeout);
+    };
+  }
+  bot.on('path_update', (results) => centreRawSteps(results.path));
+  watchPlayerBlocks(bot);
   passagesOnPath(bot);
   watchStalls(bot);
+}
+
+function modeName(place) {
+  return place === 'climb' ? 'climb' : place ? 'walk' : 'noPlace';
+}
+
+function planModeName(place, dig) {
+  if (dig) return place ? 'digClimb' : 'digNoPlace';
+  return modeName(place);
 }
 
 // place is true for an everyday walk (blocks only as a last resort), 'climb' for jobs that
 // need scaffolding, and false for no placing at all.
 export function useMoveMode(bot, place) {
-  const name = place === 'climb' ? 'climb' : place ? 'walk' : 'noPlace';
+  const name = modeName(place);
   if (!bot.moveModes || bot.moveMode === name) return;
   bot.pathfinder.setMovements(bot.moveModes[name]);
   bot.moveMode = name;
@@ -468,14 +559,275 @@ export function walkPatience(distance, maxSeconds) {
   return Math.min(maxSeconds, Math.max(20, distance * 3)) * 1000;
 }
 
+// How long a planned walk may search, in ms: first for a way on foot, then for one that digs
+// or places.
+export const PLAN_BUDGET = { onFoot: 2500, build: 5000 };
+
+// A way on foot counts as long as it is at most twice the straight distance plus 24 blocks
+// (stairs cost 2 a block up, so this takes in a staircase too). Past that, digging or placing
+// is the better deal. Returns the pathfinder's searchRadius, which it adds to the distance.
+export function onFootRadius(distance) {
+  return distance + 24;
+}
+
+const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+// Runs one search a slice at a time (tickTimeout each), so the bot keeps ticking while it
+// thinks. Null when stopped.
+async function search(bot, movements, goal, timeout, radius, stopped) {
+  const slices = bot.pathfinder.getPathFromTo(movements, bot.entity.position, goal, { timeout, searchRadius: radius });
+  let { result } = slices.next().value;
+  while (result.status === 'partial') {
+    await nextTurn();
+    if (stopped()) return null;
+    result = slices.next().value.result;
+  }
+  return result;
+}
+
+// True when the bot could stand at cell, as the pathfinder sees it.
+function standable(m, cell) {
+  const feet = m.getBlock(cell, 0, 0, 0);
+  const head = m.getBlock(cell, 0, 1, 0);
+  const below = m.getBlock(cell, 0, -1, 0);
+  return feet.safe && head.safe && (below.physical || below.climbable || feet.climbable || feet.liquid);
+}
+
+// For a goal around one spot (GoalNear, GoalBlock): true when no cell that ends it has room to stand.
+function nowhereToStand(m, goal) {
+  if (goal.x === undefined || goal.y === undefined || goal.z === undefined) return false;
+  const r = Math.ceil(Math.sqrt(goal.rangeSq ?? 0));
+  if (r > 3) return false;
+  for (let dx = -r; dx <= r; dx++) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dz = -r; dz <= r; dz++) {
+        const cell = new Vec3(goal.x + dx, goal.y + dy, goal.z + dz);
+        if (goal.isEnd(cell) && standable(m, cell)) return false;
+      }
+    }
+  }
+  return true;
+}
+
+function noRouteText(bot, goal, m, tried, refused) {
+  const parts = [`no route found, so nothing was dug or placed. Tried ${tried.join(', then ')}`];
+  const target = goalPos(goal);
+  if (target && nowhereToStand(m, goal)) {
+    const r = Math.round(Math.sqrt(goal.rangeSq ?? 0));
+    parts.push(`There is nowhere to stand ${r ? `within ${r} of` : 'at'} ${posText(target)}`);
+  }
+  const up = target ? Math.floor(target.y) - Math.floor(bot.entity.position.y) : 0;
+  if (up >= 3) parts.push(`The spot is ${up} blocks above my feet`);
+  if (!m.allow1by1towers) {
+    parts.push('Placing blocks is off for this walk');
+  } else {
+    const blocks = m.countScaffoldingItems();
+    parts.push(blocks ? `I had ${blocks} blocks to build up with` : 'I have no spare dirt, cobblestone or similar to build up with');
+  }
+  if (refused) parts.push("Placing blocks against the build near the spot was ruled out, I only do that inside a build job's area");
+  return parts.join('. ');
+}
+
+// The search's goal for a walk that digs its way to a block. A look goal raycasts the world as
+// it is, so a buried block is never in sight from anywhere and the search can't end. A spot
+// whose feet or head touch the block (or with it right over the head) counts too, since the
+// route has dug those open by the time the bot stands there. In rock every step costs about
+// the same, so a plain search digs out a ball around the bot before it goes anywhere; the
+// heuristic is weighted by DIG_WEIGHT to send it straight at the block.
+export const DIG_WEIGHT = 16;
+
+function digGoal(goal, weight) {
+  const t = goal.pos;
+  const touches = (n) => {
+    const dx = Math.abs(n.x - t.x);
+    const dz = Math.abs(n.z - t.z);
+    const dy = t.y - n.y;
+    if (dx === 0 && dz === 0) return dy === 2;
+    return dx + dz === 1 && (dy === 0 || dy === 1);
+  };
+  return {
+    heuristic: (n) => goal.heuristic(n) * weight,
+    isEnd: (n) => goal.isEnd(n) || touches(n),
+    hasChanged: () => false,
+    isValid: () => true
+  };
+}
+
+// Works out a route to goal before the bot takes a step. First on foot (no digging, no
+// placing) within onFootRadius, then with the digging and placing the walk allows. Gives
+// { status: 'success', path } for a complete route, { status: 'partial', path, left } for a
+// way that only gets closer (left is the distance it leaves), or { status: 'none', message }
+// when there is nothing worth walking. A partial way is on foot, except on a dig walk (dig set,
+// for a block to dig out), where it may dig: it only goes through what the walk may dig anyway.
+// Null when stopped.
+export async function planRoute(bot, goal, place, { dig = false, onFootMs = PLAN_BUDGET.onFoot, buildMs = PLAN_BUDGET.build, stopped = () => false } = {}) {
+  const here = bot.entity.position.floored();
+  if (goal.isEnd(here)) return { status: 'success', path: [] };
+  const digging = dig && goal.pos;
+  const footGoal = digging ? digGoal(goal, 1) : goal;
+  const h = goal.heuristic(here);
+  const foot = await search(bot, bot.planModes.onFoot, footGoal, onFootMs, onFootRadius(h), stopped);
+  if (!foot) return null;
+  if (foot.status === 'success') return { status: 'success', path: foot.path };
+
+  const left = foot.context.bestNode.h;
+  const tried = [foot.status === 'noPath'
+    ? `on foot (no way within ${Math.round(h + onFootRadius(h))} blocks of walking)`
+    : `on foot (nothing complete after ${onFootMs / 1000}s)`];
+  const m = bot.planModes[planModeName(place, dig)];
+  const closer = foot.path.length > 0 && h - left >= 2 ? { status: 'partial', path: foot.path, left } : null;
+  // Still getting closer on foot when time ran out: keep walking and look again from there.
+  if (foot.status === 'timeout' && closer && h - left >= Math.max(8, h / 4)) return { ...closer, message: noRouteText(bot, goal, m, tried, 0) };
+
+  let refused = 0;
+  const target = goalPos(goal);
+  m.onRefusedPlace = target ? (p) => { if (p.distanceTo(target) <= 5) refused++; } : null;
+  const build = await search(bot, m, digging ? digGoal(goal, DIG_WEIGHT) : goal, buildMs, -1, stopped);
+  m.onRefusedPlace = null;
+  if (!build) return null;
+  if (build.status === 'success') return { status: 'success', path: build.path };
+  const how = m.allow1by1towers ? 'digging and placing' : 'digging';
+  tried.push(build.status === 'noPath' ? `${how} (no way at all)` : `${how} (nothing complete after ${buildMs / 1000}s)`);
+  const message = noRouteText(bot, goal, m, tried, refused);
+  if (build.status === 'timeout' && digging && build.path.length > 0) {
+    const dug = goal.heuristic(build.context.bestNode.data);
+    if (h - dug >= 2) return { status: 'partial', path: build.path, left: dug, message };
+  }
+  if (build.status === 'timeout' && closer) return { ...closer, message };
+  return { status: 'none', message };
+}
+
+function cellKey(p) {
+  return `${p.x},${p.y},${p.z}`;
+}
+
+// The blocks a path digs out or puts down itself.
+function ownChanges(path) {
+  const cells = new Set();
+  for (const step of path) {
+    for (const b of step.toBreak) cells.add(cellKey(b));
+    for (const p of step.toPlace) if (!p.useOne) cells.add(cellKey({ x: p.x + p.dx, y: p.y + p.dy, z: p.z + p.dz }));
+  }
+  return cells;
+}
+
+function pathError(name, message) {
+  const err = new Error(message);
+  err.name = name;
+  return err;
+}
+
+// Walks to a fixed goal along a route planned in full first (planRoute), standing still while
+// it plans. The pathfinder still does the walking: getPathTo hands it the planned steps (see
+// setupMovements). It plans again after every dig or place, so after one of the route's own
+// it gets the rest of the same steps back. Any other reason (stuck, a block on the way changed
+// by someone else, out of blocks, the steps ran out short of the goal) makes the bot stand
+// still and plan again from where it is.
+async function plannedGoto(bot, goal, place, dig) {
+  const walk = { goal, ready: null, steps: [], expected: new Set(), reset: null, dirty: false, following: false, replan: false, end: null };
+  let wake = () => {};
+  const again = () => {
+    walk.following = false;
+    walk.replan = true;
+    wake();
+  };
+  walk.handOut = () => {
+    if (walk.ready) {
+      walk.steps = walk.ready.path;
+      walk.ready = null;
+      walk.expected = ownChanges(walk.steps);
+      walk.reset = null;
+      walk.dirty = false;
+      walk.following = true;
+      return { status: 'success', path: walk.steps };
+    }
+    if (walk.following && walk.reset === 'block_updated' && !walk.dirty && walk.steps.length > 0) {
+      walk.reset = null;
+      return { status: 'success', path: walk.steps };
+    }
+    bot.clearControlStates();
+    if (walk.following) again();
+    return { status: 'planning', path: [] };
+  };
+
+  const onReached = (g) => {
+    if (g !== goal) return;
+    walk.end = 'reached';
+    wake();
+  };
+  const onGoal = (g) => {
+    if (g === goal) return;
+    walk.end = 'changed';
+    wake();
+  };
+  const onStop = () => {
+    walk.end = 'stopped';
+    wake();
+  };
+  const onReset = (reason) => { walk.reset = reason; };
+  const onBlock = (oldBlock, newBlock) => {
+    if (!walk.following || !oldBlock || !newBlock || oldBlock.type === newBlock.type) return;
+    const p = oldBlock.position;
+    if (walk.expected.has(cellKey(p))) return;
+    if (walk.steps.some((s) => Math.abs(s.x - p.x - 0.5) <= 2 && Math.abs(s.y - p.y) <= 3 && Math.abs(s.z - p.z - 0.5) <= 2)) walk.dirty = true;
+  };
+  const onTick = () => {
+    if (walk.following) {
+      if (walk.steps.length === 0 && !bot.pathfinder.isMoving() && bot.pathfinder.goal === goal) again();
+    } else if (bot.entity?.isInWater) {
+      bot.setControlState('jump', true);
+    }
+  };
+  const events = { goal_reached: onReached, goal_updated: onGoal, path_stop: onStop, path_reset: onReset, blockUpdate: onBlock, physicsTick: onTick };
+  for (const [name, fn] of Object.entries(events)) bot.on(name, fn);
+  bot.plannedWalk = walk;
+  try {
+    bot.pathfinder.setGoal(goal);
+    let best = Infinity;
+    while (!walk.end) {
+      walk.replan = false;
+      const plan = await planRoute(bot, goal, place, { dig, stopped: () => walk.end !== null });
+      if (!plan || walk.end) break;
+      if (plan.status === 'none') throw pathError('NoRoute', plan.message);
+      if (plan.path.length === 0) break;
+      if (plan.status === 'partial') {
+        if (plan.left > best - 1) throw pathError('NoRoute', `${plan.message}. Walked as close as I could on foot`);
+        best = plan.left;
+      }
+      walk.ready = plan;
+      bot.pathfinder.setGoal(goal);
+      await new Promise((resolve) => {
+        wake = resolve;
+        if (walk.end || walk.replan) resolve();
+      });
+    }
+  } finally {
+    for (const [name, fn] of Object.entries(events)) bot.removeListener(name, fn);
+    if (bot.plannedWalk === walk) bot.plannedWalk = null;
+    if (bot.pathfinder.goal === goal) bot.pathfinder.setGoal(null);
+  }
+  if (walk.end === 'changed') throw pathError('GoalChanged', 'The goal was changed before it could be completed!');
+  if (walk.end === 'stopped') throw pathError('PathStopped', 'Path was stopped before it could be completed!');
+}
+
+// A failed walk says why in reason: 'no_route' (planned, nothing found), 'no_path' (the
+// pathfinder's own search), 'stuck', 'timeout', 'short' (ended before the goal), 'stopped',
+// 'interrupted' (another goal took over) or 'error'.
+function walkFail(reason, message) {
+  return { ...fail(message), reason };
+}
+
 // Walks to a goal and turns the usual failures into a result message. With place off, the
 // bot never puts blocks down on the way (used when carrying items to hand over, and so on).
 // A long walk is fine as long as the bot keeps getting closer; it gives up once it hasn't
 // for moveTimeoutSeconds, or a short walk sooner (see walkPatience), not counting time spent
-// digging or placing blocks on the way.
-export async function walkTo(ctx, goal, { place = true } = {}) {
+// digging or placing blocks on the way. A fixed goal gets its route planned first
+// (plannedGoto); a moving one (an entity) is left to the pathfinder, which keeps up with it.
+// Set dig when the walk is to a block the bot will dig out, so a buried one can be dug to.
+export async function walkTo(ctx, goal, { place = true, dig = false } = {}) {
   const { bot, config, signal } = ctx;
   useMoveMode(bot, place);
+  const planned = bot.planModes && !('entity' in goal);
   const full = config.limits.moveTimeoutSeconds * 1000;
   const target = goalPos(goal);
   const patience = target ? walkPatience(bot.entity.position.distanceTo(target), config.limits.moveTimeoutSeconds) : full;
@@ -497,7 +849,7 @@ export async function walkTo(ctx, goal, { place = true } = {}) {
     return now - bestAt > full || waited > patience;
   };
   try {
-    await guarded(() => bot.pathfinder.goto(goal), {
+    await guarded(() => (planned ? plannedGoto(bot, goal, place, dig) : bot.pathfinder.goto(goal)), {
       ms: target ? full * 8 : full,
       signal,
       stalled: target ? stalled : undefined,
@@ -506,16 +858,20 @@ export async function walkTo(ctx, goal, { place = true } = {}) {
     // goto also resolves when the best path is empty, so check the bot really got there.
     const p = bot.entity.position.floored();
     if (!goal.isEnd(p) && !goal.isEnd(p.offset(0, 1, 0))) {
-      return fail(`could not get all the way there, ${botPos(bot)}`);
+      return walkFail('short', `could not get all the way there, ${botPos(bot)}`);
     }
     return ok(`arrived, ${botPos(bot)}`);
   } catch (err) {
-    if (err instanceof AbortedError) return fail('stopped');
-    if (err instanceof StalledError) return fail(`stuck, got no closer for ${Math.round((Date.now() - bestAt) / 1000)}s, ${botPos(bot)}`);
-    if (err instanceof TimeoutError) return fail(`timed out walking, ${botPos(bot)}`);
-    if (err.name === 'NoPath' || err.name === 'Timeout') return fail(`no path, ${botPos(bot)}`);
-    if (err.name === 'GoalChanged' || err.name === 'PathStopped') return fail(`movement was interrupted, ${botPos(bot)}`);
-    return fail(`could not walk there: ${err.message}`);
+    if (err instanceof AbortedError) return walkFail('stopped', 'stopped');
+    if (err instanceof StalledError) return walkFail('stuck', `stuck, got no closer for ${Math.round((Date.now() - bestAt) / 1000)}s, ${botPos(bot)}`);
+    if (err instanceof TimeoutError) return walkFail('timeout', `timed out walking, ${botPos(bot)}`);
+    if (err.name === 'NoRoute') return walkFail('no_route', `${err.message}, ${botPos(bot)}`);
+    if (err.name === 'NoPath' || err.name === 'Timeout') return walkFail('no_path', `no path, ${botPos(bot)}`);
+    if (err.name === 'GoalChanged' || err.name === 'PathStopped') return walkFail('interrupted', `movement was interrupted, ${botPos(bot)}`);
+    return walkFail('error', `could not walk there: ${err.message}`);
+  } finally {
+    // Left set, the pathfinder would keep walking (and digging) the last path after the walk gave up.
+    if (bot.pathfinder.goal === goal) bot.pathfinder.setGoal(null);
   }
 }
 

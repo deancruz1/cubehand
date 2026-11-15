@@ -1,8 +1,13 @@
 import { Vec3 } from 'vec3';
-import { ok, fail } from './util.js';
-import { placeOne, removeScaffold, digBlock } from './blocks.js';
+import { ok, fail, posText } from './util.js';
+import { placeOne, removeScaffold, digBlock, findReference } from './blocks.js';
 import { watchScaffold, SCAFFOLD_BLOCKS } from './movement.js';
-import { parseBlock, itemFor, matchesState, stateProblem } from './states.js';
+import { parseBlock, itemFor, matchesState, stateProblem, placementOptions } from './states.js';
+
+// As in blocks.js: how far from the eyes a block can be placed without walking.
+const REACH = 4.5;
+// Walks in a row that fail to get near a group's blocks before the rest of that group is skipped.
+const GIVE_UP_AFTER = 3;
 
 const range = (a, b) => {
   const out = [];
@@ -174,23 +179,92 @@ export function* nearestFirst(blocks, here) {
   }
 }
 
-// Places blocks one y layer at a time, in the order given, or with nearest set, always the
-// one closest to the bot next. Blocks with nothing to place against yet are retried once the
+// Splits blocks into groups that lie together: two blocks are in one group when they are at
+// most gap blocks apart on every axis, so a window or a skipped block doesn't split a wall,
+// but the two gable ends of a roof are two groups. Each group keeps the order blocks came in.
+export function groupBlocks(blocks, gap = 2) {
+  const index = new Map(blocks.map((p, i) => [`${p.x},${p.y},${p.z}`, i]));
+  const seen = new Array(blocks.length).fill(false);
+  const groups = [];
+  for (let i = 0; i < blocks.length; i++) {
+    if (seen[i]) continue;
+    seen[i] = true;
+    const members = [];
+    const queue = [i];
+    while (queue.length > 0) {
+      const j = queue.pop();
+      members.push(j);
+      const p = blocks[j];
+      for (let dx = -gap; dx <= gap; dx++) {
+        for (let dy = -gap; dy <= gap; dy++) {
+          for (let dz = -gap; dz <= gap; dz++) {
+            const k = index.get(`${p.x + dx},${p.y + dy},${p.z + dz}`);
+            if (k !== undefined && !seen[k]) {
+              seen[k] = true;
+              queue.push(k);
+            }
+          }
+        }
+      }
+    }
+    groups.push(members.sort((a, b) => a - b).map((j) => blocks[j]));
+  }
+  return groups;
+}
+
+// Hands out a group's blocks so everything that can go in from where the bot stands goes in
+// before it walks. Only blocks with no block of the group still to come right under them are
+// up next. Of those, the closest one in reach that placeable(p) says has something to place
+// against comes first, otherwise the closest one, which means a walk. here() is the eye position.
+export function* fromHere(blocks, here, placeable = () => true) {
+  const key = (x, y, z) => `${x},${y},${z}`;
+  const left = new Map(blocks.map((p) => [key(p.x, p.y, p.z), p]));
+  const under = new Map(blocks.map((p) => [p, key(p.x, p.y - 1, p.z)]));
+  const dist = (p, at) => (p.x + 0.5 - at.x) ** 2 + (p.y + 0.5 - at.y) ** 2 + (p.z + 0.5 - at.z) ** 2;
+  while (left.size > 0) {
+    const at = here();
+    let nearest = null;
+    const near = [];
+    for (const p of left.values()) {
+      if (left.has(under.get(p))) continue;
+      const d = dist(p, at);
+      if (!nearest || d < nearest.d) nearest = { p, d };
+      if (d <= REACH ** 2) near.push({ p, d });
+    }
+    near.sort((a, b) => a.d - b.d);
+    const next = near.find((n) => placeable(n.p)) ?? nearest;
+    left.delete(key(next.p.x, next.p.y, next.p.z));
+    yield next.p;
+  }
+}
+
+// Places blocks one y layer at a time, in the order given, or with nearest set, all as one
+// batch handed out by fromHere. Blocks with nothing to place against yet are retried once the
 // rest of their layer is down, then with the layers above (a hanging lantern needs the block
 // over it). Afterwards every block is checked once more, and the ones that are missing or
 // turned the wrong way get one more go. strays holds the keys of planned spots where
-// scaffolding went up; it is dug out before the block goes there.
-export async function placeAll(ctx, placements, { nearest = false, strays } = {}) {
+// scaffolding went up; it is dug out before the block goes there. With giveUpAfter, that many
+// failed walks in a row stop it early and gaveUp says why. all is the whole build, when these
+// placements are only part of it, for the progress line and the count of items still needed.
+export async function placeAll(ctx, placements, { nearest = false, strays, giveUpAfter, all = placements } = {}) {
   const { signal } = ctx;
   let placed = 0;
   const failures = [];
   let stoppedReason = null;
+  let gaveUp = null;
+  let streak = [];
+  const before = all.filter((p) => p.done).length;
 
   const layers = new Map();
   for (const p of placements) {
-    if (!layers.has(p.y)) layers.set(p.y, []);
-    layers.get(p.y).push(p);
+    const layer = nearest ? 'all' : p.y;
+    if (!layers.has(layer)) layers.set(layer, []);
+    layers.get(layer).push(p);
   }
+  const placeable = (p) => {
+    const options = p.props && Object.keys(p.props).length ? placementOptions(p.block, p.props) : undefined;
+    return Boolean(findReference(ctx.bot, new Vec3(p.x, p.y, p.z), p.block, p.attach, options));
+  };
 
   const place = async (p) => {
     const pos = new Vec3(p.x, p.y, p.z);
@@ -207,7 +281,7 @@ export async function placeAll(ctx, placements, { nearest = false, strays } = {}
     if (result.ok) p.done = true;
     return result;
   };
-  const ranOut = (p) => `ran out of ${itemFor(p.block, ctx.bot.registry)}, need ${placements.filter((q) => q.block === p.block && !q.done).length} more`;
+  const ranOut = (p) => `ran out of ${itemFor(p.block, ctx.bot.registry)}, need ${all.filter((q) => q.block === p.block && !q.done).length} more`;
 
   let carried = [];
   outer: for (const layer of [...layers.values(), []]) {
@@ -216,7 +290,7 @@ export async function placeAll(ctx, placements, { nearest = false, strays } = {}
     while (pending.length > 0) {
       const retry = [];
       let progress = false;
-      const order = nearest ? nearestFirst(pending, () => ctx.bot.entity.position.offset(0, 1.6, 0)) : pending;
+      const order = nearest ? fromHere(pending, () => ctx.bot.entity.position.offset(0, 1.6, 0), placeable) : pending;
       for (const p of order) {
         if (signal?.aborted) {
           stoppedReason = 'stopped';
@@ -226,12 +300,22 @@ export async function placeAll(ctx, placements, { nearest = false, strays } = {}
         if (result.ok) {
           placed++;
           progress = true;
-          ctx.status?.progress(`placed ${placed} of ${placements.length} blocks`);
+          failures.push(...streak);
+          streak = [];
+          ctx.status?.progress(`placed ${before + placed} of ${all.length} blocks`);
         } else if (result.message.startsWith('missing item')) {
           stoppedReason = ranOut(p);
           break outer;
         } else if (result.message.startsWith('no block to place against')) {
           retry.push(p);
+        } else if (giveUpAfter && result.reason) {
+          streak.push(result.message);
+          // A planned walk that found no way to the group's first block won't find one on a
+          // second try either.
+          if (streak.length >= giveUpAfter || (result.reason === 'no_route' && placed === 0)) {
+            gaveUp = { message: result.message, tries: streak.length, from: ctx.bot.entity.position.floored() };
+            break outer;
+          }
         } else {
           failures.push(result.message);
         }
@@ -243,6 +327,7 @@ export async function placeAll(ctx, placements, { nearest = false, strays } = {}
       pending = retry;
     }
   }
+  if (!gaveUp) failures.push(...streak);
   for (const p of carried) failures.push(`no block to place against at ${p.x} ${p.y} ${p.z}`);
 
   const wrong = [];
@@ -257,7 +342,57 @@ export async function placeAll(ctx, placements, { nearest = false, strays } = {}
       else if (!result.ok) failures.push(result.message);
     }
   }
-  return { placed, failures, wrong, stoppedReason };
+  return { placed, failures, wrong, stoppedReason, gaveUp };
+}
+
+// Builds a structure group by group, always the closest group to the bot next, each finished
+// before walking to the next. A group the bot can't get to is skipped and the next one goes on.
+// report has what is left of each group and why.
+async function placeGroups(ctx, groups, { strays }) {
+  const all = groups.flat();
+  const todo = [...groups];
+  const dist = (p, at) => (p.x + 0.5 - at.x) ** 2 + (p.y + 0.5 - at.y) ** 2 + (p.z + 0.5 - at.z) ** 2;
+  let placed = 0;
+  const failures = [];
+  const wrong = [];
+  const report = [];
+  let stoppedReason = null;
+  while (todo.length > 0 && !stoppedReason) {
+    const at = ctx.bot.entity.position.offset(0, 1.6, 0);
+    const closest = (g) => g.reduce((m, p) => Math.min(m, dist(p, at)), Infinity);
+    let best = 0;
+    for (let i = 1; i < todo.length; i++) if (closest(todo[i]) < closest(todo[best])) best = i;
+    const group = todo.splice(best, 1)[0];
+    const result = await placeAll(ctx, group, { nearest: true, strays, all, giveUpAfter: GIVE_UP_AFTER });
+    placed += result.placed;
+    failures.push(...result.failures);
+    wrong.push(...result.wrong);
+    stoppedReason = result.stoppedReason;
+    const left = group.filter((p) => !p.done);
+    if (left.length > 0) report.push({ left, failures: result.failures, gaveUp: result.gaveUp });
+  }
+  for (const group of todo) report.push({ left: group, failures: [], notStarted: true });
+  return { placed, failures, wrong, stoppedReason, report };
+}
+
+// "8 blocks around 2781 83 -5022 (8 deepslate_bricks, from 2781 80 -5025 to 2781 85 -5019):
+// couldn't get up there ...", for one group of a build that didn't get finished.
+function leftText({ left, failures, gaveUp, notStarted }, climbText) {
+  const min = { x: Math.min(...left.map((p) => p.x)), y: Math.min(...left.map((p) => p.y)), z: Math.min(...left.map((p) => p.z)) };
+  const max = { x: Math.max(...left.map((p) => p.x)), y: Math.max(...left.map((p) => p.y)), z: Math.max(...left.map((p) => p.z)) };
+  const mid = { x: Math.round((min.x + max.x) / 2), y: Math.round((min.y + max.y) / 2), z: Math.round((min.z + max.z) / 2) };
+  const names = new Map();
+  for (const p of left) names.set(p.block, (names.get(p.block) ?? 0) + 1);
+  const what = [...names].map(([n, c]) => `${c} ${n}`).join(', ');
+  const where = left.length <= 3 ? `at ${left.map(posText).join('; ')}` : `from ${posText(min)} to ${posText(max)}`;
+  let why;
+  if (gaveUp) {
+    const rise = min.y - gaveUp.from.y;
+    why = rise >= 2 ? `couldn't get up there, the lowest is ${rise} blocks above where I got to` : "couldn't get close enough";
+    why += ` (${gaveUp.tries} ${gaveUp.tries === 1 ? 'try' : 'tries'}, last: ${gaveUp.message}); ${climbText}`;
+  } else if (notStarted) why = 'not started';
+  else why = failures.length ? failures.slice(0, 3).join('; ') : 'not finished';
+  return `${left.length} block${left.length === 1 ? '' : 's'} around ${posText(mid)} (${what}, ${where}): ${why}`;
 }
 
 // The box a structure fills, and the spots its blocks go.
@@ -278,9 +413,36 @@ export function buildSite(origin, blocks) {
   return { min, max, planned };
 }
 
-// Where a build's scaffolding may be: next to the build (min..max) and a few blocks over it.
+// The lowest ground in the 2 blocks round a site (and under it), as the y of the feet of
+// someone standing on it, at most 32 blocks below the site. Scaffolding to high blocks like
+// roof trim starts there.
+export function groundUnder(bot, min, max) {
+  let ground = min.y;
+  for (let x = min.x - 2; x <= max.x + 2; x++) {
+    for (let z = min.z - 2; z <= max.z + 2; z++) {
+      let y = min.y - 1;
+      while (y > min.y - 32) {
+        const b = bot.blockAt(new Vec3(x, y, z), false);
+        if (!b || b.boundingBox === 'block') break;
+        y--;
+      }
+      ground = Math.min(ground, y + 1);
+    }
+  }
+  return ground;
+}
+
+// The area a build may put scaffolding in (bot.buildZone): round the site and over it, and
+// down to the ground beside it.
+export function buildZone(site, ground) {
+  return { min: new Vec3(site.min.x - 2, Math.min(site.min.y, ground) - 1, site.min.z - 2), max: site.max.offset(2, 2, 2) };
+}
+
+// Where a build's scaffolding may be: next to the build (min..max), a few blocks over it, and
+// down to the ground beside it (site.ground) for a build that starts high up.
 function scaffoldInSite(site, p) {
-  return p.x >= site.min.x - 2 && p.x <= site.max.x + 2 && p.z >= site.min.z - 2 && p.z <= site.max.z + 2 && p.y >= site.min.y - 2 && p.y <= site.max.y + 3;
+  const bottom = Math.min(site.min.y, site.ground ?? site.min.y) - 2;
+  return p.x >= site.min.x - 2 && p.x <= site.max.x + 2 && p.z >= site.min.z - 2 && p.z <= site.max.z + 2 && p.y >= bottom && p.y <= site.max.y + 3;
 }
 
 // A block that shows up at p is the bot's own scaffolding when the pathfinder is placing one
@@ -350,12 +512,13 @@ export async function buildStructure(ctx, { origin, blocks = [], parts = [], dry
   // Like build_house: scaffolding may go up next to its own blocks, never made of the build's
   // materials, and comes down again afterwards.
   const site = buildSite(origin, all);
-  bot.buildZone = { min: site.min.offset(-2, -1, -2), max: site.max.offset(2, 2, 2) };
+  site.ground = groundUnder(bot, site.min, site.max);
+  bot.buildZone = buildZone(site, site.ground);
   bot.buildKeep = new Set([...plan.needed.keys()].map((n) => bot.registry.itemsByName[n]?.id).filter((id) => id !== undefined));
   const scaffold = watchBuildScaffold(bot, site, site.planned);
   let result;
   try {
-    result = await placeAll(ctx, plan.placements, { nearest: true, strays: scaffold.strays });
+    result = await placeGroups(ctx, groupBlocks(plan.placements), { strays: scaffold.strays });
   } finally {
     scaffold.stop();
     bot.buildZone = null;
@@ -363,11 +526,19 @@ export async function buildStructure(ctx, { origin, blocks = [], parts = [], dry
   }
   const removed = await removeScaffold(ctx, scaffold.leftover(plan.placements));
 
-  const { placed, failures, wrong, stoppedReason } = result;
-  let message = `placed ${placed}, skipped ${plan.skipped}, failed ${failures.length}`;
+  const { placed, failures, wrong, stoppedReason, report } = result;
+  const tried = failures.length + report.reduce((n, r) => n + (r.gaveUp?.tries ?? 0), 0);
+  let message = `placed ${placed}, skipped ${plan.skipped}, failed ${tried}`;
   if (removed) message += `, took down ${removed} scaffolding blocks`;
   if (wrong.length > 0) message += `. ${wrong.length} came out turned the wrong way, first: ${wrong.slice(0, 3).join('; ')}`;
-  if (failures.length > 0) message += `. First failures: ${failures.slice(0, 5).join('; ')}`;
+  if (report.length > 0) {
+    const climb = [...inventoryCounts(bot.inventory.items())].filter(([n]) => SCAFFOLD_BLOCKS.includes(n) && !plan.needed.has(n));
+    const climbText = climb.length ? `I have ${climb.map(([n, c]) => `${c} ${n}`).join(', ')}, so scaffolding up is possible` : 'I have no blocks to scaffold with (dirt, cobblestone and the like)';
+    const count = report.reduce((n, r) => n + r.left.length, 0);
+    message += `. Left to do, ${count} blocks in ${report.length} group${report.length === 1 ? '' : 's'}: ${report.map((r) => leftText(r, climbText)).join('. ')}`;
+  }
   if (stoppedReason) message += `. Stopped early: ${stoppedReason}`;
-  return stoppedReason || failures.length > 0 ? fail(message) : ok(message);
+  if (report.length > 0) message += '. build_structure with the same plan again skips what is already in place';
+  if (placed > 0) return ok(message);
+  return stoppedReason || report.length > 0 || failures.length > 0 ? fail(message) : ok(message);
 }
