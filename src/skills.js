@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { ok, fail } from './actions/util.js';
 import { isAdmin } from './guard.js';
+import { asJob, findSequences, toolRuns, SIDE_ENDS } from './report.js';
 
 const MAX_SKILLS = 50;
 const MAX_STEPS = 20;
@@ -415,6 +416,30 @@ export class Skills {
     renameSync(`${this.path}.tmp`, this.path);
   }
 }
+
+const contains = (runs, tools) => runs.some((run) => ` ${run.join(' ')} `.includes(` ${tools.join(' ')} `));
+const collapse = (names) => names.filter((n, i) => n !== names[i - 1]);
+
+// A routine worth saving: the longest run of 3 or more tools that the job that just ended (a line
+// from the job log) did, that minJobs or more earlier job lines did too, that a skill may hold
+// every step of, and that no saved skill covers yet. null when there is none. Free time and side
+// lines don't count. earlier should be a bounded list, like JobLog.recent().
+export function repeatedRoutine(line, earlier, { skills = [], usable = () => true, minJobs = 3 } = {}) {
+  const job = asJob(line);
+  if (!job || job.freeTime || SIDE_ENDS.has(job.end)) return null;
+  const own = toolRuns(job).filter((run) => run.length >= 3);
+  if (!own.length) return null;
+  const before = earlier.filter((l) => l !== line).map(asJob).filter((j) => j && !j.freeTime && !SIDE_ENDS.has(j.end));
+  const saved = skills.map((s) => collapse((s.steps ?? []).map((step) => step.tool)));
+  const found = findSequences(before, { minCount: minJobs, minJobs, top: Infinity, keepInside: true }).filter(
+    (s) => s.tools.every(usable) && contains(own, s.tools) && !contains(saved, s.tools)
+  );
+  found.sort((a, b) => b.tools.length - a.tools.length || b.jobs - a.jobs);
+  return found[0]?.tools ?? null;
+}
+
+// The line for the first turn of the next job like it.
+export const routineHint = (tools) => `You did ${tools.join(' > ')} in earlier jobs like this too; skill save can make it one call.`;
 
 const str = { type: 'string' };
 

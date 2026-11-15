@@ -5,6 +5,7 @@ import { isAdmin } from '../guard.js';
 
 export async function remember({ memory, config, requester }, input) {
   const entry = memory.remember({ ...input, by: requester ?? undefined, admin: isAdmin(config ?? {}, requester) });
+  if (!entry) return fail(`not saved: an admin's note is already called ${input.name}, and only an admin can change it. Save this under another name.`);
   const where = entry.pos ? ` at ${entry.pos.x} ${entry.pos.y} ${entry.pos.z}` : '';
   return ok(`remembered ${entry.name}${entry.area ? ' as an area' : ''}${where}`);
 }
@@ -32,6 +33,7 @@ export async function recordArea({ bot, memory, areas, config, requester }, { ac
   const area = outlineFrom(rec.points);
   if (!area) return fail(`only got ${rec.points.length} points, too little to make an outline. They need to walk all the way around it.`);
   const { width, depth, center } = areaBounds(area);
-  memory.remember({ name: label, note: note ?? '', x: center.x, y: center.y, z: center.z, area, by: requester ?? undefined, admin: isAdmin(config ?? {}, requester) });
+  const entry = memory.remember({ name: label, note: note ?? '', x: center.x, y: center.y, z: center.z, area, by: requester ?? undefined, admin: isAdmin(config ?? {}, requester) });
+  if (!entry) return fail(`not saved: an admin's note is already called ${label}, and only an admin can change it. Record it again and save it under another name.`);
   return ok(`saved ${label}: about ${width} x ${depth} blocks around ${center.x} ${center.y} ${center.z}, ${area.corners.length} corners`);
 }

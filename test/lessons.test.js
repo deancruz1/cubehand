@@ -94,15 +94,15 @@ test('a full store drops the lowest score, oldest first', () => {
   });
 });
 
-test('a lesson unused for 30 days, or sunk below the floor, is dropped', () => {
+test('a lesson unused for 14 days, or sunk below the floor, is dropped', () => {
   withDir((dir) => {
     const path = join(dir, 'lessons.json');
     const now = Date.now();
     writeFileSync(
       path,
       JSON.stringify([
-        { id: 1, text: 'Old and unused.', lastUsed: now - 31 * DAY, score: 3 },
-        { id: 2, text: 'Recent.', lastUsed: now - 29 * DAY, score: 1 },
+        { id: 1, text: 'Old and unused.', lastUsed: now - 15 * DAY, score: 3 },
+        { id: 2, text: 'Recent.', lastUsed: now - 13 * DAY, score: 1 },
         { id: 3, text: 'Sunk.', lastUsed: now, score: -1.5 }
       ])
     );
@@ -141,6 +141,7 @@ test('worthLesson picks out jobs that went wrong', () => {
     ['API error', job({ end: 'api_error', tools: [[bad('mine')]] }), false],
     ['no trouble', job({ tools: [[ok('move_to'), ok('mine')], [ok('finish')]] }), false],
     ['a tool cut short by a change', job({ tools: [[bad('move_to', 'Now at 1 2 3. (Stopped because a player just changed the instructions, see below.)')]] }), false],
+    ['a tool the brain marked as stopped from outside', job({ tools: [[{ ...bad('dig_area', 'dug 30 blocks. Stopped early: stopped'), interrupted: true }]] }), false],
     ['only escalate failed', job({ tools: [[{ name: 'escalate', ok: false, ms: 0, error: 'Not done' }], [ok('mine')]] }), false]
   ];
   for (const [name, record, expected] of rows) assert.equal(worthLesson(record), expected, name);
@@ -267,6 +268,15 @@ test('the lesson request is compact and frames the digest as a record', () => {
   assert.doesNotMatch(digest, /Steve|Now at|finish/);
   assert.ok(digest.length < 600, `digest is ${digest.length} characters`);
   assert.ok(system.length < 1100, `system is ${system.length} characters`);
+});
+
+test('a call marked as interrupted is cut short in the digest and is not a failed tool', () => {
+  const stopped = { ...bad('dig_area', 'dug 30 blocks from 1 2 3. Stopped early: stopped'), interrupted: true };
+  const record = job({ end: 'stop', tools: [[stopped], [bad('mine')]] });
+  const digest = lessonRequest(record, []).messages[0].content;
+  assert.match(digest, /Actions in order: dig_area \(cut short\); mine FAILED: mine: it went wrong$/m);
+  assert.deepEqual(lessonMeta(record).tools, ['mine']);
+  assert.deepEqual(lessonMeta(job({ end: 'stop', tools: [[stopped]] })), { tools: [], source: 'correction', request: 'mine some iron' });
 });
 
 test('a long job keeps the first and last actions of its digest', () => {
@@ -428,4 +438,100 @@ test('asText is short, framed as advice, and empty with no lessons', () => {
   assert.equal(lines.length, 3);
   assert.ok(frame.length <= 110, `frame is ${frame.length} characters`);
   assert.ok(text.length <= 720, `block is ${text.length} characters`);
+});
+
+test('isCorrection catches players saying she drifted off how the work was asked for', () => {
+  const names = ['Clodine'];
+  for (const text of [
+    'Clodine, you deviated from your y level.',
+    'you have drifted to y-58, why?',
+    'she seems to have deviated again',
+    'Clodine you are at -58 again, go back to -59',
+    'go back down to y -59, you are digging at y -58',
+    'you are at -60 why are you at -60',
+    'why are you on 70',
+    'why do you keep going back up',
+    'you seem to have missed some of the ore spots',
+    'you have stopped short of the end of the tunnel',
+    'this tunnel is a block too high',
+    'the tunnel at the far end is not complete yet',
+    'the tunnel you just dug has some blocks remaining',
+    "you're still leaving gaps in the floor",
+    'you are crossing the tunnels again'
+  ]) {
+    assert.equal(isCorrection(text, names), true, text);
+  }
+  for (const text of ['keep going', 'you keep going, nice', 'is it done?', 'go back to y -59', 'there are 40 blocks to go', 'how far is the tunnel now', 'you are doing great']) {
+    assert.equal(isCorrection(text, names), false, text);
+  }
+});
+
+test('the standing_job tool is not an action, so a round that only saves its progress is not judged', () => {
+  const standing = { name: 'standing_job', ok: true, ms: 1 };
+  assert.equal(judgeable(job({ tools: [[standing], [ok('finish')]] })), false);
+  assert.equal(worthLesson(job({ end: 'steps', tools: [[standing]] })), false);
+  assert.equal(judgeable(job({ tools: [[standing, ok('dig_area')]] })), true);
+});
+
+test('a job whose every action was stopped from outside counts for no lesson, but a correction still has it looked over', () => {
+  const stopped = { ...bad('dig_area', 'dug 4 blocks. Stopped early: stopped'), interrupted: true };
+  const record = job({ tools: [[stopped], [ok('finish')]] });
+  assert.equal(judgeable(record), false);
+  assert.equal(worthLesson(record), false);
+  assert.equal(worthLesson(record, ['you are at -58 again']), true);
+  assert.equal(worthLesson(job({ end: 'replaced', tools: [[stopped]] }), ['you drifted again']), true);
+  assert.equal(worthLesson(job({ end: 'shutdown', tools: [[ok('dig_area')]] }), ['you drifted again']), false);
+  assert.equal(worthLesson(job({ self: true, tools: [[ok('dig_area')]] }), ['you drifted again']), false);
+});
+
+test('a lesson judged on eight jobs or more that helped no more often than it failed is retired, on load and on save', () => {
+  withDir((dir) => {
+    const path = join(dir, 'lessons.json');
+    const now = Date.now();
+    const logged = [];
+    writeFileSync(
+      path,
+      JSON.stringify([
+        { id: 1, text: 'Even split.', lastUsed: now, uses: 11, helped: 4, failed: 4, score: 1 },
+        { id: 2, text: 'More help than not.', lastUsed: now, uses: 11, helped: 5, failed: 3, score: 1 },
+        { id: 3, text: 'Too few jobs to say.', lastUsed: now, uses: 9, helped: 2, failed: 5, score: 0 }
+      ])
+    );
+    const lessons = new Lessons(path, { now, log: (line) => logged.push(line) });
+    assert.deepEqual(lessons.lessons.map((l) => l.id), [2, 3]);
+    assert.deepEqual(logged, ['[lessons] retired after helping 4 and failing 4 jobs: Even split.']);
+    lessons.lessons[1].failed = 6;
+    lessons.save();
+    clearTimeout(lessons.timer);
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).map((l) => l.id), [2]);
+  });
+});
+
+test('a correction said again and again is counted, and the review is told how often', () => {
+  withDir((dir) => {
+    const lessons = store(dir, { ignore: ['Clodine', 'Steve'] });
+    const now = Date.now();
+    lessons.noteCorrection('Clodine you are at -58 again', now - 3 * 3600000 - 1);
+    lessons.noteCorrection('you drifted off your y level', now - 60000);
+    lessons.noteCorrection('you put it in the wrong chest', now - 50000);
+    lessons.noteCorrection('go back down, you are digging at y -58', now - 40000);
+    lessons.noteCorrection('you are at -58 again', now);
+    assert.equal(lessons.timesSaid(['you are at -58 again'], now), 2);
+    assert.equal(lessons.timesSaid(['Clodine, you deviated to y -58'], now), 3);
+    assert.equal(lessons.timesSaid(['no'], now), 1);
+    const record = job({ text: 'dig the next tunnel', tools: [[ok('dig_area')]] });
+    const once = lessonRequest(record, ['you are at -58 again']).messages[0].content;
+    assert.doesNotMatch(once, /times in the last few hours/);
+    const often = lessonRequest(record, ['you are at -58 again'], { times: 3 }).messages[0].content;
+    assert.match(often, /\nPlayers have said this or something like it 3 times in the last few hours\.\n<\/job>$/);
+  });
+});
+
+test('the review is told to turn a correction into a general habit without the numbers', () => {
+  const { system } = lessonRequest(job({ tools: [[ok('dig_area')]] }), ['you are at -58 again']);
+  assert.match(system, /no numbers, coordinates or player names/);
+  assert.match(system, /habit that would have prevented it, said without the numbers/);
+  assert.match(system, /several times nearly always deserves one/);
+  assert.equal(parseLesson('After each dig, check your floor level against the one asked for.'), 'After each dig, check your floor level against the one asked for.');
+  assert.equal(parseLesson('Stay at y -59 in every tunnel of the strip mine.'), null);
 });

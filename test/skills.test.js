@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Vec3 } from 'vec3';
 import { TOOLS } from '../src/tools.js';
-import { Skills, SKILL_TOOL, NOT_IN_SKILLS, skillAction, validateSkill, bindSteps, substitute, checkSchema } from '../src/skills.js';
+import { Skills, SKILL_TOOL, NOT_IN_SKILLS, skillAction, validateSkill, bindSteps, substitute, checkSchema, repeatedRoutine, routineHint } from '../src/skills.js';
+import { JobRecord } from '../src/joblog.js';
 
 const BRAIN = [{ name: 'finish', input_schema: { type: 'object', properties: { message: { type: 'string' } }, required: ['message'], additionalProperties: false } }];
 const ALL = [...TOOLS, ...BRAIN, SKILL_TOOL];
@@ -392,4 +393,45 @@ test('the skill tool is one of the tools, and saves, runs, lists and forgets thr
   assert.match(r.message, /^forgot skill look_east\n/);
   assert.equal(skills.summary(), '');
   rmSync(dir, { recursive: true });
+});
+
+// A job log line, built the way the brain builds one. tools is one list of names per step, and a
+// name ending in ! failed.
+function line(tools, { request = 'dig the next tunnel', self = false, end = 'done', standing = false } = {}) {
+  const record = new JobRecord({ player: self ? null : 'Steve', text: self ? null : request, self, standing });
+  for (const list of tools) {
+    const step = record.step('claude-sonnet-5-5', { input_tokens: 10, output_tokens: 1 }, 5);
+    for (const name of list) step.tools.push(name.endsWith('!') ? { name: name.slice(0, -1), ok: false, ms: 5, error: 'no' } : { name, ok: true, ms: 5 });
+  }
+  return record.finish(end);
+}
+
+test('a routine is pointed out only when it is 3 tools or more, seen in 3 earlier jobs, and no skill covers it', () => {
+  const store = schemas();
+  const usable = (name) => store.has(name);
+  const routine = ['move_to', 'dig_area', 'store_items'];
+  const three = [1, 2, 3].map(() => line([['escalate'], ['move_to', 'dig_area'], ['dig_area', 'store_items'], ['finish']]));
+  const now = line([['move_to', 'dig_area', 'store_items', 'finish']]);
+  assert.deepEqual(repeatedRoutine(now, [...three, now], { usable }), routine);
+  // Twice before is not enough.
+  assert.equal(repeatedRoutine(now, three.slice(1), { usable }), null);
+  // Three times in one earlier job is one job.
+  const once = line([['move_to', 'dig_area', 'store_items', 'move_to', 'dig_area', 'store_items', 'move_to', 'dig_area', 'store_items']]);
+  assert.equal(repeatedRoutine(now, [once, line([['move_to']])], { usable }), null);
+  // A single call, or a run broken by a failure, has no routine of its own.
+  assert.equal(repeatedRoutine(line([['dig_area']]), three, { usable }), null);
+  assert.equal(repeatedRoutine(line([['move_to', 'dig_area!', 'store_items']]), three, { usable }), null);
+  // A saved skill that holds those steps in order covers it.
+  const covering = { steps: [{ tool: 'take_items' }, { tool: 'move_to' }, { tool: 'dig_area' }, { tool: 'dig_area' }, { tool: 'store_items' }] };
+  assert.equal(repeatedRoutine(now, three, { usable, skills: [covering] }), null);
+  assert.deepEqual(repeatedRoutine(now, three, { usable, skills: [{ steps: [{ tool: 'store_items' }, { tool: 'move_to' }] }] }), routine);
+  // A tool a skill can't hold rules a routine out.
+  const looks = [1, 2, 3].map(() => line([['inspect_blocks', 'move_to', 'dig_area']]));
+  assert.equal(repeatedRoutine(line([['inspect_blocks', 'move_to', 'dig_area']]), looks, { usable }), null);
+  // Free time and side lines don't count, before or now.
+  const free = [1, 2, 3].map(() => line([['move_to', 'dig_area', 'store_items']], { self: true }));
+  assert.equal(repeatedRoutine(now, free, { usable }), null);
+  assert.equal(repeatedRoutine(line([['move_to', 'dig_area', 'store_items']], { self: true }), three, { usable }), null);
+  assert.equal(repeatedRoutine(now, three.map((l) => ({ ...l, end: 'tidy' })), { usable }), null);
+  assert.match(routineHint(routine), /^You did move_to > dig_area > store_items in earlier jobs like this too; skill save can make it one call\.$/);
 });
