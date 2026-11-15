@@ -10,7 +10,8 @@
   },
   "scripts": {
     "start": "node --env-file=.env src/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "report": "node src/report.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.8.0",
