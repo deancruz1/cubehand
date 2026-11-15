@@ -32,6 +32,7 @@
     "maxBuildBlocks": 2000,
     "maxInspectBlocks": 600,
     "maxDigBlocks": 1000,
+    "warnCostUsd": 2,
     "moveTimeoutSeconds": 90,
     "stuckSeconds": 45,
     "quietSeconds": 60

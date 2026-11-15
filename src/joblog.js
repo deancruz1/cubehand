@@ -68,6 +68,8 @@ export class JobRecord {
     // Times the job was put on hold (low health, a lost connection) and how long in all.
     this.holds = 0;
     this.heldMs = 0;
+    // Times the job was pointed out for what it cost.
+    this.costWarnings = 0;
     this.tier = null;
     this.model = null;
     this.effort = null;
@@ -91,11 +93,17 @@ export class JobRecord {
     return step;
   }
 
+  // Cost so far in dollars, or null once any call has no known price.
+  get cost() {
+    const calls = [...this.calls, ...this.steps];
+    return calls.some((c) => c.cost === null) ? null : round(calls.reduce((sum, c) => sum + c.cost, 0));
+  }
+
   finish(end) {
     this.finished = true;
     const calls = [...this.calls, ...this.steps];
     const tokens = calls.reduce((total, c) => addTokens(total, c.tokens), {});
-    const cost = calls.some((c) => c.cost === null) ? null : round(calls.reduce((sum, c) => sum + c.cost, 0));
+    const cost = this.cost;
     const toolMs = this.steps.reduce((sum, s) => sum + s.tools.reduce((t, tool) => t + tool.ms, 0), 0);
     return {
       start: new Date(this.startedAt).toISOString(),
@@ -104,6 +112,7 @@ export class JobRecord {
       freeTime: this.self,
       holds: this.holds,
       heldMs: this.heldMs,
+      costWarnings: this.costWarnings,
       tier: this.tier,
       model: this.model,
       effort: this.effort,
@@ -125,7 +134,8 @@ export function summaryLine(line) {
   return (
     `[job] ${line.end}: ${totals.steps} steps, model ${seconds(totals.modelMs)}s, tools ${seconds(totals.toolMs)}s, ` +
     `tokens in ${t.input ?? 0}, cache read ${t.cacheRead ?? 0}, cache write ${t.cacheWrite ?? 0}, out ${t.output ?? 0}, ${cost}` +
-    (line.heldMs ? `, held ${seconds(line.heldMs)}s` : '')
+    (line.heldMs ? `, held ${seconds(line.heldMs)}s` : '') +
+    (line.costWarnings ? `, cost warnings ${line.costWarnings}` : '')
   );
 }
 

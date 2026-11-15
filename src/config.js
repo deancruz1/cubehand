@@ -56,6 +56,10 @@ export function validateConfig(raw, env) {
   if (dig !== undefined && !(Number.isInteger(dig) && dig > 0)) {
     throw new ConfigError('config.json limits.maxDigBlocks must be a whole number above 0.');
   }
+  const warnCost = raw.limits.warnCostUsd;
+  if (warnCost !== undefined && !(typeof warnCost === 'number' && warnCost >= 0)) {
+    throw new ConfigError('config.json limits.warnCostUsd must be a number, 0 or more.');
+  }
   const scale = raw.bot.pauseScale;
   if (scale !== undefined && !(typeof scale === 'number' && scale >= 0)) {
     throw new ConfigError('config.json bot.pauseScale must be a number, 0 or more.');
@@ -71,8 +75,9 @@ export function validateConfig(raw, env) {
       fallback: true, strictTools: true, maxTokens: 16000, maxRetries: 2, busyReplies: true, buildEffort: 'high',
       routing: true, everydayModel: 'claude-sonnet-5-5', quickModel: 'claude-haiku-5-5', ...raw.claude
     },
-    // maxDigBlocks is the biggest box dig_area takes.
-    limits: { buildMaxSteps: 40, buildMaxSeconds: 1200, stuckSeconds: 45, quietSeconds: 60, maxDigBlocks: 1000, ...raw.limits },
+    // maxDigBlocks is the biggest box dig_area takes. warnCostUsd is the job cost that gets a
+    // warning (and again each time it doubles), 0 for none. It never stops a job.
+    limits: { buildMaxSteps: 40, buildMaxSeconds: 1200, stuckSeconds: 45, quietSeconds: 60, maxDigBlocks: 1000, warnCostUsd: 2, ...raw.limits },
     idle: { enabled: true, freeTimeMinutes: 15, freeTimeSteps: 8, freeTimeSeconds: 240, defendRadius: 10, ...raw.idle },
     survival: { criticalHealth: 8, eatAtFood: 14, ...raw.survival }
   };

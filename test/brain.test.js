@@ -35,7 +35,7 @@ function fakeClient(responses) {
   };
 }
 
-function makeBrain({ client, config = baseConfig, runTool, jobLog }) {
+function makeBrain({ client, config = baseConfig, runTool, jobLog, log = () => {} }) {
   const said = [];
   const heard = [];
   const toolCalls = [];
@@ -54,7 +54,7 @@ function makeBrain({ client, config = baseConfig, runTool, jobLog }) {
       heard.push({ text, to });
     },
     onStop: () => stops++,
-    log: () => {}
+    log
   });
   return { brain, said, heard, toolCalls, stops: () => stops };
 }
@@ -894,6 +894,114 @@ test('a mid-job reply is counted in the job it came in during', async () => {
   await job;
   assert.equal(lines.length, 1);
   assert.deepEqual(lines[0].calls.map((c) => [c.kind, c.tokens.input]), [['busy', 300]]);
+});
+
+// Four steps of 300K input tokens on the main model, $1.20 each, then the reply.
+function priceyClient() {
+  return fakeClient([
+    ...['a', 'b', 'c', 'd'].map((id) => ({ ...reply('tool_use', [toolUse(id, 'mine')]), usage: usage(300000, 0, 0, 0) })),
+    reply('end_turn', [{ type: 'text', text: 'Done mining.' }])
+  ]);
+}
+
+async function priceyJob(warnCostUsd, request = { player: 'Steve', text: 'mine stone', whisper: true }) {
+  const lines = [];
+  const logged = [];
+  const client = priceyClient();
+  const config = { ...baseConfig, limits: { ...baseConfig.limits, warnCostUsd }, idle: { freeTimeSeconds: 60, freeTimeSteps: 8 } };
+  const made = makeBrain({ client, config, jobLog: { write: (line) => lines.push(line) }, log: (text) => logged.push(text) });
+  await made.brain.start(request);
+  return { ...made, client, line: lines[0], logged };
+}
+
+const costLines = (heard) => heard.filter((h) => /has cost/.test(h.text));
+
+test('an expensive job is pointed out once at the threshold and again each time the cost doubles', async () => {
+  const { heard, logged, line } = await priceyJob(2);
+  assert.deepEqual(costLines(heard), [
+    { text: 'This job has cost about $2.40 so far. Say stop if you want me to end it.', to: 'Steve' },
+    { text: 'This job has cost about $4.80 so far. Say stop if you want me to end it.', to: 'Steve' }
+  ]);
+  assert.deepEqual(logged.filter((l) => /^\[brain\] this job has cost/.test(l)), ['[brain] this job has cost $2.40 so far', '[brain] this job has cost $4.80 so far']);
+  assert.equal(line.costWarnings, 2);
+  assert.match(logged.find((l) => l.startsWith('[job]')), /, cost warnings 2$/);
+});
+
+test('a cost warning never ends or changes the job, and the model never hears about it', async () => {
+  const warned = await priceyJob(2);
+  const quiet = await priceyJob(0);
+  assert.equal(costLines(quiet.heard).length, 0);
+  assert.equal(quiet.logged.some((l) => /has cost/.test(l)), false);
+  assert.equal(quiet.line.costWarnings, 0);
+  assert.equal(warned.line.end, 'done');
+  assert.equal(warned.line.steps.length, 5);
+  assert.deepEqual(warned.toolCalls, quiet.toolCalls);
+  assert.deepEqual(warned.client.calls.map((c) => c.params), quiet.client.calls.map((c) => c.params));
+  assert.ok(warned.client.calls.every((c) => !JSON.stringify(c.params.messages).includes('has cost')));
+  assert.deepEqual(warned.heard.filter((h) => !/has cost/.test(h.text)), quiet.heard);
+});
+
+test('free time gets the cost warning in the console only', async () => {
+  const { heard, logged, line } = await priceyJob(2, { player: null, text: null, self: true });
+  assert.equal(costLines(heard).length, 0);
+  assert.equal(logged.filter((l) => /^\[brain\] this job has cost/.test(l)).length, 2);
+  assert.equal(line.costWarnings, 2);
+});
+
+test('a job on a model with no known price gets no cost warning', async () => {
+  const client = fakeClient([
+    { ...reply('tool_use', [toolUse('a', 'mine')]), model: 'some-other-model', usage: usage(5000000, 0, 0, 0) },
+    reply('end_turn', [{ type: 'text', text: 'Done.' }])
+  ]);
+  const lines = [];
+  const { brain, heard } = makeBrain({ client, jobLog: { write: (line) => lines.push(line) } });
+  await brain.start({ player: 'Steve', text: 'mine stone' });
+  assert.deepEqual(heard, [{ text: 'Done.', to: null }]);
+  assert.equal(lines[0].totals.cost, null);
+  assert.equal(lines[0].costWarnings, 0);
+});
+
+test('a cost warning that comes during a hold is said once the hold is over', async () => {
+  let answer;
+  const thinking = new Promise((r) => (answer = r));
+  const client = fakeClient((n) =>
+    n === 1 ? thinking.then(() => ({ ...reply('tool_use', [toolUse('a', 'mine')]), usage: usage(600000, 0, 0, 0) })) : reply('end_turn', [{ type: 'text', text: 'Done.' }])
+  );
+  const { brain, heard } = makeBrain({ client });
+  const job = brain.start({ player: 'Steve', text: 'mine stone', whisper: true });
+  await tick();
+  await brain.pause('offline');
+  answer();
+  await sleep(20);
+  assert.deepEqual(heard, []);
+  brain.resume('offline');
+  await job;
+  assert.deepEqual(heard, [
+    { text: 'This job has cost about $2.40 so far. Say stop if you want me to end it.', to: 'Steve' },
+    { text: 'Done.', to: 'Steve' }
+  ]);
+});
+
+test('a mid-job reply counts toward the cost warning of the job it came in during', async () => {
+  const client = fakeClient([
+    { ...reply('tool_use', [toolUse('a', 'mine')]), usage: usage(450000, 0, 0, 0) },
+    { ...reply('end_turn', [{ type: 'text', text: 'Mining.' }]), usage: usage(100000, 0, 0, 0) },
+    reply('end_turn', [])
+  ]);
+  const config = { ...baseConfig, claude: { ...baseConfig.claude, busyReplies: true } };
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const lines = [];
+  const { brain, heard } = makeBrain({ client, config, jobLog: { write: (line) => lines.push(line) }, runTool: async () => (await gate, { ok: true, message: 'done' }) });
+  const job = brain.start({ player: 'Steve', text: 'mine stone' });
+  await tick();
+  assert.equal(costLines(heard).length, 0);
+  brain.enqueue('Alex', 'what are you doing?');
+  while (heard.length < 2) await tick();
+  release();
+  await job;
+  assert.deepEqual(costLines(heard), [{ text: 'This job has cost about $2.20 so far. Say stop if you want me to end it.', to: null }]);
+  assert.equal(lines[0].costWarnings, 1);
 });
 
 test('a job log that fails to write never breaks the job', async () => {

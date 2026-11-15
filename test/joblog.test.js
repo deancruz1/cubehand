@@ -73,6 +73,26 @@ test('a held job records its holds, and the summary says how long it was held', 
   assert.match(summaryLine(line), /, held 12\.5s$/);
 });
 
+test('the cost so far adds up every call, and turns unknown once any call has no price', () => {
+  const record = new JobRecord({ player: 'Steve', text: 'mine' });
+  assert.equal(record.cost, 0);
+  record.step('claude-opus-5-5', { input_tokens: 1e6, output_tokens: 0 }, 5);
+  record.call('busy', 'claude-sonnet-5-5', { input_tokens: 1e6, output_tokens: 0 }, 5);
+  assert.equal(record.cost, 6);
+  record.step('some-other-model', { input_tokens: 10, output_tokens: 1 }, 5);
+  assert.equal(record.cost, null);
+});
+
+test('cost warnings go in the line, and the summary counts them', () => {
+  const record = new JobRecord({ player: 'Steve', text: 'mine' });
+  record.step('claude-opus-5-5', { input_tokens: 10, output_tokens: 1 }, 5);
+  const quiet = record.finish('done');
+  assert.equal(quiet.costWarnings, 0);
+  assert.doesNotMatch(summaryLine(quiet), /cost warnings/);
+  record.costWarnings = 2;
+  assert.match(summaryLine(record.finish('done')), /, cost warnings 2$/);
+});
+
 test('the job log appends one JSON line per job', () => {
   const dir = mkdtempSync(join(tmpdir(), 'joblog-'));
   try {

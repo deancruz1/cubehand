@@ -48,6 +48,23 @@ test('pauseScale defaults to 1 and must be a number, 0 or more', () => {
   assert.throws(() => validateConfig(raw, env), /pauseScale/);
 });
 
+test('warnCostUsd defaults to 2 and must be a number, 0 or more', () => {
+  const raw = copy();
+  assert.equal(validateConfig(raw, env).limits.warnCostUsd, 2);
+  delete raw.limits.warnCostUsd;
+  const config = validateConfig(raw, env);
+  assert.equal(config.limits.warnCostUsd, 2);
+  assert.equal(config.limits.maxSteps, 25);
+  raw.limits.warnCostUsd = 0;
+  assert.equal(validateConfig(raw, env).limits.warnCostUsd, 0);
+  raw.limits.warnCostUsd = 0.5;
+  assert.equal(validateConfig(raw, env).limits.warnCostUsd, 0.5);
+  raw.limits.warnCostUsd = -1;
+  assert.throws(() => validateConfig(raw, env), /warnCostUsd/);
+  raw.limits.warnCostUsd = '2';
+  assert.throws(() => validateConfig(raw, env), /warnCostUsd/);
+});
+
 test('empty allowlist is rejected', () => {
   const raw = copy();
   raw.allowlist = [];

@@ -287,6 +287,7 @@ export class Brain {
   recordBusyReply(job, player, text, model, usage, ms) {
     if (job?.record && !job.record.finished) {
       job.record.call('busy', model, usage, ms);
+      this.warnCost(job);
       return;
     }
     const record = new JobRecord({ player, text });
@@ -301,6 +302,27 @@ export class Brain {
       this.jobLog?.write(line);
     } catch (err) {
       this.log(`[joblog] couldn't record the job: ${err.message}`);
+    }
+  }
+
+  // A job whose cost reaches limits.warnCostUsd gets a warning, and another each time that
+  // doubles. It only warns: the job carries on and the model never hears about it.
+  warnCost(job) {
+    const limit = this.config.limits.warnCostUsd ?? 2;
+    const cost = job?.record?.cost;
+    // A call with no known price leaves the cost unknown, and an unknown cost gets no warning.
+    if (!limit || cost === null || cost === undefined) return;
+    // A player's job hears its warning once its first step has begun.
+    if (!job.self && !job.tell) return;
+    job.warnAt ??= limit;
+    if (cost < job.warnAt) return;
+    while (job.warnAt <= cost) job.warnAt *= 2;
+    job.record.costWarnings++;
+    this.log(`[brain] this job has cost $${cost.toFixed(2)} so far`);
+    if (!job.self) {
+      job.tell(`This job has cost about $${cost.toFixed(2)} so far. Say stop if you want me to end it.`).catch((err) => {
+        this.log(`[brain] couldn't send the cost warning: ${err.message}`);
+      });
     }
   }
 
@@ -458,7 +480,10 @@ export class Brain {
       running: null,
       clock: null,
       hold: null,
-      heldFor: null
+      heldFor: null,
+      tell: null,
+      // The cost that gets the next warning.
+      warnAt: null
     };
     job.record = new JobRecord({ player: request.player, text: request.text, self: job.self });
     this.current = job;
@@ -555,6 +580,7 @@ export class Brain {
       await this.waitWhileHeld(job, signal);
       if (!signal.aborted) this.say(line, to);
     };
+    job.tell = tell;
     const ended = () => this.endedByAbort(signal, self, (line) => this.say(line, to));
     await this.waitWhileHeld(job, signal);
     if (signal.aborted) return ended();
@@ -656,6 +682,7 @@ export class Brain {
         }
         this.logUsage(step, response.usage);
         const logged = record?.step(response.model ?? model, response.usage, Date.now() - asked);
+        this.warnCost(job);
         const outdated = () => (record?.holds ?? 0) > heldBefore;
 
         if (response.stop_reason === 'refusal') {
