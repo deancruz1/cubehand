@@ -1,8 +1,9 @@
 import { Vec3 } from 'vec3';
 import { ok, fail, posText } from './util.js';
-import { placeOne, removeScaffold, digBlock, findReference } from './blocks.js';
+import { placeOne, removeScaffold, digBlock, findReference, referenceWays, isReplaceable } from './blocks.js';
 import { watchScaffold, SCAFFOLD_BLOCKS } from './movement.js';
 import { parseBlock, itemFor, matchesState, stateProblem, placementOptions } from './states.js';
+import { pickSource } from '../chests.js';
 
 // As in blocks.js: how far from the eyes a block can be placed without walking.
 const REACH = 4.5;
@@ -238,6 +239,40 @@ export function* fromHere(blocks, here, placeable = () => true) {
   }
 }
 
+// Blocks that drop or pop off when what they stand on or hang from goes, so a support that comes
+// out again is no use to them.
+const NEEDS_SUPPORT = /torch|lantern|ladder|_door$|sign$|banner$|button$|lever$|pressure_plate$|rail$|carpet$|_bed$|redstone|repeater$|comparator$|sapling$|candle|sand$|gravel$|concrete_powder$|anvil$|^scaffolding$|pointed_dripstone|^snow$|vine|lichen|chain$|^bell$|_head$|_skull$|flower_pot$|cake$|_coral|_fan$|mushroom$|fungus$|_roots$|dripleaf|^(dandelion|poppy|blue_orchid|allium|azure_bluet|oxeye_daisy|cornflower|lily_of_the_valley|torchflower)$|_tulip$/;
+
+// A player's trick for a block with nothing to place against: put dirt or cobblestone (never
+// the build's own materials) in a free spot next to it on a side it can go against, place it,
+// and break the dirt again. Null when there is nothing to do it with or nowhere to do it.
+async function withSupport(ctx, p, place, all) {
+  const { bot } = ctx;
+  if (NEEDS_SUPPORT.test(p.block)) return null;
+  const keep = bot.buildKeep;
+  const item = bot.inventory.items().find((i) => SCAFFOLD_BLOCKS.includes(i.name) && !keep?.has(bot.registry.itemsByName[i.name]?.id));
+  if (!item) return null;
+  const planned = new Set(all.filter((q) => !q.done).map((q) => `${q.x},${q.y},${q.z}`));
+  const pos = new Vec3(p.x, p.y, p.z);
+  const options = p.props && Object.keys(p.props).length ? placementOptions(p.block, p.props) : undefined;
+  const tried = new Set();
+  for (const how of referenceWays(p.block, p.attach, options)) {
+    const cell = pos.plus(how.dir);
+    const key = `${cell.x},${cell.y},${cell.z}`;
+    if (tried.has(key) || planned.has(key)) continue;
+    tried.add(key);
+    const here = bot.blockAt(cell, false);
+    if (!here || !isReplaceable(here.name) || !findReference(bot, cell, item.name)) continue;
+    const put = await placeOne(ctx, item.name, cell);
+    if (!put.ok) continue;
+    const result = await place(p);
+    const dug = await digBlock(ctx, cell, { anyTool: true });
+    if (!dug.ok) return { ...result, message: `${result.message}; the ${item.name} I put at ${posText(cell)} to hold it is still there: ${dug.message}` };
+    return result;
+  }
+  return null;
+}
+
 // Places blocks one y layer at a time, in the order given, or with nearest set, all as one
 // batch handed out by fromHere. Blocks with nothing to place against yet are retried once the
 // rest of their layer is down, then with the layers above (a hanging lantern needs the block
@@ -273,12 +308,18 @@ export async function placeAll(ctx, placements, { nearest = false, strays, giveU
       const here = ctx.bot.blockAt(pos, false);
       if (here && SCAFFOLD_BLOCKS.includes(here.name) && !matchesState(here, p.block, p.props)) {
         const dug = await digBlock(ctx, pos, { anyTool: true });
-        if (!dug.ok) return dug;
+        if (!dug.ok) {
+          p.why = dug.message;
+          return dug;
+        }
       }
       strays.delete(key);
     }
     const result = await placeOne(ctx, p.block, pos, { attach: p.attach, props: p.props });
-    if (result.ok) p.done = true;
+    if (result.ok) {
+      p.done = true;
+      p.why = undefined;
+    } else p.why = result.message;
     return result;
   };
   const ranOut = (p) => `ran out of ${itemFor(p.block, ctx.bot.registry)}, need ${all.filter((q) => q.block === p.block && !q.done).length} more`;
@@ -308,6 +349,11 @@ export async function placeAll(ctx, placements, { nearest = false, strays, giveU
           break outer;
         } else if (result.message.startsWith('no block to place against')) {
           retry.push(p);
+        } else if (/Server refused/.test(result.message) && !p.refused) {
+          // Once more after the rest of the layer, from wherever she is then and with more
+          // neighbors down to click.
+          p.refused = true;
+          retry.push(p);
         } else if (giveUpAfter && result.reason) {
           streak.push(result.message);
           // A planned walk that found no way to the group's first block won't find one on a
@@ -328,7 +374,30 @@ export async function placeAll(ctx, placements, { nearest = false, strays, giveU
     }
   }
   if (!gaveUp) failures.push(...streak);
-  for (const p of carried) failures.push(`no block to place against at ${p.x} ${p.y} ${p.z}`);
+  // What still has nothing to place against gets a block of scaffolding beside it for as long
+  // as it takes to put it in, bottom up. Each one that goes in may hold up the next.
+  let unsupported = carried;
+  if (!gaveUp && !stoppedReason) {
+    unsupported = [...carried].sort((a, b) => a.y - b.y);
+    while (unsupported.length > 0 && !signal?.aborted) {
+      const still = [];
+      for (const p of unsupported) {
+        if (signal?.aborted) {
+          still.push(p);
+          continue;
+        }
+        let result = await place(p);
+        if (!result.ok && result.message.startsWith('no block to place against')) result = (await withSupport(ctx, p, place, all)) ?? result;
+        if (result.ok) {
+          placed++;
+          ctx.status?.progress(`placed ${before + placed} of ${all.length} blocks`);
+        } else still.push(p);
+      }
+      if (still.length === unsupported.length) break;
+      unsupported = still;
+    }
+  }
+  for (const p of unsupported) failures.push(p.why ?? `no block to place against at ${p.x} ${p.y} ${p.z}`);
 
   const wrong = [];
   if (!stoppedReason) {
@@ -369,15 +438,30 @@ async function placeGroups(ctx, groups, { strays }) {
     wrong.push(...result.wrong);
     stoppedReason = result.stoppedReason;
     const left = group.filter((p) => !p.done);
-    if (left.length > 0) report.push({ left, failures: result.failures, gaveUp: result.gaveUp });
+    if (left.length > 0) report.push({ left, gaveUp: result.gaveUp });
   }
-  for (const group of todo) report.push({ left: group, failures: [], notStarted: true });
+  for (const group of todo) report.push({ left: group, notStarted: true });
   return { placed, failures, wrong, stoppedReason, report };
+}
+
+// The reasons the blocks of a group are still missing, the same reason once with how many
+// blocks it holds up.
+function whyText(left) {
+  const kinds = new Map();
+  for (const p of left) {
+    const why = p.why ?? 'not tried before it stopped';
+    const kind = why.replace(/-?\d+/g, 'N');
+    const k = kinds.get(kind);
+    if (k) k.count++;
+    else kinds.set(kind, { why, count: 1 });
+  }
+  const shown = [...kinds.values()].slice(0, 3).map(({ why, count }) => (count > 1 ? `${why} (${count} blocks like this)` : why));
+  return `${shown.join('; ')}${kinds.size > 3 ? `; and ${kinds.size - 3} other reasons` : ''}`;
 }
 
 // "8 blocks around 2781 83 -5022 (8 deepslate_bricks, from 2781 80 -5025 to 2781 85 -5019):
 // couldn't get up there ...", for one group of a build that didn't get finished.
-function leftText({ left, failures, gaveUp, notStarted }, climbText) {
+export function leftText({ left, gaveUp, notStarted }, climbText) {
   const min = { x: Math.min(...left.map((p) => p.x)), y: Math.min(...left.map((p) => p.y)), z: Math.min(...left.map((p) => p.z)) };
   const max = { x: Math.max(...left.map((p) => p.x)), y: Math.max(...left.map((p) => p.y)), z: Math.max(...left.map((p) => p.z)) };
   const mid = { x: Math.round((min.x + max.x) / 2), y: Math.round((min.y + max.y) / 2), z: Math.round((min.z + max.z) / 2) };
@@ -391,7 +475,7 @@ function leftText({ left, failures, gaveUp, notStarted }, climbText) {
     why = rise >= 2 ? `couldn't get up there, the lowest is ${rise} blocks above where I got to` : "couldn't get close enough";
     why += ` (${gaveUp.tries} ${gaveUp.tries === 1 ? 'try' : 'tries'}, last: ${gaveUp.message}); ${climbText}`;
   } else if (notStarted) why = 'not started';
-  else why = failures.length ? failures.slice(0, 3).join('; ') : 'not finished';
+  else why = whyText(left);
   return `${left.length} block${left.length === 1 ? '' : 's'} around ${posText(mid)} (${what}, ${where}): ${why}`;
 }
 
@@ -467,6 +551,27 @@ export function watchBuildScaffold(bot, site, planned) {
   return { strays, stop, leftover };
 }
 
+// "40 spruce_planks in the chest at 2807 64 -5121", for each of names the nearest chest the bot
+// remembers holding it, within 64 blocks.
+export function chestStock(bot, names) {
+  const index = bot.chestIndex;
+  if (!index?.list || !bot.entity) return [];
+  const entries = index.list(bot.game?.dimension);
+  const out = [];
+  for (const name of names) {
+    const chest = pickSource(entries, new Set([name]), bot.entity.position, new Set(), 64);
+    if (chest) out.push(`${chest.items.find(([n]) => n === name)[1]} ${name} in the ${chest.name} at ${posText(chest.parts[0])}`);
+  }
+  return out;
+}
+
+// What to do about items a build is short of, so the bot gets them itself before asking anyone.
+export function missingHelp(bot, names, again) {
+  const stock = chestStock(bot, names);
+  const where = stock.length ? ` I remember ${stock.join(', ')}.` : '';
+  return `obtain gets each of them in one call (from chests I know, by crafting, or by mining and chopping), then ${again}.${where}`;
+}
+
 function slabFinder(bot) {
   return (stairs) => {
     const slab = stairs.replace(/_stairs$/, '_slab');
@@ -502,7 +607,9 @@ export async function buildStructure(ctx, { origin, blocks = [], parts = [], dry
   if (dry_run) {
     return ok(`Plan: ${all.length} blocks, ${plan.skipped} already in place. Needs ${needText}.${missingText ? ` Missing: ${missingText}.` : ' I have everything.'}`);
   }
-  if (plan.missing.length > 0) return fail(`missing items: ${missingText}. Nothing was placed.`);
+  if (plan.missing.length > 0) {
+    return fail(`missing items: ${missingText}. Nothing was placed. ${missingHelp(bot, plan.missing.map((m) => m.block), 'build_structure with the same plan')}`);
+  }
 
   // Like build_house: scaffolding may go up next to its own blocks, never made of the build's
   // materials, and comes down again afterwards.
@@ -528,7 +635,9 @@ export async function buildStructure(ctx, { origin, blocks = [], parts = [], dry
   if (wrong.length > 0) message += `. ${wrong.length} came out turned the wrong way, first: ${wrong.slice(0, 3).join('; ')}`;
   if (report.length > 0) {
     const climb = [...inventoryCounts(bot.inventory.items())].filter(([n]) => SCAFFOLD_BLOCKS.includes(n) && !plan.needed.has(n));
-    const climbText = climb.length ? `I have ${climb.map(([n, c]) => `${c} ${n}`).join(', ')}, so scaffolding up is possible` : 'I have no blocks to scaffold with (dirt, cobblestone and the like)';
+    const stock = climb.length ? [] : chestStock(bot, SCAFFOLD_BLOCKS).slice(0, 2);
+    const fetch = stock.length ? `, but I remember ${stock.join(' and ')}: take_items some of that first` : ', obtain or mine some dirt or cobblestone first';
+    const climbText = climb.length ? `I have ${climb.map(([n, c]) => `${c} ${n}`).join(', ')}, so scaffolding up is possible` : `I have no blocks to scaffold with (dirt, cobblestone and the like)${fetch}`;
     const count = report.reduce((n, r) => n + r.left.length, 0);
     message += `. Left to do, ${count} blocks in ${report.length} group${report.length === 1 ? '' : 's'}: ${report.map((r) => leftText(r, climbText)).join('. ')}`;
   }

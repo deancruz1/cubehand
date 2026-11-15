@@ -170,9 +170,14 @@ class DoorMovements extends Movements {
     return false;
   }
 
+  // A door's lower half counts as no floor, so a jump over it looks fine, but the body goes
+  // through the upper half and stops at the door.
   getMoveParkourForward(node, dir, neighbors) {
     for (let d = 1; d <= 4; d++) {
-      if (this.getBlock(node, dir.x * d, 0, dir.z * d).name === 'iron_door' || this.getBlock(node, dir.x * d, 1, dir.z * d).name === 'iron_door') return;
+      for (const dy of [-1, 0, 1]) {
+        const b = this.getBlock(node, dir.x * d, dy, dir.z * d);
+        if (b.name === 'iron_door' || b.passage) return;
+      }
     }
     super.getMoveParkourForward(node, dir, neighbors);
   }

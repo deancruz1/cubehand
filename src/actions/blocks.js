@@ -200,20 +200,96 @@ function isFullBlock(block) {
   return s.length === 1 && s[0][0] === 0 && s[0][1] === 0 && s[0][2] === 0 && s[0][3] === 1 && s[0][4] === 1 && s[0][5] === 1;
 }
 
-// A solid neighbor to place against, from the ways to place the block (see placementOptions).
-// Ladders only go on the side of a full block; attach (a direction like 0 0 -1) picks which
-// side when it matters. A slab clicked onto the same slab would join it into a double slab.
+// Blocks a right click uses instead of placing against them: the door or trapdoor swings, the
+// chest opens. Iron doors and trapdoors only answer to redstone, so they take the block.
+const OPENS_ON_CLICK = /(_door|_trapdoor|_fence_gate|chest|barrel|shulker_box|furnace|^smoker$|crafting_table|^crafter$|anvil$|enchanting_table|brewing_stand|^beacon$|^hopper$|^dispenser$|^dropper$|^lectern$|^loom$|^stonecutter$|^grindstone$|smithing_table|cartography_table|^bell$|^note_block$|^jukebox$|^comparator$|^repeater$|daylight_detector|^lever$|_button$|_bed$|cake$|^respawn_anchor$|^composter$|_sign$|^decorated_pot$|^chiseled_bookshelf$|_shelf$|^redstone_wire$|^dragon_egg$|command_block$|^flower_pot$|^potted_|^vault$)/;
+
+export function opensOnClick(name) {
+  return OPENS_ON_CLICK.test(name) && name !== 'iron_door' && name !== 'iron_trapdoor';
+}
+
+// The game joins a slab clicked onto the same slab into a double slab when the click is on its
+// open half: the top of a bottom slab, the underside of a top one, or a side above or below
+// the middle. Then nothing goes in the spot next to it.
+function joinsSlab(neighbor, how, name) {
+  if (!name.endsWith('_slab') || neighbor.name !== name) return false;
+  const type = neighbor.getProperties?.().type;
+  if (type === 'double') return false;
+  if (how.dir.y !== 0 || type === undefined) return how.dir.y < 0 ? type !== 'top' : how.dir.y > 0 ? type !== 'bottom' : false;
+  const y = how.half === 'top' ? 0.75 : how.half === 'bottom' ? 0.25 : 0.5;
+  return type === 'bottom' ? y > 0.5 : y <= 0.5;
+}
+
+// The ways to place a block, in order: attach (a direction like 0 0 -1) when it matters, else
+// the options for its state (see placementOptions), else every side, below first. Ladders only
+// go on the side of a full block.
+export function referenceWays(name, attach, options) {
+  if (attach) return [{ dir: attach }];
+  return options ?? (name === 'ladder' ? FACES.filter((f) => f.y === 0) : FACES).map((dir) => ({ dir }));
+}
+
+function usableReference(neighbor, how, name) {
+  if (!neighbor || neighbor.boundingBox !== 'block') return false;
+  if (name === 'ladder' && !isFullBlock(neighbor)) return false;
+  return !opensOnClick(neighbor.name) && !joinsSlab(neighbor, how, name);
+}
+
+// Every solid neighbor the block can be placed against, in the order of referenceWays.
+export function findReferences(bot, pos, name, attach, options) {
+  const refs = [];
+  for (const how of referenceWays(name, attach, options)) {
+    const neighbor = bot.blockAt(pos.plus(how.dir), false);
+    if (usableReference(neighbor, how, name)) refs.push({ reference: neighbor, face: how.dir.scaled(-1), how });
+  }
+  return refs;
+}
+
 export function findReference(bot, pos, name, attach, options) {
-  const ladder = name === 'ladder';
-  const ways = attach ? [{ dir: attach }] : options ?? (ladder ? FACES.filter((f) => f.y === 0) : FACES).map((dir) => ({ dir }));
+  return findReferences(bot, pos, name, attach, options)[0] ?? null;
+}
+
+const SIDE_NAMES = { '0,-1,0': 'below', '0,1,0': 'above', '1,0,0': 'east', '-1,0,0': 'west', '0,0,1': 'south', '0,0,-1': 'north' };
+const sideName = (dir) => SIDE_NAMES[`${dir.x},${dir.y},${dir.z}`];
+
+// Why nothing next to pos will take the block, and what to do about it.
+export function noReferenceText(bot, pos, name, attach, options) {
+  const ways = referenceWays(name, attach, options);
+  const notes = [];
   for (const how of ways) {
     const neighbor = bot.blockAt(pos.plus(how.dir), false);
     if (!neighbor || neighbor.boundingBox !== 'block') continue;
-    if (ladder && !isFullBlock(neighbor)) continue;
-    if (name.endsWith('_slab') && neighbor.name === name) continue;
-    return { reference: neighbor, face: how.dir.scaled(-1), how };
+    const where = `the ${neighbor.name} ${sideName(how.dir)}`;
+    if (opensOnClick(neighbor.name)) notes.push(`${where} would open instead of taking a block`);
+    else if (joinsSlab(neighbor, how, name)) notes.push(`${where} would join it into a double slab`);
+    else if (name === 'ladder') notes.push(`${where} is not a full block for a ladder`);
   }
-  return null;
+  const allowed = new Set(ways.map((w) => sideName(w.dir)));
+  const others = FACES.filter((f) => !allowed.has(sideName(f)) && bot.blockAt(pos.plus(f), false)?.boundingBox === 'block');
+  if (others.length > 0) notes.push(`it can only go against the block ${[...allowed].join(', ')} of it for that state, not ${others.map(sideName).join(', ')}`);
+  const why = notes.length ? notes.join('; ') : 'nothing solid on any side';
+  return `no block to place against at ${posText(pos)}: ${why}. Something has to go next to it first: in build_structure, put what holds it up in the same call; a block of dirt or cobblestone there can be broken again once it is in`;
+}
+
+// Where on the reference clickToPlace clicks.
+function clickPoint({ how, reference, face }) {
+  let dy = 0.5 + face.y * 0.5;
+  if (face.y === 0 && how.half) dy += how.half === 'top' ? 0.25 : -0.25;
+  return reference.position.offset(0.5 + face.x * 0.5, dy, 0.5 + face.z * 0.5);
+}
+
+// True when nothing solid stands between the eyes and the spot clickToPlace clicks, coming at it
+// through the cell the block goes in, the way a player has to see a face to click it.
+export function inSight(bot, ref, pos) {
+  const eye = bot.entity.position.offset(0, 1.62, 0);
+  const end = clickPoint(ref).plus(ref.face.scaled(0.02));
+  const d = end.minus(eye);
+  const steps = Math.ceil(d.norm() / 0.1);
+  for (let i = 1; i < steps; i++) {
+    const cell = eye.plus(d.scaled(i / steps)).floored();
+    if (cell.equals(pos)) continue;
+    if (bot.blockAt(cell, false)?.boundingBox === 'block') return false;
+  }
+  return true;
 }
 
 // Clicks the reference block so the new block comes out in the wanted state: on the upper or
@@ -240,6 +316,26 @@ function standingIn(bot, pos) {
   const p = bot.entity.position;
   return pos.x + 1 > p.x - 0.3 && pos.x < p.x + 0.3 && pos.z + 1 > p.z - 0.3 && pos.z < p.z + 0.3 && pos.y + 1 > p.y && pos.y < p.y + 1.8;
 }
+
+// Entities the game won't put a block into: players, mobs, boats and minecarts. Dropped items
+// and arrows don't count.
+const SOLID_ENTITY_TYPES = new Set(['player', 'mob', 'animal', 'hostile', 'passive', 'water_creature', 'ambient', 'living']);
+
+function inTheWay(bot, pos) {
+  for (const e of Object.values(bot.entities ?? {})) {
+    if (e === bot.entity || !e.position) continue;
+    if (!SOLID_ENTITY_TYPES.has(e.type) && !/boat|raft|minecart/.test(e.name ?? '')) continue;
+    const half = (e.width ?? 0.6) / 2;
+    const p = e.position;
+    if (pos.x + 1 > p.x - half && pos.x < p.x + half && pos.z + 1 > p.z - half && pos.z < p.z + half && pos.y + 1 > p.y && pos.y < p.y + (e.height ?? 1.8)) {
+      return e.username ?? e.name ?? 'something';
+    }
+  }
+  return null;
+}
+
+// Faces it may try in one go when the server turns a click down.
+const PLACE_TRIES = 3;
 
 // Shared by place_block, build_structure and build_house. Assumes the block name is known.
 // props is the wanted state (facing, half, axis, type, open, hanging), see states.js.
@@ -268,25 +364,50 @@ export async function placeOne(ctx, name, pos, { attach, props } = {}) {
   if (!item) return fail(`missing item: ${itemName}`);
 
   const options = props && Object.keys(props).length ? placementOptions(name, props) : undefined;
-  if (!findReference(bot, pos, name, attach, options)) return fail(`no block to place against at ${posText(pos)}`);
+  const usable = findReferences(bot, pos, name, attach, options);
+  if (usable.length === 0) return fail(noReferenceText(bot, pos, name, attach, options));
 
   if (!inReach(bot, pos) || standingIn(bot, pos)) {
-    const walked = await walkTo(ctx, new GoalPlaceBlock(pos, bot.world, { range: 4 }), { place: 'climb' });
+    // Only a spot that sees one of the faces it can use ends the walk.
+    const faces = usable.map((r) => r.how.dir);
+    const walked = await walkTo(ctx, new GoalPlaceBlock(pos, bot.world, { range: 4, faces }), { place: 'climb' });
     if (standingIn(bot, pos)) return { ...fail(`could not step out of the way of ${posText(pos)}: ${walked.message}`), reason: walked.reason ?? 'in_the_way' };
     if (!walked.ok && !inReach(bot, pos)) return { ...fail(`could not get close enough to ${posText(pos)}: ${walked.message}`), reason: walked.reason };
+    await settle(bot);
   }
+  for (let i = 0; i < 6 && inTheWay(bot, pos); i++) await delay(250);
+  const blocker = inTheWay(bot, pos);
+  if (blocker) return fail(`${blocker} is in the way at ${posText(pos)}, nothing can be placed into it`);
 
-  // Re-check after walking, the pathfinder may have changed things nearby.
-  const ref = findReference(bot, pos, name, attach, options);
-  if (!ref) return fail(`no block to place against at ${posText(pos)}`);
+  // Re-check after walking, the pathfinder may have changed things nearby. A face in sight goes
+  // first; when the server turns a click down, the next face gets a go.
+  const refs = findReferences(bot, pos, name, attach, options);
+  if (refs.length === 0) return fail(noReferenceText(bot, pos, name, attach, options));
+  const ordered = [...refs.filter((r) => inSight(bot, r, pos)), ...refs.filter((r) => !inSight(bot, r, pos))];
 
+  let error = null;
+  let tries = 0;
   try {
     await bot.equip(item, 'hand');
-    await clickToPlace(bot, ref);
+    for (const ref of ordered.slice(0, PLACE_TRIES)) {
+      tries++;
+      try {
+        await clickToPlace(bot, ref);
+        error = null;
+        break;
+      } catch (err) {
+        error = err;
+        if (bot.blockAt(pos, false)?.name === name) {
+          error = null;
+          break;
+        }
+        if (!/refused/i.test(err.message)) break;
+      }
+    }
   } catch (err) {
-    const placed = bot.blockAt(pos, false);
-    if (placed?.name !== name) return fail(`could not place at ${posText(pos)}: ${err.message}`);
+    if (bot.blockAt(pos, false)?.name !== name) error = err;
   }
+  if (error) return fail(`could not place at ${posText(pos)}: ${error.message}${tries > 1 ? ` (tried ${tries} faces)` : ''}`);
   ctx.placed?.add(name, pos);
   await pause(80, 200);
 

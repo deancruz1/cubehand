@@ -6,8 +6,14 @@ import { EventEmitter } from 'node:events';
 import { expandParts, planBuild, nearestFirst, buildSite, buildStructure, watchBuildScaffold, groupBlocks, fromHere, groundUnder, buildZone } from '../src/actions/build.js';
 import { setPauseScale } from '../src/actions/util.js';
 import { planHouse, buildHouse } from '../src/actions/house.js';
-import { placeOne } from '../src/actions/blocks.js';
+import { placeOne, placeBlock, findReference, inSight } from '../src/actions/blocks.js';
 import { markPathfinderPlace } from '../src/actions/movement.js';
+import { createRequire } from 'node:module';
+
+// Real 26.1 blocks, loaded the way mineflayer loads them, for shapes and states.
+const requireMf = createRequire(createRequire(import.meta.url).resolve('mineflayer'));
+const realRegistry = requireMf('prismarine-registry')('26.1');
+const RealBlock = requireMf('prismarine-block')(realRegistry);
 
 const registry = {
   itemsByName: { torch: {}, oak_stairs: {}, spruce_trapdoor: {}, oak_log: {} },
@@ -323,11 +329,16 @@ function builderBot({ items, canReach = () => true, start, extra = [], noRoute =
     registry: { blocksByName: { oak_planks: {}, dirt: {} }, itemsByName: { oak_planks: { id: 5 }, dirt: { id: 3 } } },
     inventory: { items: () => items },
     blockAt: (p) => world.get(`${p.x},${p.y},${p.z}`) ?? { name: 'air', position: p, boundingBox: 'empty', shapes: [], getProperties: () => ({}) },
-    equip: async () => {},
+    equip: async (item) => { bot.heldItem = item; },
     placeBlock: async (ref, face) => {
       const pos = ref.position.plus(face);
-      world.set(`${pos.x},${pos.y},${pos.z}`, solid('oak_planks', pos));
-      events.push({ placed: pos });
+      const name = bot.heldItem?.name ?? 'oak_planks';
+      world.set(`${pos.x},${pos.y},${pos.z}`, solid(name, pos));
+      events.push({ placed: pos, name });
+    },
+    dig: async (block) => {
+      world.delete(`${block.position.x},${block.position.y},${block.position.z}`);
+      events.push({ dug: block.position });
     },
     canDigBlock: () => true,
     pathfinder: {
@@ -410,7 +421,7 @@ test('build_structure skips a group it cannot get to after a few tries, finishes
   // Part of it got built, so it counts as done, with what is left grouped.
   assert.equal(result.ok, true, result.message);
   assert.match(result.message, /^placed 3, skipped 0, failed 3\. Left to do, 5 blocks in 1 group: 5 blocks around 4 80 0 \(5 oak_planks, from 2 80 0 to 6 80 0\): couldn't get up there, the lowest is 16 blocks above where I got to \(3 tries, last: could not get close enough to \d 80 0: could not get all the way there, now at 4 64 2\); I have 20 dirt, so scaffolding up is possible\. build_structure with the same plan again skips what is already in place$/);
-  assert.match(bare.result.message, /; I have no blocks to scaffold with \(dirt, cobblestone and the like\)\./);
+  assert.match(bare.result.message, /; I have no blocks to scaffold with \(dirt, cobblestone and the like\), obtain or mine some dirt or cobblestone first\./);
 });
 
 test('a group whose first block has no route is skipped after that one walk', async () => {
@@ -583,4 +594,233 @@ test('build_house notes scaffolding on its planned spots and only claims its own
   world.set(`${wall.x},${wall.y},${wall.z}`, 'cobblestone');
   assert.deepEqual(scaffold.leftover(plan.blocks).map((p) => `${p.x},${p.y},${p.z}`), ['4,64,4']);
   assert.equal(bot.listenerCount('blockUpdate'), 0);
+});
+
+// A bot among real 26.1 blocks, with a server that answers a click the way the game does: a
+// wooden door or trapdoor that gets clicked swings and nothing is placed, anything else gets
+// the held block in the spot across the clicked face. refuse(dest, ref) turns a click down too.
+function serverBot({ at, items, refuse = () => false }) {
+  const blocks = new Map();
+  const text = (props) => Object.fromEntries(Object.entries(props).map(([k, v]) => [k, String(v)]));
+  const w = {
+    set: (x, y, z, name, props = {}) => blocks.set(`${x},${y},${z}`, RealBlock.fromProperties(name, text(props), 0)),
+    get: (p) => {
+      const b = blocks.get(`${p.x},${p.y},${p.z}`);
+      const out = b ? RealBlock.fromStateId(b.stateId, 0) : RealBlock.fromProperties('air', {}, 0);
+      out.position = new Vec3(p.x, p.y, p.z);
+      return out;
+    }
+  };
+  const clicks = [];
+  const walks = [];
+  const bot = {
+    entity: { position: at.clone(), height: 1.8 },
+    registry: realRegistry,
+    entities: {},
+    inventory: { items: () => items.map(([name, count]) => ({ name, count })) },
+    blockAt: (p) => w.get(p),
+    equip: async (item) => { bot.heldItem = item; },
+    look: async () => {},
+    pathfinder: { goto: async (goal) => { walks.push(goal); }, setGoal() {}, isMining: () => false, isBuilding: () => false }
+  };
+  bot.world = { getBlock: (p) => w.get(p), raycast: () => null };
+  const click = async (ref, face, half) => {
+    const dest = ref.position.plus(face);
+    clicks.push(`${ref.name} ${ref.position.x} ${ref.position.y} ${ref.position.z}`);
+    const refused = new Error(`Server refused to place ${bot.heldItem.name} at ${dest}: the block is still air`);
+    if (/_door$|_trapdoor$/.test(ref.name) && !ref.name.startsWith('iron_')) {
+      const props = ref.getProperties();
+      w.set(ref.position.x, ref.position.y, ref.position.z, ref.name, { ...props, open: String(props.open) !== 'true' });
+      throw refused;
+    }
+    if (refuse(dest, ref)) throw refused;
+    const type = face.y < 0 || (face.y === 0 && half === 'top') ? 'top' : 'bottom';
+    w.set(dest.x, dest.y, dest.z, bot.heldItem.name, bot.heldItem.name.endsWith('_slab') ? { type } : {});
+  };
+  bot.placeBlock = (ref, face) => click(ref, face);
+  bot._placeBlockWithOptions = (ref, face, options) => click(ref, face, options.half);
+  return { bot, w, clicks, walks, ctx: { bot, config: { limits: { moveTimeoutSeconds: 90 } } } };
+}
+
+test('a block is never placed against a door or trapdoor, which would swing open instead', async () => {
+  setPauseScale(0);
+  // Under a window: a sill trapdoor below the spot and the glass pane of the window beside it.
+  const { bot, w, clicks, ctx } = serverBot({ at: new Vec3(0.5, 64, 3.5), items: [['cobblestone', 4]] });
+  w.set(0, 64, 0, 'spruce_trapdoor', { facing: 'north', half: 'top', open: false });
+  w.set(0, 65, -1, 'glass_pane');
+  const result = await placeBlock(ctx, { block: 'cobblestone', x: 0, y: 65, z: 0 });
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(clicks, ['glass_pane 0 65 -1']);
+  assert.equal(String(bot.blockAt(new Vec3(0, 64, 0)).getProperties().open), 'false');
+
+  // Above a door with nothing else next to it yet: it says why instead of opening the door.
+  w.set(3, 64, 0, 'spruce_door', { facing: 'north', half: 'lower', hinge: 'left', open: false });
+  w.set(3, 65, 0, 'spruce_door', { facing: 'north', half: 'upper', hinge: 'left', open: false });
+  const above = await placeBlock(ctx, { block: 'cobblestone', x: 3, y: 66, z: 0 });
+  setPauseScale(1);
+  assert.equal(above.ok, false);
+  assert.match(above.message, /^no block to place against at 3 66 0: the spruce_door below would open instead of taking a block\. Something has to go next to it first/);
+  assert.equal(clicks.length, 1);
+  assert.equal(String(bot.blockAt(new Vec3(3, 65, 0)).getProperties().open), 'false');
+});
+
+test('a walk to place a block only ends where a face it can use is in sight', async () => {
+  setPauseScale(0);
+  const { w, walks, ctx } = serverBot({ at: new Vec3(0.5, 64, 12.5), items: [['cobblestone', 4]] });
+  w.set(0, 64, 0, 'spruce_trapdoor', { facing: 'north', half: 'top', open: false });
+  w.set(1, 65, 0, 'stone');
+  await placeBlock(ctx, { block: 'cobblestone', x: 0, y: 65, z: 0 });
+  setPauseScale(1);
+  assert.equal(walks.length, 1);
+  assert.deepEqual(walks[0].facesPos.map(([dir]) => dir.toString()), ['(1, 0, 0)']);
+});
+
+test('slabs go against the side of a slab beside them, only not onto its open half', async () => {
+  setPauseScale(0);
+  // A porch roof: the middle slab between two slabs already down, with nothing under it.
+  const { bot, w, clicks, ctx } = serverBot({ at: new Vec3(1.5, 64, 3.5), items: [['spruce_slab', 8]] });
+  w.set(0, 66, 0, 'spruce_slab', { type: 'bottom' });
+  w.set(2, 66, 0, 'spruce_slab', { type: 'bottom' });
+  const porch = await placeBlock(ctx, { block: 'spruce_slab', x: 1, y: 66, z: 0 });
+  assert.equal(porch.ok, true, porch.message);
+  assert.equal(bot.blockAt(new Vec3(1, 66, 0)).getProperties().type, 'bottom');
+  // A roof ridge, a bottom slab next to the last one.
+  const ridge = await placeBlock(ctx, { block: 'spruce_slab[type=bottom]', x: 1, y: 66, z: 1 });
+  assert.equal(ridge.ok, true, ridge.message);
+  assert.deepEqual(clicks, ['spruce_slab 2 66 0', 'spruce_slab 1 66 0']);
+  // A top slab clicked on the upper half of a bottom slab's side would join it, and so would
+  // any slab on top of a bottom slab.
+  const top = await placeBlock(ctx, { block: 'spruce_slab[type=top]', x: 3, y: 66, z: 0 });
+  assert.match(top.message, /^no block to place against at 3 66 0: the spruce_slab west would join it into a double slab/);
+  w.set(5, 65, 0, 'spruce_slab', { type: 'bottom' });
+  assert.equal(findReference(bot, new Vec3(5, 66, 0), 'spruce_slab'), null);
+  setPauseScale(1);
+});
+
+test('a click the server turns down is tried again on another face', async () => {
+  setPauseScale(0);
+  const { bot, w, clicks, ctx } = serverBot({ at: new Vec3(0.5, 64, 3.5), items: [['cobblestone', 4]], refuse: (dest, ref) => ref.position.y < dest.y });
+  w.set(0, 63, 0, 'stone');
+  w.set(1, 64, 0, 'stone');
+  const result = await placeBlock(ctx, { block: 'cobblestone', x: 0, y: 64, z: 0 });
+  setPauseScale(1);
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(clicks, ['stone 0 63 0', 'stone 1 64 0']);
+  assert.equal(bot.blockAt(new Vec3(0, 64, 0)).name, 'cobblestone');
+});
+
+test('nothing is clicked while a mob stands in the spot', async () => {
+  setPauseScale(0);
+  const { bot, w, clicks, ctx } = serverBot({ at: new Vec3(0.5, 64, 3.5), items: [['cobblestone', 4]] });
+  w.set(0, 63, 0, 'stone');
+  bot.entities = { 7: { type: 'animal', name: 'cow', position: new Vec3(0.4, 64, 0.6), width: 0.9, height: 1.4 } };
+  const result = await placeBlock(ctx, { block: 'cobblestone', x: 0, y: 64, z: 0 });
+  setPauseScale(1);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /^cow is in the way at 0 64 0/);
+  assert.deepEqual(clicks, []);
+});
+
+test('a face counts as in sight only with nothing solid between the eyes and it', () => {
+  const { bot, w } = serverBot({ at: new Vec3(0.5, 64, 3.5), items: [] });
+  w.set(0, 63, 0, 'stone');
+  const ref = findReference(bot, new Vec3(0, 64, 0), 'cobblestone');
+  assert.equal(inSight(bot, ref, new Vec3(0, 64, 0)), true);
+  w.set(0, 65, 1, 'stone');
+  w.set(0, 64, 1, 'stone');
+  assert.equal(inSight(bot, ref, new Vec3(0, 64, 0)), false);
+});
+
+test('a block with nothing to place against gets a scaffolding block beside it that comes out again', async () => {
+  setPauseScale(0);
+  // A lintel over a gap, with nothing under its middle block.
+  const { bot, ctx, events } = builderBot({ items: [{ name: 'oak_planks', count: 8 }, { name: 'dirt', count: 4 }], start: new Vec3(1.5, 64, 2.5) });
+  bot.registry.itemsByName.dirt = { id: 3 };
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, blocks: [{ dx: 0, dy: 0, dz: 0, block: 'oak_planks' }, { dx: 0, dy: 1, dz: 0, block: 'oak_planks' }, { dx: 1, dy: 2, dz: 0, block: 'oak_planks' }] });
+  setPauseScale(1);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^placed 3, skipped 0, failed 0$/);
+  assert.equal(bot.blockAt(new Vec3(1, 66, 0)).name, 'oak_planks');
+  assert.equal(bot.blockAt(new Vec3(1, 65, 0)).name, 'air');
+  const support = events.filter((e) => e.name === 'dirt');
+  assert.equal(support.length, 1);
+  assert.ok(events.some((e) => e.dug?.equals(support[0].placed)));
+});
+
+test('a block it can not hold up is left with the reason, and the call still counts what it did', async () => {
+  setPauseScale(0);
+  const { ctx } = builderBot({ items: [{ name: 'oak_planks', count: 8 }], start: new Vec3(1.5, 64, 2.5) });
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, blocks: [{ dx: 0, dy: 0, dz: 0, block: 'oak_planks' }, { dx: 3, dy: 3, dz: 0, block: 'oak_planks' }] });
+  setPauseScale(1);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^placed 1, skipped 0, failed 1\. Left to do, 1 blocks in 1 group: 1 block around 3 67 0 \(1 oak_planks, at 3 67 0\): no block to place against at 3 67 0: nothing solid on any side\. Something has to go next to it first/);
+});
+
+test('short of items, a build says what and how many, and to get them with obtain from the chest it knows', async () => {
+  const { bot, ctx } = builderBot({ items: [{ name: 'oak_planks', count: 1 }], start: new Vec3(1.5, 64, 2.5) });
+  bot.chestIndex = { list: () => [{ key: 'k', name: 'chest', parts: [{ x: 5, y: 64, z: 5 }], items: [['oak_planks', 40], ['dirt', 300]] }] };
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, blocks: [{ dx: 0, dy: 0, dz: 0, block: 'oak_planks' }, { dx: 1, dy: 0, dz: 0, block: 'oak_planks' }] });
+  assert.equal(result.ok, false);
+  assert.equal(result.message, 'missing items: oak_planks (need 2, have 1, 1 more). Nothing was placed. obtain gets each of them in one call (from chests I know, by crafting, or by mining and chopping), then build_structure with the same plan. I remember 40 oak_planks in the chest at 5 64 5.');
+});
+
+test('with no blocks to climb on, a build that could not get up says which chest has some', async () => {
+  setPauseScale(0);
+  const high = [0, 1, 2].map((i) => ({ x: 2 + i, y: 79, z: 0 }));
+  const { bot, ctx } = builderBot({ items: [{ name: 'oak_planks', count: 64 }], canReach: (p) => p.y < 70, start: new Vec3(4.5, 64, 2.5), extra: high });
+  bot.chestIndex = { list: () => [{ key: 'k', name: 'chest', parts: [{ x: 5, y: 64, z: 5 }], items: [['cobblestone', 300]] }] };
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, parts: [{ shape: 'line', from: { dx: 2, dy: 16, dz: 0 }, to: { dx: 4, dy: 16, dz: 0 }, block: 'oak_planks' }] });
+  setPauseScale(1);
+  assert.match(result.message, /I have no blocks to scaffold with \(dirt, cobblestone and the like\), but I remember 300 cobblestone in the chest at 5 64 5: take_items some of that first/);
+});
+
+test('trim on two gable ends: one end is finished before the other, each block after the one it sits on', async () => {
+  setPauseScale(0);
+  // Two gable ends 14 apart with the bot halfway between, each a triangle of planks with trim on
+  // its sloping edge.
+  const blocks = [];
+  for (const dx of [0, 14]) {
+    for (let dz = 0; dz <= 8; dz++) {
+      const h = Math.min(dz, 8 - dz);
+      for (let dy = 0; dy <= h; dy++) blocks.push({ dx, dy, dz, block: 'oak_planks' });
+      blocks.push({ dx, dy: h + 1, dz, block: 'oak_planks' });
+    }
+  }
+  const { ctx, events } = builderBot({ items: [{ name: 'oak_planks', count: 100 }], start: new Vec3(7.5, 64, 4.5) });
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, blocks });
+  setPauseScale(1);
+  assert.equal(result.ok, true, result.message);
+  const placed = events.filter((e) => e.placed).map((e) => e.placed);
+  assert.equal(placed.length, blocks.length);
+  const sides = placed.map((p) => p.x);
+  assert.equal(sides.filter((x, i) => i > 0 && x !== sides[i - 1]).length, 1, sides.join(' '));
+  for (const [i, p] of placed.entries()) {
+    if (p.y > 64) assert.ok(placed.slice(0, i).some((q) => q.x === p.x && q.y === p.y - 1 && q.z === p.z), `${p} before the block under it`);
+  }
+});
+
+test('build_house that places most of the house is done, and lists what is left with the reason', async () => {
+  setPauseScale(0);
+  const world = new Map();
+  const solid = (name, pos) => ({ name, position: pos, boundingBox: 'block', shapes: [[0, 0, 0, 1, 1, 1]], getProperties: () => ({}) });
+  for (let x = -5; x <= 5; x++) for (let z = -5; z <= 5; z++) world.set(`${x},62,${z}`, solid('stone', new Vec3(x, 62, z)));
+  const bot = Object.assign(new EventEmitter(), {
+    entity: { position: new Vec3(0.5, 64, 0.5), height: 1.62 },
+    registry: { blocksByName: { cobblestone: {}, oak_planks: {} }, itemsByName: { cobblestone: { id: 4 }, oak_planks: { id: 5 } } },
+    inventory: { items: () => [{ name: 'cobblestone', count: 200 }, { name: 'oak_planks', count: 50 }] },
+    blockAt: (p) => world.get(`${p.x},${p.y},${p.z}`) ?? { name: 'air', position: p, boundingBox: 'empty', getProperties: () => ({}) },
+    equip: async (item) => { bot.heldItem = item; },
+    placeBlock: async (ref, face) => {
+      const pos = ref.position.plus(face);
+      if (pos.x === 0 && pos.y === 67 && pos.z === 0) throw new Error(`Server refused to place cobblestone at ${pos}: the block is still air`);
+      world.set(`${pos.x},${pos.y},${pos.z}`, solid(bot.heldItem.name, pos));
+    },
+    pathfinder: { goto: async () => {}, setGoal() {}, isMining: () => false, isBuilding: () => false, bestHarvestTool: () => null }
+  });
+  bot.world = { getBlock: (p) => bot.blockAt(p) };
+  const ctx = { bot, config: { protectedBlocks: [], limits: { moveTimeoutSeconds: 90 } } };
+  const result = await buildHouse(ctx, { x: 0, y: 64, z: 0, width: 5, depth: 5, roof: 'flat', materials: { walls: 'cobblestone', floor: 'oak_planks', roof: 'cobblestone', door: 'none', windows: 'none' } });
+  setPauseScale(1);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /Placed 95 of 96 blocks\. Left to do, 1 blocks in 1 group: 1 block around 0 67 0 \(1 cobblestone, at 0 67 0\): could not place at 0 67 0: Server refused to place cobblestone at \(0, 67, 0\): the block is still air \(tried 3 faces\)\. build_house with the same settings again/);
 });

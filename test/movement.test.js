@@ -1080,6 +1080,29 @@ test('a pillar too high to reach on foot gets a try a day, and is let go after t
   }
 });
 
+// A house's foundation course, one block high along z 0, with the door standing in it at x 0
+// facing east, so its panel is across the way along the wall.
+function foundationWithDoor() {
+  const w = world();
+  w.floor();
+  for (let x = -4; x <= 4; x++) if (x !== 0) w.set(x, 64, 0, 'stone');
+  w.set(0, 64, 0, 'spruce_door', { facing: 'east', half: 'lower', hinge: 'left', open: 'false' });
+  w.set(0, 65, 0, 'spruce_door', { facing: 'east', half: 'upper', hinge: 'left', open: 'false' });
+  return w;
+}
+
+test('a walk along the top of a wall never jumps through a door standing in it', async () => {
+  const w = foundationWithDoor();
+  const result = plan(w, new Vec3(-2, 65, 0), new GoalBlock(2, 65, 0));
+  assert.equal(result.status, 'success');
+  const over = result.path.filter((n) => n.parkour);
+  assert.deepEqual(over.map((n) => `${n.x},${n.y},${n.z}`), []);
+  // With the real physics she gets there by stepping down off the wall, not stuck at the door.
+  const bot = physicsBot(foundationWithDoor(), new Vec3(-1.5, 65, 0.5));
+  const walked = await run(bot, walkTo({ bot, config: limits }, new GoalBlock(2, 65, 0), { place: false }), 600);
+  assert.equal(walked.ok, true, walked.message);
+});
+
 test('a walk never digs the block a door stands on, not even a dig walk', () => {
   const w = world();
   w.floor();

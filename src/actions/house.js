@@ -2,7 +2,7 @@ import { Vec3 } from 'vec3';
 import { ok, fail, posText } from './util.js';
 import { isNaturalBlock } from './movement.js';
 import { digBlock, removeScaffold, isReplaceable, isProtected } from './blocks.js';
-import { placeAll, inventoryCounts, expandParts, watchBuildScaffold, groundUnder, buildZone } from './build.js';
+import { placeAll, inventoryCounts, expandParts, watchBuildScaffold, groundUnder, buildZone, groupBlocks, leftText, missingHelp } from './build.js';
 import { collectDrops } from './items.js';
 import { parseBlock, dirVector, opposite, matchesState } from './states.js';
 
@@ -407,9 +407,8 @@ export async function buildHouse(ctx, input) {
   const needed = new Map();
   for (const b of todo) needed.set(b.block, (needed.get(b.block) ?? 0) + 1);
   const have = (n) => (inventory.get(n) ?? 0) + (recovered.get(n) ?? 0);
-  const missing = [...needed]
-    .filter(([n, c]) => have(n) < c)
-    .map(([n, c]) => `${n} (need ${c}, have ${inventory.get(n) ?? 0}${recovered.get(n) ? ` plus ${recovered.get(n)} from taking down my own blocks` : ''})`);
+  const short = [...needed].filter(([n, c]) => have(n) < c);
+  const missing = short.map(([n, c]) => `${n} (need ${c}, have ${inventory.get(n) ?? 0}${recovered.get(n) ? ` plus ${recovered.get(n)} from taking down my own blocks` : ''}, ${c - have(n)} more)`);
   const parts = [
     `walls ${materials.walls}`,
     `floor ${materials.floor ?? 'none, keeps the ground'}`,
@@ -424,7 +423,9 @@ export async function buildHouse(ctx, input) {
   const clearing = [toDig.length > own && `${toDig.length - own} natural blocks`, own && `${own} of my own blocks that don't fit the plan`].filter(Boolean);
   const summary = `${width}x${depth} house ${where}, ${floors} floor${floors > 1 ? 's' : ''}${extras.length ? ` plus ${extras.join(' and ')}` : ''}, ${roof} roof, door on the ${door} side at ${posText(plan.door)}. ${parts.join(', ')}. Needs ${needText || 'nothing more'}${clearing.length ? `, and ${clearing.join(' and ')} cleared first` : ''}.`;
   if (input.dry_run) return ok(`Plan: ${summary}${missing.length ? ` Missing: ${missing.join(', ')}.` : ' I have everything.'}`);
-  if (missing.length) return fail(`missing items: ${missing.join(', ')}. Nothing was built. Plan: ${summary}`);
+  if (missing.length) {
+    return fail(`missing items: ${missing.join(', ')}. Nothing was built. ${missingHelp(bot, short.map(([n]) => n), 'build_house with the same settings')} Plan: ${summary}`);
+  }
 
   // The exact settings of a real build go into memory, so carrying on later never depends on
   // the bot remembering to save them.
@@ -475,13 +476,17 @@ export async function buildHouse(ctx, input) {
   }
   const removed = await removeScaffold(ctx, scaffold.leftover(todo));
 
-  const { placed, failures, wrong, stoppedReason } = result;
+  const { placed, wrong, stoppedReason } = result;
   let message = `${summary} Placed ${placed} of ${todo.length} blocks`;
   if (removed) message += `, took down ${removed} scaffolding blocks`;
   if (wrong.length) message += `. ${wrong.length} came out turned the wrong way, first: ${wrong.slice(0, 3).join('; ')}`;
-  if (failures.length) message += `. ${failures.length} failed, first: ${failures.slice(0, 4).join('; ')}`;
+  const left = todo.filter((b) => !b.done);
+  const groups = groupBlocks(left);
+  if (left.length) message += `. Left to do, ${left.length} blocks in ${groups.length} group${groups.length === 1 ? '' : 's'}: ${groups.slice(0, 6).map((g) => leftText({ left: g })).join('. ')}${groups.length > 6 ? `. And ${groups.length - 6} more groups` : ''}`;
   const stopped = digProblem ?? stoppedReason ?? (signal?.aborted ? 'stopped' : null);
   if (stopped) message += `. Stopped early: ${stopped}`;
-  record(stopped || failures.length ? `stopped at ${clock()} with ${placed} of ${todo.length} blocks placed${stopped ? `, ${stopped}` : ''}` : `finished at ${clock()}`);
-  return stopped || failures.length ? fail(message) : ok(message);
+  if (left.length) message += '. build_house with the same settings again keeps what is done and goes on with the rest';
+  record(left.length ? `stopped at ${clock()} with ${placed} of ${todo.length} blocks placed${stopped ? `, ${stopped}` : ''}` : `finished at ${clock()}`);
+  // Anything placed is progress; only a run that placed nothing of what was left fails.
+  return placed > 0 || left.length === 0 ? ok(message) : fail(message);
 }
