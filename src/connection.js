@@ -2,6 +2,7 @@ import mineflayer from 'mineflayer';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import { setupMovements } from './actions/movement.js';
 import { fixToolMaterials } from './actions/blocks.js';
+import { chatBody } from './chat.js';
 
 const { pathfinder } = pathfinderPkg;
 
@@ -67,6 +68,34 @@ export function isWhisperLine(line, sender) {
     new RegExp(`^${NAME_PREFIX}${escapeRegex(sender)} whispers(?: to you)?:? `).test(line) ||
     new RegExp(`^\\[${NAME_PREFIX}\\w+ -> \\w+\\s?\\] `).test(line)
   );
+}
+
+// What sender whispered to the bot in line, or null when line is no whisper from them. Unlike
+// Mineflayer's whisper event, the sender is the one the server named, not a name read out of
+// the text, which public chat from a player with a short name ("<Bo> Alice whispers to you: hi"),
+// a "/me" or any system line could fake.
+export function whisperBody(line, sender) {
+  const name = escapeRegex(sender);
+  const match =
+    new RegExp(`^${NAME_PREFIX}${name} whispers(?: to you)?:? (.*)$`, 's').exec(line) ??
+    new RegExp(`^\\[${NAME_PREFIX}${name} -> \\w+\\s?\\] (.*)$`, 's').exec(line);
+  return match ? match[1] : null;
+}
+
+// One line from Mineflayer's messagestr event as { username, text, whisper }, with the sender
+// taken from the id the server sent with it, never from the text. null for a line to leave alone,
+// { unknown: true } for player chat from someone not in the player list, and { serverWhisper: true }
+// for a server line that reads like a whisper, which has no sender id and could be anyone's.
+export function readChat(players, line, position, sender) {
+  const list = Object.values(players ?? {});
+  if (position !== 'chat') return list.some((p) => whisperBody(line, p.username) !== null) ? { serverWhisper: true } : null;
+  const username = list.find((p) => p.uuid === sender)?.username;
+  if (!username) return { unknown: true };
+  if (isWhisperLine(line, username)) {
+    const body = whisperBody(line, username);
+    return body === null ? null : { username, text: body, whisper: true };
+  }
+  return { username, text: chatBody(line, username), whisper: false };
 }
 
 // An item's enchantments as prismarine-block's digTime takes them: [{ name, lvl }]. From 1.20.5

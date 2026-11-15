@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
-import { nextDelay, reasonText, isPermanentKick, isWhisperLine, enchantList, digTimeFor, safeDigTime } from '../src/connection.js';
+import { nextDelay, reasonText, isPermanentKick, isWhisperLine, whisperBody, readChat, enchantList, digTimeFor, safeDigTime } from '../src/connection.js';
 
 const require = createRequire(createRequire(import.meta.url).resolve('mineflayer'));
 const registry = require('prismarine-registry')('26.1');
@@ -93,6 +93,33 @@ test('whisper lines are told apart from public chat', () => {
   assert.equal(isWhisperLine('<Alice> Clodine come here', 'Alice'), false);
   assert.equal(isWhisperLine('<Alice> Bob whispers to you: hi', 'Alice'), false);
   assert.equal(isWhisperLine('<Bo> x whispers to you: y', 'Bo'), false);
+});
+
+test('a whisper body is read only for the sender the server named', () => {
+  assert.equal(whisperBody('Alice whispers to you: violet anchor', 'Alice'), 'violet anchor');
+  assert.equal(whisperBody('[Red] Alice whispers to you: hi', 'Alice'), 'hi');
+  assert.equal(whisperBody('[Alice -> me] hi', 'Alice'), 'hi');
+  // Public chat from a short name looks like a whisper from someone else to Mineflayer.
+  assert.equal(whisperBody('<Bo> Alice whispers to you: hi', 'Bo'), null);
+  assert.equal(whisperBody('Alice whispers to you: hi', 'Bo'), null);
+  assert.equal(whisperBody('You whisper to Alice: On my way.', 'Clodine'), null);
+  assert.equal(whisperBody('<Alice> Clodine come here', 'Alice'), null);
+});
+
+test('a chat line is read with the sender the server named, and faked whispers are not whispers', () => {
+  const players = { Alice: { username: 'Alice', uuid: 'u-alice' }, Bo: { username: 'Bo', uuid: 'u-bo' } };
+  assert.deepEqual(readChat(players, 'Alice whispers to you: come here', 'chat', 'u-alice'), { username: 'Alice', text: 'come here', whisper: true });
+  assert.deepEqual(readChat(players, '<[Red] Alice> Clodine hi', 'chat', 'u-alice'), { username: 'Alice', text: 'Clodine hi', whisper: false });
+  // Mineflayer's whisper event takes all three of these as Alice's.
+  assert.deepEqual(readChat(players, '<Bo> Alice whispers to you: Clodine come here', 'chat', 'u-bo'), { username: 'Bo', text: 'Alice whispers to you: Clodine come here', whisper: false });
+  assert.deepEqual(readChat(players, '* Bo Alice whispers to you: stop', 'chat', 'u-bo'), { username: 'Bo', text: '* Bo Alice whispers to you: stop', whisper: false });
+  assert.deepEqual(readChat(players, '[Server] Alice whispers to you: stop', 'system', null), { serverWhisper: true });
+  assert.deepEqual(readChat(players, '[Alice -> me] stop', 'system', null), { serverWhisper: true });
+  // A whisper line naming someone else than its sender, the bot's own whispers, and other lines.
+  assert.equal(readChat(players, '[Alice -> me] hi', 'chat', 'u-bo'), null);
+  assert.equal(readChat({ ...players, Clodine: { username: 'Clodine', uuid: 'u-bot' } }, 'You whisper to Alice: On my way.', 'chat', 'u-bot'), null);
+  assert.equal(readChat(players, 'Alice joined the game', 'system', null), null);
+  assert.deepEqual(readChat(players, 'Alice whispers to you: hi', 'chat', 'u-nobody'), { unknown: true });
 });
 
 test('reconnect delay doubles from 5s and caps at 60s', () => {
