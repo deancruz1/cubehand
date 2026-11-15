@@ -37,6 +37,112 @@ export function inReach(bot, pos) {
   return bot.entity.position.offset(0, 1.6, 0).distanceTo(pos.offset(0.5, 0.5, 0.5)) <= REACH;
 }
 
+// The 26.1 data gives ores, obsidian and metal blocks the material incorrect_for_wooden_tool (a
+// tool tier tag) instead of mineable/pickaxe. That table only lists wooden tools, so a diamond
+// pickaxe digs them at the speed of a bare hand: deepslate diamond ore took 6.75 s instead of
+// 0.85 s. Every one of them drops only for a pickaxe, so they get the pickaxe's material.
+export function fixToolMaterials(registry) {
+  if (!registry?.blocksArray || registry.toolMaterialsFixed || !registry.materials?.['mineable/pickaxe']) return;
+  registry.toolMaterialsFixed = true;
+  for (const b of registry.blocksArray) {
+    if (typeof b.material === 'string' && b.material.startsWith('incorrect_for_')) b.material = 'mineable/pickaxe';
+  }
+}
+
+// Mineflayer works out how long a dig takes when it starts, five times longer when the bot isn't
+// on the ground, and waits all of it before telling the server the block is done. So a step or a
+// landing finishes first.
+export async function settle(bot, ms = 1000) {
+  const end = Date.now() + ms;
+  while (bot.entity?.onGround === false && Date.now() < end) await delay(50);
+}
+
+// Cells a player moves through: anything without a full hitbox (air, water, grass, torches) but
+// lava and fire, and doors, gates, trapdoors and ladders.
+export function isOpenBlock(block) {
+  if (!block || block.name === 'lava' || block.name === 'fire' || block.name === 'soul_fire') return false;
+  return block.boundingBox === 'empty' || /_door$|_fence_gate$|_trapdoor$|^ladder$/.test(block.name);
+}
+
+// Reads blocks by state id where the bot has a real world (much faster than blockAt over
+// thousands of cells), else through blockAt.
+export function blockReader(bot) {
+  const w = bot.world;
+  const byState = bot.registry?.blocksByStateId;
+  if (byState && typeof w?.getBlockStateId === 'function' && typeof w.getColumnAt === 'function') {
+    return (p) => (w.getColumnAt(p) ? byState[w.getBlockStateId(p)] ?? null : null);
+  }
+  return (p) => bot.blockAt(p, false);
+}
+
+const cellText = (p) => `${p.x},${p.y},${p.z}`;
+
+// The open space the bot can get to from where it stands, for telling which blocks a player
+// could see: a flood through open cells, nearest first, within range. When the flood runs out
+// before cap cells it is exact. When it doesn't (open ground, big caves), a cell past it still
+// counts when it belongs to an open space bigger than a pocket in the rock. add() joins a cell the
+// bot dug out.
+export function openSpace(bot, { range = 32, cap = 16000, pocket = 64 } = {}) {
+  const read = blockReader(bot);
+  const open = (p) => isOpenBlock(read(p));
+  const start = bot.entity.position.floored();
+  const reached = new Set([cellText(start)]);
+  const queue = [start];
+  let full = true;
+  for (let i = 0; i < queue.length; i++) {
+    if (reached.size >= cap) {
+      full = false;
+      break;
+    }
+    for (const f of FACES) {
+      const n = queue[i].plus(f);
+      if (Math.abs(n.x - start.x) > range + 1 || Math.abs(n.y - start.y) > range + 1 || Math.abs(n.z - start.z) > range + 1) continue;
+      const key = cellText(n);
+      if (reached.has(key) || !open(n)) continue;
+      reached.add(key);
+      queue.push(n);
+    }
+  }
+  const big = new Map();
+  const inBigSpace = (p) => {
+    const first = cellText(p);
+    if (big.has(first)) return big.get(first);
+    const seen = new Set([first]);
+    const cells = [p];
+    let found = false;
+    for (let i = 0; i < cells.length && !found; i++) {
+      for (const f of FACES) {
+        const n = cells[i].plus(f);
+        const key = cellText(n);
+        if (seen.has(key) || !open(n)) continue;
+        seen.add(key);
+        cells.push(n);
+        if (reached.has(key) || big.get(key) || seen.size >= pocket) found = true;
+      }
+    }
+    for (const key of seen) big.set(key, found);
+    return found;
+  };
+  const reaches = (p) => reached.has(cellText(p)) || (!full && open(p) && inBigSpace(p));
+  return {
+    add: (p) => reached.add(cellText(p)),
+    reaches,
+    // A block with a face on that space.
+    exposes: (p) => FACES.some((f) => reaches(p.plus(f)))
+  };
+}
+
+// Where a player strip mines for each ore.
+const ORE_LEVELS = { diamond: -59, redstone: -59, lapis: 0, gold: -16, iron: 16, copper: 48, coal: 96, ancient_debris: 15 };
+
+// What a player does when no ore of the kind is in sight.
+export function buriedText(query, buried) {
+  const kind = Object.keys(ORE_LEVELS).find((k) => query.replace(/^deepslate_/, '').startsWith(k));
+  const level = kind ? ` (${kind.replace('_', ' ')} is most common around y ${ORE_LEVELS[kind]})` : '';
+  const hidden = buried ? `, only ${buried} buried in rock where no player could see them` : '';
+  return `no exposed ${query} in reach on foot${hidden}. To find some, a player digs a 2-high tunnel or strip mine with dig_area${level}`;
+}
+
 export async function eat({ bot }, { food }) {
   const foods = bot.registry.foodsByName;
   const items = bot.inventory.items();
@@ -222,9 +328,19 @@ export function findNearest(bot, test, maxDistance, count = 1) {
     .slice(0, count);
 }
 
-export async function findBlock({ bot }, { block, maxDistance }) {
+// Ores only count where a player could see them, unless bot.xray is on.
+export async function findBlock({ bot, config }, { block, maxDistance }) {
   const range = Math.min(maxDistance ?? 64, 128);
-  const found = findNearest(bot, (name) => matchesBlockName(name, block), range, 5);
+  const isOreName = (name) => name.endsWith('_ore') || name === 'ancient_debris';
+  const matching = bot.registry.blocksArray.filter((b) => matchesBlockName(b.name, block));
+  const ores = matching.length > 0 && matching.every((b) => isOreName(b.name)) && config?.bot?.xray !== true;
+  let found = findNearest(bot, (name) => matchesBlockName(name, block), range, ores ? 300 : 5);
+  if (ores && found.length) {
+    const space = openSpace(bot, { range });
+    const all = found.length;
+    found = found.filter((p) => space.exposes(p)).slice(0, 5);
+    if (found.length === 0) return fail(`${buriedText(block, all)}.`);
+  }
   if (found.length === 0) return fail(`no ${block} within ${range} blocks`);
   const here = bot.entity.position;
   const lines = found.map((p) => `${bot.blockAt(p).name} at ${posText(p)} (${Math.round(p.distanceTo(here))} away)`);
@@ -275,6 +391,7 @@ export async function digBlock(ctx, pos, { anyTool = false } = {}) {
     }
   }
 
+  fixToolMaterials(bot.registry);
   const fresh = bot.blockAt(pos, false);
   if (!bot.canDigBlock(fresh)) return fail(`can't break ${fresh.name} at ${posText(pos)}`);
 
@@ -285,12 +402,14 @@ export async function digBlock(ctx, pos, { anyTool = false } = {}) {
     return fail(`need a better tool to break ${fresh.name} at ${posText(pos)}: with ${bot.heldItem?.name ?? 'my hand'} it would take long and drop nothing${needs.length ? `. It takes one of: ${needs.join(', ')}` : ''}`);
   }
 
+  await settle(bot);
+  if (signal?.aborted) return fail(`stopped before breaking ${fresh.name}`);
   const onAbort = () => bot.stopDigging();
   signal?.addEventListener('abort', onAbort);
   try {
     await bot.dig(fresh);
   } catch (err) {
-    return fail(`stopped breaking ${fresh.name}: ${err.message}`);
+    return { ...fail(`stopped breaking ${fresh.name}: ${err.message}`), error: err.message };
   } finally {
     signal?.removeEventListener('abort', onAbort);
   }

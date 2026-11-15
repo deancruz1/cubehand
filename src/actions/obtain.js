@@ -1,10 +1,10 @@
 import { Vec3 } from 'vec3';
 import { ok, fail, posText } from './util.js';
 import { takeItems, countItems, isPickable } from './containers.js';
-import { craft } from './crafting.js';
+import { craft, carriedItems } from './crafting.js';
 import { smelt, smeltOutput, fuelValue, pickFuel, furnaceKind } from './furnace.js';
-import { mine, chopTree, isTerrain, isBuildTerrain, isLogName, nextToBuild, treeLogTest, treeAt } from './mining.js';
-import { findNearest, matchesBlockName } from './blocks.js';
+import { mine, chopTree, isTerrain, isBuildTerrain, isLogName, nextToBuild, treeLogTest, treeAt, mineableBlocks } from './mining.js';
+import { findNearest, matchesBlockName, buriedText } from './blocks.js';
 import { partsDistance } from '../chests.js';
 
 const MAX_COUNT = 256;
@@ -135,9 +135,11 @@ function dedupe(missing) {
 //   table: a crafting table nearby; furnaces: names of free furnaces nearby
 //   logs: log names nearby, nearest first (for fuel); blocked: Map of 'take:x', 'craft:x',
 //     'smelt:x' or 'gather:x' to why that came up short before
+//   slots: { total, waste } inventory slots, and how many the carried part stacks take beyond
+//     full ones; stackSize(name). Without slots, room isn't checked.
 // Cheapest first: carried, then stored, then crafted or smelted from those, then gathered.
 export function planObtain(world, item, want) {
-  const { have, stored = new Map(), recipes, smeltsFrom = () => [], gather = () => null, blocked = new Map(), logs = [] } = world;
+  const { have, stored = new Map(), recipes, smeltsFrom = () => [], gather = () => null, blocked = new Map(), logs = [], slots = null, stackSize = () => 64 } = world;
   const optionCache = new Map();
   const memo = new Map();
   let nodes = 0;
@@ -201,6 +203,14 @@ export function planObtain(world, item, want) {
   function miss(s, name, count, path, reason, kind = 'none') {
     s.missing.push({ item: name, count, for: path[path.length - 1] ?? null, reason, kind });
     return false;
+  }
+
+  // craft won't start a batch when there's no room for what comes out.
+  function fits(s) {
+    if (!slots) return true;
+    let used = slots.waste;
+    for (const [n, c] of s.inv) if (c > 0) used += Math.ceil(c / stackSize(n));
+    return used <= slots.total;
   }
 
   const DEAD = new Set(['none', 'loop', 'depth', 'unmade']);
@@ -275,9 +285,13 @@ export function planObtain(world, item, want) {
       uses.push(['crafting_table', 1]);
       s.table = true;
     }
+    // The first batch comes out while its ingredients are still carried.
+    add(s.inv, name, r.count);
+    const roomFirst = fits(s);
+    add(s.inv, name, made - r.count);
     consume(s, uses);
-    add(s.inv, name, made);
-    s.steps.push({ action: 'craft', item: name, count: made, uses, gives: [[name, made]], needsTable: r.table, setsTable });
+    if (!roomFirst || !fits(s)) return miss(s, name, made, path.slice(0, -1), 'no room left in my inventory for them', 'room');
+    s.steps.push({ action: 'craft', item: name, count: made, uses, gives: [[name, made]], needsTable: r.table, setsTable, ingredients: r.needs.map(([ing]) => ing) });
     return true;
   }
 
@@ -501,12 +515,15 @@ function gatherFor(ctx, name) {
   const sources = reg.blocksArray.filter((b) => b.boundingBox === 'block' && !isLogName(b.name) && (isTerrain(b.name) || isBuildTerrain(b.name)) && dropsOf(b).includes(item.id));
   if (!sources.length) return null;
   const names = sources.map((b) => b.name);
-  const found = bot.findBlocks({ matching: sources.map((b) => b.id), maxDistance: GATHER_RANGE, count: 128 })
+  const near = bot.findBlocks({ matching: sources.map((b) => b.id), maxDistance: GATHER_RANGE, count: 128 })
     .filter((p) => {
       const b = getBlock(p);
       return b && names.includes(b.name) && !own(p, b.name) && !nextToBuild(getBlock, p, own);
     })
     .sort((a, b) => a.distanceTo(here) - b.distanceTo(here));
+  // Only what mine would take: blocks a player can see, not ore buried in the rock.
+  const found = mineableBlocks(ctx, near);
+  if (!found.length && near.length) return { action: 'mine', block: names[0], found: 0, reason: `${buriedText(names[0], near.length)} (within ${GATHER_RANGE} blocks)` };
   if (!found.length) return { action: 'mine', block: names[0], found: 0, reason: `no ${names.slice(0, 3).join(' or ')} within ${GATHER_RANGE} blocks away from builds` };
   const nearest = getBlock(found[0]).name;
   const query = mineQuery(names, nearest);
@@ -556,8 +573,21 @@ export function readWorld(ctx, blocked = new Map()) {
     table: findNearest(bot, (n) => n === 'crafting_table', GATHER_RANGE).length > 0,
     furnaces,
     logs,
-    blocked
+    blocked,
+    slots: inventorySlots(bot),
+    stackSize: (name) => reg.itemsByName[name]?.stackSize ?? 64
   };
+}
+
+// The main inventory and hotbar, and the slots part stacks take beyond the full stacks they'd
+// pack into.
+function inventorySlots(bot) {
+  const inv = bot.inventory;
+  if (inv.inventoryStart === undefined || !inv.slots) return null;
+  const items = inv.slots.slice(inv.inventoryStart, inv.inventoryEnd).filter(Boolean);
+  let packed = 0;
+  for (const [name, n] of countItems(items)) packed += Math.ceil(n / (bot.registry.itemsByName[name]?.stackSize ?? 64));
+  return { total: inv.inventoryEnd - inv.inventoryStart, waste: items.length - packed };
 }
 
 function listText(pairs) {
@@ -591,7 +621,7 @@ export function planText(plan) {
 export const RUNNERS = { take: takeItems, craft, smelt, mine, chop: chopTree };
 
 function carriedOf(bot, name) {
-  return bot.inventory.items().reduce((sum, i) => (i.name === name ? sum + i.count : sum), 0);
+  return carriedItems(bot).reduce((sum, i) => (i.name === name ? sum + i.count : sum), 0);
 }
 
 // What each step should add: [[name, count]].
@@ -602,7 +632,7 @@ function expected(st) {
 }
 
 function hasParts(bot, st) {
-  const counts = countItems(bot.inventory.items());
+  const counts = countItems(carriedItems(bot));
   if (st.tools && !st.tools.some((t) => get(counts, t) > 0)) return false;
   return st.uses.every(([n, c]) => get(counts, n) >= c);
 }
@@ -631,7 +661,7 @@ function doneText(st, got) {
 
 function runStep(ctx, st, run) {
   if (st.action === 'take') return run.take(ctx, { items: st.items.map(([item, count]) => ({ item, count })) });
-  if (st.action === 'craft') return run.craft(ctx, { item: st.item, count: st.count });
+  if (st.action === 'craft') return run.craft(ctx, { item: st.item, count: st.count, ingredients: st.ingredients });
   if (st.action === 'smelt') return run.smelt(ctx, { item: st.input, count: st.count, wait: true });
   if (st.action === 'mine') return run.mine(ctx, { block: st.block, count: st.count });
   return run.chop(ctx, st.pos ? { x: st.pos.x, y: st.pos.y, z: st.pos.z, trees: st.count, log: st.item } : { trees: st.count, log: st.item });

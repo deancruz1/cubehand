@@ -8,10 +8,33 @@ const { GoalLookAtBlock } = pathfinderPkg.goals;
 const MAX_DEPTH = 3;
 const TABLE_RANGE = 32;
 const BATCH = 8;
-const BATCH_MS = 20000;
+const MAX_NUDGES = 3;
+const TABLE_STUCK = 'the crafting table stopped responding';
+export const CRAFT_TIMING = { batchMs: 20000, quietMs: 3000, settleMs: 6000, tickMs: 1000 };
+// A batch at a table that timed out is still running inside mineflayer, and starting another
+// would mix its clicks with the first one's.
+const running = new WeakMap();
+
+// mineflayer copies a crafting window's slots into the inventory only when it closes, so while
+// one is open its slots are the up-to-date ones.
+export function carriedItems(bot) {
+  const w = bot.currentWindow;
+  if (!w?.type?.startsWith('minecraft:crafting')) return bot.inventory.items();
+  return w.slots.slice(w.inventoryStart, w.inventoryEnd).filter(Boolean);
+}
 
 function have(bot, id) {
-  return bot.inventory.items().filter((i) => i.type === id).reduce((sum, i) => sum + i.count, 0);
+  return carriedItems(bot).filter((i) => i.type === id).reduce((sum, i) => sum + i.count, 0);
+}
+
+const ingredientNames = (bot, r) => [...new Set(r.delta.filter((d) => d.count < 0).map((d) => bot.registry.items[d.id]?.name))].sort().join(',');
+
+// Only the recipe variant made from exactly these items, so planks of one wood that a plan keeps
+// for something else don't go into the sticks.
+function variant(bot, ingredients) {
+  if (!ingredients?.length) return () => true;
+  const want = [...new Set(ingredients)].sort().join(',');
+  return (r) => ingredientNames(bot, r) === want;
 }
 
 function inventoryText(bot) {
@@ -41,10 +64,71 @@ function roomFor(bot, item) {
   return room;
 }
 
+function windowState(bot) {
+  const w = bot.currentWindow;
+  if (!w) return 'closed';
+  return `${w.id}|${w.selectedItem?.count ?? 0}|${w.slots.map((s) => (s ? `${s.type}:${s.count}` : '')).join(',')}`;
+}
+
+// A resync sends every slot of the open window again, which wakes a click that is still waiting
+// for a slot update the server never sent. With no window open the craft is waiting for the
+// table to open, so it gets used again.
+function nudge(bot, table) {
+  const w = bot.currentWindow;
+  if (w) bot._syncWindow?.(w).catch(() => {});
+  else bot.activateBlock?.(table).catch(() => {});
+}
+
+function watchQuiet(bot, table, job) {
+  let last = windowState(bot);
+  let since = Date.now();
+  let nudges = 0;
+  return setInterval(() => {
+    const now = windowState(bot);
+    if (now !== last) {
+      last = now;
+      since = Date.now();
+      return;
+    }
+    if (job.done || nudges >= MAX_NUDGES || Date.now() - since < CRAFT_TIMING.quietMs) return;
+    nudges++;
+    since = Date.now();
+    nudge(bot, table);
+  }, CRAFT_TIMING.tickMs);
+}
+
+// Gives a batch that timed out one more resync and a few seconds to finish by itself.
+async function settle(bot, table, job) {
+  if (!job.done) nudge(bot, table);
+  const end = Date.now() + CRAFT_TIMING.settleMs;
+  while (!job.done && Date.now() < end) await delay(100);
+  return job.done;
+}
+
+async function runBatch(bot, recipe, n, table) {
+  if (!table) return guarded(() => bot.craft(recipe, n, undefined), { ms: CRAFT_TIMING.batchMs });
+  const job = { done: false };
+  job.promise = bot.craft(recipe, n, table).finally(() => {
+    job.done = true;
+  });
+  running.set(bot, job);
+  const watch = watchQuiet(bot, table, job);
+  try {
+    await guarded(() => job.promise, { ms: CRAFT_TIMING.batchMs });
+  } catch (err) {
+    if (!(err instanceof TimeoutError) || !(await settle(bot, table, job))) throw err;
+    await job.promise;
+  } finally {
+    clearInterval(watch);
+  }
+}
+
 // Crafts a few at a time and checks the inventory in between, so one lost click can't take the
 // rest of the job with it. Returns how many were really made.
-async function craftTimes(ctx, item, perCraft, times, table) {
+async function craftTimes(ctx, item, perCraft, times, table, pick = () => true) {
   const { bot } = ctx;
+  const job = running.get(bot);
+  if (table && job && !(await settle(bot, table, job))) return { count: 0, error: 'my last craft at the crafting table never finished, so the table is still busy' };
   const start = have(bot, item.id);
   const made = () => have(bot, item.id) - start;
   let error = null;
@@ -55,10 +139,10 @@ async function craftTimes(ctx, item, perCraft, times, table) {
       error = 'my inventory is full';
       break;
     }
-    let recipe = bot.recipesFor(item.id, null, n * perCraft, table)[0];
+    let recipe = bot.recipesFor(item.id, null, n * perCraft, table).filter(pick)[0];
     if (!recipe) {
       n = 1;
-      recipe = bot.recipesFor(item.id, null, perCraft, table)[0];
+      recipe = bot.recipesFor(item.id, null, perCraft, table).filter(pick)[0];
     }
     if (!recipe) {
       error = error ?? 'missing ingredient';
@@ -67,10 +151,10 @@ async function craftTimes(ctx, item, perCraft, times, table) {
     const before = have(bot, item.id);
     let stuck = false;
     try {
-      await guarded(() => bot.craft(recipe, n, table ?? undefined), { ms: BATCH_MS });
+      await runBatch(bot, recipe, n, table);
     } catch (err) {
       stuck = err instanceof TimeoutError;
-      error = stuck ? 'crafting got stuck' : err.message;
+      error = stuck ? (table ? TABLE_STUCK : 'crafting got stuck') : err.message;
       bot.emit('craft_trouble', `crafting ${item.name} failed (${err.message}). Inventory: ${inventoryText(bot)}`);
     }
     if (!table) await settleInventory(bot);
@@ -138,16 +222,19 @@ async function getTable(ctx, depth, notes) {
   return { block: bot.blockAt(spot) };
 }
 
-async function craftItem(ctx, name, count, depth, notes) {
+async function craftItem(ctx, name, count, depth, notes, ingredients) {
   const { bot } = ctx;
   const item = bot.registry.itemsByName[name];
   if (!item) return fail(`unknown item: ${name}`);
   if (depth > MAX_DEPTH) return fail(`too many steps to make ${name}`);
 
-  const all = bot.recipesAll(item.id, null, true);
+  let all = bot.recipesAll(item.id, null, true);
   if (all.length === 0) return fail(`${name} can't be crafted`);
+  let pick = variant(bot, ingredients);
+  if (!all.some(pick)) pick = () => true;
+  all = all.filter(pick);
 
-  let recipe = bot.recipesFor(item.id, null, count, null)[0];
+  let recipe = bot.recipesFor(item.id, null, count, null).filter(pick)[0];
   let table = null;
   if (!recipe) {
     const plan = bestRecipe(bot, all, count);
@@ -165,14 +252,14 @@ async function craftItem(ctx, name, count, depth, notes) {
         if (!walked.ok && !inReach(bot, table.position)) return fail(`couldn't get to the crafting table at ${posText(table.position)}`);
       }
     }
-    recipe = bot.recipesFor(item.id, null, count, table)[0];
+    recipe = bot.recipesFor(item.id, null, count, table).filter(pick)[0];
     if (!recipe) return fail(`still missing ingredients for ${name}`);
   }
 
   const times = Math.ceil(count / recipe.result.count);
   if (table) await bot.lookAt(table.position.offset(0.5, 0.5, 0.5)).catch(() => {});
   await pause(250, 600);
-  const made = await craftTimes(ctx, item, recipe.result.count, times, table);
+  const made = await craftTimes(ctx, item, recipe.result.count, times, table, pick);
   if (made.count === 0) return fail(`couldn't craft ${name}: ${made.error ?? 'nothing came out'}`);
   if (depth > 0) notes.push(`made ${made.count} ${name}`);
   if (made.count < count) return fail(`only crafted ${made.count} of ${count} ${name}: ${made.error ?? 'ran out'}`);
@@ -180,10 +267,11 @@ async function craftItem(ctx, name, count, depth, notes) {
 }
 
 // Crafts an item, making missing parts (planks, sticks...) and a crafting table first if needed.
-export async function craft(ctx, { item, count }) {
+// ingredients (from obtain's plan) picks the recipe variant made from exactly those items.
+export async function craft(ctx, { item, count, ingredients }) {
   const notes = [];
   await settleInventory(ctx.bot);
-  const result = await craftItem(ctx, item, Math.max(1, count ?? 1), 0, notes);
+  const result = await craftItem(ctx, item, Math.max(1, count ?? 1), 0, notes, ingredients);
   const steps = notes.length ? ` (first ${notes.join(', ')})` : '';
   return result.ok ? ok(`${result.message}${steps}`) : fail(`${result.message}${steps}`);
 }

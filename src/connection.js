@@ -1,6 +1,7 @@
 import mineflayer from 'mineflayer';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import { setupMovements } from './actions/movement.js';
+import { fixToolMaterials } from './actions/blocks.js';
 
 const { pathfinder } = pathfinderPkg;
 
@@ -68,6 +69,54 @@ export function isWhisperLine(line, sender) {
   );
 }
 
+// An item's enchantments as prismarine-block's digTime takes them: [{ name, lvl }]. From 1.20.5
+// on they come as an enchantments component, { enchantments: [{ id, level }] }, where id is the
+// enchantment's place in the registry the server sent (names). Anything unreadable counts as none.
+export function enchantList(item, names = [], registry = null) {
+  try {
+    const list = item?.enchants;
+    if (Array.isArray(list)) return list.filter((e) => e && typeof e.name === 'string');
+    if (!Array.isArray(list?.enchantments)) return [];
+    return list.enchantments
+      .map(({ id, level }) => ({ name: names[id] ?? registry?.enchantments?.[id]?.name ?? null, lvl: level }))
+      .filter((e) => typeof e.name === 'string' && e.lvl > 0);
+  } catch {
+    return [];
+  }
+}
+
+// Mineflayer's bot.digTime, with the held item's and helmet's enchantments read by enchantList.
+// Mineflayer's own throws for an enchanted tool from 1.20.5 on, so every dig fails.
+export function digTimeFor(bot, block, names = []) {
+  const held = bot.heldItem;
+  let helmet = null;
+  try {
+    helmet = bot.inventory.slots[bot.getEquipmentDestSlot('head')];
+  } catch {}
+  const enchantments = [...enchantList(held, names, bot.registry), ...enchantList(helmet, names, bot.registry)];
+  return block.digTime(
+    held ? held.type : null,
+    bot.game.gameMode === 'creative',
+    ['water', 'flowing_water'].includes(bot._getBlockAtEyeLevel()?.name),
+    !bot.entity.onGround,
+    enchantments,
+    bot.entity.effects
+  );
+}
+
+// Loaded after Mineflayer's own plugins, so it replaces their digTime. The enchantment names
+// come from the server's registry, in the order its ids count. The ores' tool materials are put
+// right here too (fixToolMaterials), so walks that dig through ore use the pickaxe's speed.
+export function safeDigTime(bot) {
+  fixToolMaterials(bot.registry);
+  let names = [];
+  bot._client.on('registry_data', (packet) => {
+    if (packet?.id?.replace(/^minecraft:/, '') !== 'enchantment' || !Array.isArray(packet.entries)) return;
+    names = packet.entries.map((e) => String(e.key).replace(/^minecraft:/, ''));
+  });
+  bot.digTime = (block) => digTimeFor(bot, block, names);
+}
+
 export function startBot(config, hooks = {}) {
   const log = hooks.log ?? console.log;
   let bot = null;
@@ -86,6 +135,7 @@ export function startBot(config, hooks = {}) {
       auth: 'offline'
     });
     bot.loadPlugin(pathfinder);
+    bot.loadPlugin(safeDigTime);
 
     // Real clients end every tick with tick_end on 1.21.2+. Mineflayer doesn't, and
     // without it the server kicks the bot for invalid_player_movement.

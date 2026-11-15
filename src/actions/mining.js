@@ -2,13 +2,15 @@ import { Vec3 } from 'vec3';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import { ok, fail, posText, pause } from './util.js';
 import { walkTo, watchScaffold, SCAFFOLD_BLOCKS, isNaturalBlock } from './movement.js';
-import { matchesBlockName, inReach, isProtected, findNearest, removeScaffold, placeOne, isReplaceable } from './blocks.js';
+import { matchesBlockName, inReach, isProtected, findNearest, removeScaffold, placeOne, isReplaceable, openSpace, buriedText, fixToolMaterials, settle } from './blocks.js';
 import { collectDrops, gainedText } from './items.js';
 
-const { GoalLookAtBlock } = pathfinderPkg.goals;
+const { GoalLookAtBlock, GoalNear } = pathfinderPkg.goals;
 
 const SEARCH_RANGE = 32;
 const MAX_BLOCKS = 64;
+// The most blocks one vein gives before she goes back.
+const VEIN_MAX = 32;
 // The block list from one search is reused until the bot has moved this far from where it
 // searched, or it is this old.
 const RESCAN_DISTANCE = 6;
@@ -66,6 +68,44 @@ export class DigSpot extends GoalLookAtBlock {
 
 export function isOre(name) {
   return name.endsWith('_ore') || name === 'ancient_debris';
+}
+
+// Deepslate and stone versions of an ore belong to the same vein.
+export function oreKind(name) {
+  return name.replace(/^deepslate_/, '');
+}
+
+// Whether mine may go for the block at p: in non-xray mode, only one with a face on open space
+// the bot can get to, which is what a player sees.
+export function mineableTest(ctx, range = SEARCH_RANGE) {
+  if (ctx.config?.bot?.xray === true) return { space: null, sees: () => true };
+  const space = openSpace(ctx.bot, { range });
+  return { space, sees: (p) => space.exposes(p) };
+}
+
+// Of blocks found through the rock, the ones mine would end up taking: those in sight, the rest
+// of the vein behind an ore in sight, and for other terrain all of it once any is in sight, since
+// every block dug opens up the next.
+export function mineableBlocks(ctx, found) {
+  if (ctx.config?.bot?.xray === true || !found.length) return found;
+  const { sees } = mineableTest(ctx);
+  const nameAt = (p) => ctx.bot.blockAt(p, false)?.name ?? '';
+  const seen = found.filter(sees);
+  const keep = new Set();
+  if (seen.some((p) => !isOre(nameAt(p)))) for (const p of found) if (!isOre(nameAt(p))) keep.add(String(p));
+  const byKey = new Map(found.map((p) => [String(p), p]));
+  const queue = seen.filter((p) => isOre(nameAt(p)));
+  for (const p of queue) keep.add(String(p));
+  for (let i = 0; i < queue.length; i++) {
+    const kind = oreKind(nameAt(queue[i]));
+    for (const f of FACES) {
+      const n = byKey.get(String(queue[i].plus(f)));
+      if (!n || keep.has(String(n)) || !isOre(nameAt(n)) || oreKind(nameAt(n)) !== kind) continue;
+      keep.add(String(n));
+      queue.push(n);
+    }
+  }
+  return found.filter((p) => keep.has(String(p)));
 }
 
 // What mine takes: the natural blocks the pathfinder may dig through, and ores. Anything else
@@ -199,18 +239,95 @@ function lavaNext(getName, pos) {
 }
 
 async function harvest(bot, block) {
-  const tool = bot.pathfinder.bestHarvestTool(block);
+  fixToolMaterials(bot.registry);
+  const fresh = bot.blockAt(block.position, false) ?? block;
+  const tool = bot.pathfinder.bestHarvestTool(fresh);
   if (tool) await bot.equip(tool, 'hand');
-  if (block.harvestTools && !block.canHarvest(bot.heldItem?.type ?? null)) return 'need a better tool';
-  await bot.dig(block);
+  if (fresh.harvestTools && !fresh.canHarvest(bot.heldItem?.type ?? null)) return 'need a better tool';
+  await settle(bot);
+  await bot.dig(fresh);
   return null;
 }
 
+// Mines the ore blocks in start and every block of the same ore joined to them face to face,
+// which come into view one by one as she digs, then walks back to back. Reaching a block of the
+// vein may mean digging a step or two, as a player following a vein would. onDug(pos, name) hears
+// of each block. Gives { taken: name to count, problem }.
+export async function mineVein(ctx, start, { back, onDug } = {}) {
+  const { bot, config, signal } = ctx;
+  const getName = (p) => bot.blockAt(p, false)?.name;
+  const first = getName(start[0]);
+  const taken = new Map();
+  if (!first || !isOre(first)) return { taken, problem: '' };
+  const kind = oreKind(first);
+  const sameOre = (p) => {
+    const name = getName(p);
+    return Boolean(name) && isOre(name) && oreKind(name) === kind;
+  };
+  const seen = new Set(start.map(String));
+  const todo = [...start];
+  let total = 0;
+  let problem = '';
+  while (todo.length && total < VEIN_MAX) {
+    if (signal?.aborted) {
+      problem = 'stopped';
+      break;
+    }
+    const eye = bot.entity.position.offset(0, 1.6, 0);
+    todo.sort((a, b) => a.offset(0.5, 0.5, 0.5).distanceTo(eye) - b.offset(0.5, 0.5, 0.5).distanceTo(eye));
+    const p = todo.shift();
+    if (!sameOre(p)) continue;
+    const name = getName(p);
+    // A drop under a block over her head is just the space she dug; under one at her feet or
+    // lower it is a cave she could fall into.
+    const low = p.y <= Math.floor(bot.entity.position.y);
+    if (isProtected(name, config.protectedBlocks) || ctx.placed?.has(p, name) || lavaNext(getName, p) || (low && dropBelow(getName, p) >= 3)) continue;
+    if (holdsUp(bot.entity.position, p, getName) || !inReach(bot, p)) {
+      await walkTo(ctx, new DigSpot(p, bot.world, { reach: 4 }), { place: false, dig: true });
+      if (signal?.aborted) {
+        problem = 'stopped';
+        break;
+      }
+    }
+    const at = bot.entity.position;
+    if (!inReach(bot, p) || holdsUp(at, p, getName) || dropsOnto(at, p, getName)) continue;
+    let result;
+    try {
+      result = await harvest(bot, bot.blockAt(p, false));
+    } catch {
+      continue;
+    }
+    if (result) {
+      problem = `${result} for ${name}`;
+      break;
+    }
+    total++;
+    taken.set(name, (taken.get(name) ?? 0) + 1);
+    onDug?.(p, name);
+    for (const f of FACES) {
+      const n = p.plus(f);
+      if (seen.has(String(n))) continue;
+      seen.add(String(n));
+      if (sameOre(n)) todo.push(n);
+    }
+    await pause(100, 300);
+  }
+  if (back && !signal?.aborted && bot.entity.position.distanceTo(back.offset(0.5, 0, 0.5)) > 1) {
+    const walked = await walkTo(ctx, new GoalNear(back.x, back.y, back.z, 0), { place: false });
+    if (!walked.ok && bot.entity.position.distanceTo(back.offset(0.5, 0, 0.5)) > 1) {
+      problem = problem || `could not walk back to ${posText(back)} after the vein: ${walked.message}`;
+    }
+  }
+  return { taken, problem };
+}
+
 // Mines like a player would: picks the easiest visible blocks nearby, walks around to reach
-// them, mines ores it comes across, and picks up the drops as it goes. Only terrain: never
-// its own blocks, and nothing that is part of or right next to a build.
+// them, mines ores it comes across with the rest of their vein, and picks up the drops as it
+// goes. Only blocks with a face on open space she can get to, unless bot.xray is on. Only
+// terrain: never its own blocks, and nothing that is part of or right next to a build.
 export async function mine(ctx, { block, count }) {
   const { bot, config, signal } = ctx;
+  const xray = config?.bot?.xray === true;
   const query = block ?? 'stone';
   const target = Math.min(count ?? 16, MAX_BLOCKS);
   if (!bot.registry.blocksArray.some((b) => matchesBlockName(b.name, query))) return fail(`unknown block: ${query}`);
@@ -228,16 +345,21 @@ export async function mine(ctx, { block, count }) {
   let mined = 0;
   let sinceCollect = 0;
   let failures = 0;
+  let failed = 0;
+  let lastThrown = null;
   const ores = new Map();
   const skip = new Set();
   let stopReason = '';
+  const progressText = () => `mined ${mined} of ${target} ${query}${failed ? `, ${failed} failed` : ''}`;
 
   // Searching the whole sphere is slow, so the blocks found are kept and checked again each
   // time, and the search only runs again when they run out or go stale.
   let pool = [];
   let scanned = null;
+  let sight = null;
   const scan = () => {
     scanned = { at: Date.now(), from: bot.entity.position.clone() };
+    sight = mineableTest(ctx);
     const found = bot.findBlocks({ matching: ids, maxDistance: SEARCH_RANGE, count: 300 }).filter((p) => !nextToBuild(getBlock, p, own));
     const strict = (p) => BUILD_TERRAIN.has(getName(p));
     if (!found.some(strict)) {
@@ -250,6 +372,8 @@ export async function mine(ctx, { block, count }) {
   };
   const stale = () => !scanned || Date.now() - scanned.at > RESCAN_MS || bot.entity.position.distanceTo(scanned.from) > RESCAN_DISTANCE;
 
+  let buried = 0;
+  let veinTrouble = '';
   while (mined < target) {
     if (signal?.aborted) {
       stopReason = 'stopped';
@@ -267,10 +391,12 @@ export async function mine(ctx, { block, count }) {
         const name = getName(p);
         return name && wanted(name);
       });
-      const candidates = pool
+      const seen = pool
         .filter((p) => !skip.has(p.toString()) && !p.equals(under) && !lavaNext(getName, p) && dropBelow(getName, p) < 3)
-        .map((p) => ({ pos: p, name: getName(p), exposed: isExposed(getName, p) }))
+        .map((p) => ({ pos: p, name: getName(p), exposed: xray ? isExposed(getName, p) : sight.sees(p) }))
         .filter((c) => !isProtected(c.name, config.protectedBlocks) && !ctx.placed?.has(c.pos, c.name));
+      const candidates = xray ? seen : seen.filter((c) => c.exposed);
+      buried = seen.filter((c) => !c.exposed && matches(c.name)).length;
 
       // Ores a player would notice and grab on the way: visible and within reach.
       bonus = candidates.filter((c) => !matches(c.name) && isOre(c.name) && c.exposed && inReach(bot, c.pos));
@@ -287,14 +413,16 @@ export async function mine(ctx, { block, count }) {
     }
     const pick = bonus[0] ?? main[0];
     if (!pick) {
-      stopReason = `no more ${query} within ${SEARCH_RANGE} blocks`;
+      stopReason = !xray && buried ? `${buriedText(query, buried)} (within ${SEARCH_RANGE} blocks)` : `no more ${query} within ${SEARCH_RANGE} blocks`;
       break;
     }
 
     if (holdsUp(bot.entity.position, pick.pos, getName) || !inReach(bot, pick.pos)) {
-      const walked = await walkTo(ctx, new DigSpot(pick.pos, bot.world, { reach: 4 }), { place: false, dig: true });
+      const walked = await walkTo(ctx, new DigSpot(pick.pos, bot.world, { reach: 4 }), { place: false, dig: xray });
       if (!walked.ok && !inReach(bot, pick.pos)) {
         skip.add(pick.pos.toString());
+        failed++;
+        ctx.status?.progress(progressText());
         if (++failures >= 5) {
           stopReason = `kept failing to reach blocks, last at ${posText(pick.pos)}`;
           break;
@@ -313,10 +441,11 @@ export async function mine(ctx, { block, count }) {
     const fresh = bot.blockAt(pick.pos, false);
     if (!fresh || fresh.name !== pick.name) continue;
     let problem;
+    let thrown = null;
     try {
       problem = await harvest(bot, fresh);
     } catch (err) {
-      problem = err.message;
+      problem = thrown = err.message;
     }
     if (problem) {
       skip.add(pick.pos.toString());
@@ -324,14 +453,40 @@ export async function mine(ctx, { block, count }) {
         stopReason = `I need a better tool to mine ${pick.name}`;
         break;
       }
+      failed++;
+      ctx.status?.progress(progressText());
+      if (thrown && thrown === lastThrown) {
+        stopReason = `breaking failed twice in a row with the same error: ${thrown}`;
+        break;
+      }
+      lastThrown = thrown;
       continue;
     }
 
     failures = 0;
+    lastThrown = null;
     last = pick.pos;
-    if (matches(pick.name)) mined++;
-    else ores.set(pick.name, (ores.get(pick.name) ?? 0) + 1);
-    ctx.status?.progress(`mined ${mined} of ${target} ${query}`);
+    const took = (p, name) => {
+      sight?.space?.add(p);
+      if (matches(name)) mined++;
+      else ores.set(name, (ores.get(name) ?? 0) + 1);
+      ctx.status?.progress(progressText());
+    };
+    took(pick.pos, pick.name);
+    if (isOre(pick.name)) {
+      const next = FACES.map((f) => pick.pos.plus(f)).filter((n) => {
+        const name = getName(n);
+        return name && isOre(name) && oreKind(name) === oreKind(pick.name);
+      });
+      if (next.length) {
+        const vein = await mineVein(ctx, next, { back: bot.entity.position.floored(), onDug: took });
+        if (vein.problem === 'stopped') {
+          stopReason = 'stopped';
+          break;
+        }
+        if (vein.problem) veinTrouble = vein.problem;
+      }
+    }
     if (++sinceCollect >= 4) {
       await collectDrops(ctx);
       sinceCollect = 0;
@@ -343,7 +498,7 @@ export async function mine(ctx, { block, count }) {
   const oreText = ores.size ? `, plus ${[...ores].map(([n, c]) => `${c} ${n}`).join(', ')}` : '';
   const gained = [...inventoryCounts(bot)].map(([n, c]) => [n, c - (before.get(n) ?? 0)]).filter(([, c]) => c > 0);
   const pickedUp = gained.length ? gained.map(([n, c]) => `${c} ${n}`).join(', ') : 'nothing';
-  const summary = `mined ${mined} ${query}${oreText}, picked up ${pickedUp}, now at ${posText(bot.entity.position)}`;
+  const summary = `mined ${mined} ${query}${oreText}, picked up ${pickedUp}, now at ${posText(bot.entity.position)}${veinTrouble ? `. In a vein: ${veinTrouble}` : ''}`;
   if (mined >= target) return ok(summary);
   return mined > 0 || ores.size ? ok(`${summary}. Stopped early: ${stopReason}`) : fail(`${summary}. ${stopReason}`);
 }

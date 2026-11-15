@@ -378,8 +378,45 @@ test('obtain reports a mine that came up empty and does not try it again', async
   assert.match(result.message, /missing 3 cobblestone \(mine: mined 0 stone, picked up nothing\. no more stone within 32 blocks\)/);
 });
 
+test('obtain only counts ore mine would take: in sight, with the vein behind it, not ore buried in rock', () => {
+  const blocks = {};
+  const encase = (x, y, z) => {
+    for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) blocks[`${x + dx},${y + dy},${z + dz}`] ??= 'stone';
+  };
+  blocks['10,60,10'] = 'iron_ore';
+  encase(10, 60, 10);
+  const buried = readWorld({ bot: fakeBot({ blocks }) }).gather('raw_iron');
+  assert.equal(buried.found, 0);
+  assert.match(buried.reason, /no exposed iron_ore in reach on foot, only 1 buried in rock.*iron is most common around y 16/);
+
+  // One face of it open, and a second ore joined behind it.
+  blocks['-10,60,10'] = 'iron_ore';
+  blocks['-11,60,10'] = 'deepslate_iron_ore';
+  encase(-10, 60, 10);
+  encase(-11, 60, 10);
+  delete blocks['-9,60,10'];
+  const seen = readWorld({ bot: fakeBot({ blocks }) }).gather('raw_iron');
+  assert.equal(seen.found, 2);
+});
+
 test('obtain answers at once when the item is already carried or unknown', async () => {
   const bot = fakeBot({ inventory: [['torch', 12]] });
   assert.deepEqual(await obtain({ bot }, { item: 'torch', count: 10 }), ok('already carrying 12 torch'));
   assert.equal((await obtain({ bot }, { item: 'banana' })).ok, false);
+});
+
+test('obtain plans no craft that would have no room to come out, and says so', () => {
+  const room = (stacks) => world({
+    have: new Map([['spruce_planks', 6], ['cobblestone', stacks * 64]]),
+    table: true,
+    slots: { total: 36, waste: 0 },
+    stackSize: (n) => registry.itemsByName[n].stackSize
+  });
+  const full = planObtain(room(35), 'spruce_slab', 12);
+  assert.equal(full.complete, false);
+  assert.deepEqual(full.steps, []);
+  assert.match(planText(full), /missing 12 spruce_slab \(no room left in my inventory for them\)/);
+  const fits = planObtain(room(34), 'spruce_slab', 12);
+  assert.deepEqual(actions(fits), ['craft 12 spruce_slab']);
+  assert.deepEqual(fits.steps[0].ingredients, ['spruce_planks']);
 });

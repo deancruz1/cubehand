@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { Vec3 } from 'vec3';
 import { mine, chopTree, isTerrain, isBuildTerrain, looksBuilt, buildGrid, nearBuilds, nextToBuild, notTerrainText, saplingFor, canPlantOn, treeLogTest, dropsOnto } from '../src/actions/mining.js';
+import { findBlock } from '../src/actions/blocks.js';
 import { collectDrops, skippedDrop } from '../src/actions/items.js';
 import { isTarget, leftAlone, sparedText } from '../src/actions/combat.js';
 import { setPauseScale } from '../src/actions/util.js';
@@ -15,7 +16,7 @@ setPauseScale(0);
 const NAMES = [
   'air', 'stone', 'smooth_stone', 'cobblestone', 'oak_planks', 'glass', 'dirt', 'grass_block', 'coal_ore', 'lava', 'oak_log',
   'oak_leaves', 'oak_sapling', 'sand', 'sandstone', 'smooth_sandstone', 'obsidian', 'oak_door', 'torch', 'cactus',
-  'birch_log', 'birch_leaves', 'stripped_oak_log', 'gravel'
+  'birch_log', 'birch_leaves', 'stripped_oak_log', 'gravel', 'diamond_ore', 'deepslate_diamond_ore'
 ];
 const key = (p) => `${p.x},${p.y},${p.z}`;
 const boxOf = (name) => (name === 'air' || name === 'torch' ? 'empty' : 'block');
@@ -126,6 +127,21 @@ test('mine leaves its own blocks, blocks next to a build and non-terrain matches
   // One search for the three blocks, and one more to make sure none are left.
   assert.equal(bot.scans, 2);
   assert.deepEqual(ctx.progress, ['mined 1 of 5 stone', 'mined 2 of 5 stone', 'mined 3 of 5 stone']);
+});
+
+test('mine stops after the same thrown error twice, says what it was and counts the failures', async () => {
+  const bot = fakeBot({ '2,64,0': 'stone', '-2,64,0': 'stone', '0,64,2': 'stone', '1,64,-2': 'stone' });
+  let tries = 0;
+  bot.dig = async () => {
+    tries++;
+    throw new TypeError('enchantments.concat is not a function');
+  };
+  const ctx = fakeCtx(bot);
+  const result = await mine(ctx, { count: 4 });
+  assert.equal(result.ok, false);
+  assert.equal(tries, 2);
+  assert.match(result.message, /mined 0 stone, .*\. breaking failed twice in a row with the same error: enchantments.concat is not a function$/);
+  assert.deepEqual(ctx.progress, ['mined 0 of 4 stone, 1 failed', 'mined 0 of 4 stone, 2 failed']);
 });
 
 test('mine refuses building blocks and says what to do instead', async () => {
@@ -316,6 +332,56 @@ test('mine skips the block it stands on, the roof of a cave and a block with gra
   assert.equal(bot.world.get('0,66,0'), 'stone');
   assert.equal(dropsOnto(bot.entity.position, new Vec3(0, 66, 0), (p) => bot.blockAt(p).name), true);
   assert.equal(dropsOnto(bot.entity.position, new Vec3(-2, 66, 0), (p) => bot.blockAt(p).name), false);
+});
+
+// Walks stand next to a block to dig (the cell west of it, a block up) or on the spot asked for.
+function walking(bot) {
+  bot.walks = [];
+  bot.pathfinder.setGoal = () => {};
+  bot.pathfinder.isMining = () => false;
+  bot.pathfinder.isBuilding = () => false;
+  bot.pathfinder.goto = async (goal) => {
+    const to = goal.pos ? goal.pos.offset(-1, 1, 0) : new Vec3(goal.x, goal.y, goal.z);
+    bot.walks.push(`${to.x},${to.y},${to.z}`);
+    bot.entity.position = to.offset(0.5, 0, 0.5);
+  };
+  return bot;
+}
+
+test('mine leaves ore buried in the rock and says how a player would find some', async () => {
+  const bot = walking(fakeBot({ '3,60,0': 'diamond_ore' }));
+  const result = await mine(fakeCtx(bot), { block: 'diamond_ore', count: 4 });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /mined 0 diamond_ore.*no exposed diamond_ore in reach on foot, only 1 buried in rock where no player could see them\. To find some, a player digs a 2-high tunnel or strip mine with dig_area \(diamond is most common around y -59\)/);
+  assert.equal(bot.world.get('3,60,0'), 'diamond_ore');
+  assert.deepEqual(bot.walks, []);
+
+  const found = await findBlock(fakeCtx(bot), { block: 'diamond_ore' });
+  assert.equal(found.ok, false);
+  assert.match(found.message, /no exposed diamond_ore/);
+});
+
+test('mine takes an exposed ore with the rest of its vein, then walks back to where the vein began', async () => {
+  const bot = walking(fakeBot({
+    '2,63,0': 'diamond_ore', '2,62,0': 'deepslate_diamond_ore', '3,62,0': 'diamond_ore', '4,61,0': 'stone', '5,62,0': 'diamond_ore', '4,62,0': 'diamond_ore',
+    '9,60,9': 'diamond_ore'
+  }));
+  const result = await mine(fakeCtx(bot), { block: 'diamond_ore', count: 1 });
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^mined 5 diamond_ore, .*now at 0 64 0/);
+  for (const k of ['2,63,0', '2,62,0', '3,62,0', '4,62,0', '5,62,0']) assert.equal(bot.world.get(k), 'air', k);
+  assert.equal(bot.world.get('9,60,9'), 'diamond_ore');
+  assert.equal(bot.walks.at(-1), '0,64,0');
+});
+
+test('bot.xray on lets mine and find_block go for ore through the rock again', async () => {
+  const bot = walking(fakeBot({ '3,60,0': 'diamond_ore' }));
+  const ctx = { ...fakeCtx(bot), config: { protectedBlocks: [], bot: { xray: true }, limits: { moveTimeoutSeconds: 5 } } };
+  const found = await findBlock(ctx, { block: 'diamond_ore' });
+  assert.match(found.message, /diamond_ore at 3 60 0/);
+  const result = await mine(ctx, { block: 'diamond_ore', count: 1 });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(bot.world.get('3,60,0'), 'air');
 });
 
 test('saplings match the wood and only go on soil', () => {
