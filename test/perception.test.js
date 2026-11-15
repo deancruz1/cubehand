@@ -10,7 +10,8 @@ import {
   blocksSummary,
   entitiesSummary,
   statusSummary,
-  facingFromYaw
+  facingFromYaw,
+  scaffoldSummary
 } from '../src/perception.js';
 
 test('inventory groups items by name', () => {
@@ -143,6 +144,14 @@ test('status shows whole-number position and labels', () => {
   assert.match(text, /Position: 10 64 -4/);
   assert.match(text, /Health: 19\/20, Food: 17\/20/);
   assert.match(text, /Time: night/);
+});
+
+test('walk scaffolding left standing gets a line, and none when there is none', () => {
+  const here = new Vec3(0.5, 64, 0.5);
+  assert.equal(scaffoldSummary([], here), null);
+  const entries = [{ x: 10, y: 64, z: 0, name: 'cobblestone' }, { x: 3, y: 65, z: 0, name: 'dirt' }];
+  assert.equal(scaffoldSummary(entries, here), 'Scaffolding left standing from walks: 2 blocks, nearest dirt at 3 65 0 (3 away). It comes down in free time.');
+  assert.match(scaffoldSummary(entries.slice(0, 1), here), /: 1 block, nearest cobblestone at 10 64 0 \(10 away\)/);
 });
 
 test('facing from yaw', () => {

@@ -7,14 +7,22 @@ import Move from 'mineflayer-pathfinder/lib/move.js';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import { setImmediate } from 'node:timers/promises';
 import { EventEmitter } from 'node:events';
-import { setupMovements, walkTo, walkPatience, followPlayer, planRoute, centreRawSteps, playerPlaced } from '../src/actions/movement.js';
+import { setupMovements, walkTo, walkPatience, followPlayer, planRoute, centreRawSteps, playerPlaced, ladderEntrySteps, doorOpener, underBot, watchScaffold } from '../src/actions/movement.js';
 import { DigSpot } from '../src/actions/mining.js';
+import { placeOne, removeScaffold } from '../src/actions/blocks.js';
+import { watchBuildScaffold, buildZone } from '../src/actions/build.js';
+import { Idle } from '../src/idle.js';
 import { pause, delay, setPauseScale } from '../src/actions/util.js';
+import { ScaffoldLog } from '../src/placed.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { rmSync } from 'node:fs';
 
 // Real 26.1 blocks, loaded the way mineflayer loads them.
 const require = createRequire(createRequire(import.meta.url).resolve('mineflayer'));
 const registry = require('prismarine-registry')('26.1');
 const Block = require('prismarine-block')(registry);
+const { Physics, PlayerState } = require('prismarine-physics');
 const { GoalBlock, GoalNear, GoalFollow } = pathfinderPkg.goals;
 
 function world() {
@@ -490,4 +498,599 @@ test('a scale of 0 leaves the waits the bot depends on alone', async (t) => {
   await setImmediate();
   assert.equal(done, true);
   setPauseScale(1);
+});
+
+// A bot moved by the real physics, one tick per turn of the event loop, with the real
+// pathfinder walking it. press(block) stands in for the server when a button, lever or door
+// is used, and later(ticks, fn) runs fn that many ticks on. With building set, blocks it places
+// and digs really change in w, as the server would answer.
+function physicsBot(w, at, { items = [], press = () => {}, building = false } = {}) {
+  const bot = new EventEmitter();
+  bot.setMaxListeners(50);
+  const controlState = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false };
+  const timers = [];
+  let ticks = 0;
+  Object.assign(bot, {
+    version: '26.1', registry, game: { minY: -64 }, entities: {}, players: {},
+    entity: { position: at.clone(), velocity: new Vec3(0, 0, 0), onGround: true, effects: {}, height: 1.8, eyeHeight: 1.62, yaw: 0, pitch: 0 },
+    jumpTicks: 0, jumpQueued: false, fireworkRocketDuration: 0,
+    inventory: { items: () => items.map(([name, count]) => ({ name, count, type: registry.itemsByName[name].id })), slots: [] },
+    blockAt: (p) => w.get(p),
+    controlState,
+    setControlState: (k, v) => { controlState[k] = v; },
+    clearControlStates: () => { for (const k of Object.keys(controlState)) controlState[k] = false; },
+    look: async (yaw, pitch) => { bot.entity.yaw = yaw; bot.entity.pitch = pitch; },
+    lookAt: async (p) => {
+      const d = p.minus(bot.entity.position.offset(0, 1.62, 0));
+      bot.entity.yaw = Math.atan2(-d.x, -d.z);
+      bot.entity.pitch = Math.atan2(d.y, Math.sqrt(d.x * d.x + d.z * d.z));
+    },
+    equip: async () => {},
+    stopDigging() {},
+    dug: [],
+    pressed: [],
+    dig: async (b) => { bot.dug.push(b.position.toString()); },
+    activateBlock: async (b) => { bot.pressed.push(b.name); press(b); },
+    later: (n, fn) => timers.push({ at: ticks + n, fn })
+  });
+  if (building) {
+    const change = (p, name) => {
+      const old = w.get(p);
+      w.set(p.x, p.y, p.z, name);
+      bot.emit('blockUpdate', old, w.get(p));
+    };
+    Object.assign(bot, {
+      placed: [],
+      equip: async (item) => { bot.heldItem = item; },
+      canDigBlock: () => true,
+      placeBlock: async (ref, face) => {
+        const p = ref.position.plus(face);
+        bot.placed.push(p.toString());
+        change(p, bot.heldItem.name);
+      },
+      dig: async (b) => {
+        bot.dug.push(b.position.toString());
+        change(b.position, 'air');
+      }
+    });
+  }
+  bot.world = {
+    raycast: (start, dir, range) => {
+      for (let t = 0; t <= range; t += 0.05) {
+        const b = w.get(start.plus(dir.scaled(t)));
+        if (b.boundingBox === 'block') return b;
+      }
+      return null;
+    }
+  };
+  const blocks = { getBlock: (p) => w.get(p) };
+  bot.physics = Physics(registry, blocks);
+  pathfinderPkg.pathfinder(bot);
+  setupMovements(bot);
+  bot.tick = () => {
+    ticks++;
+    for (const t of timers.filter((t) => t.at <= ticks)) {
+      timers.splice(timers.indexOf(t), 1);
+      t.fn();
+    }
+    bot.physics.simulatePlayer(new PlayerState(bot, controlState), blocks).apply(bot);
+    bot.emit('physicsTick');
+  };
+  return bot;
+}
+
+async function run(bot, walk, ticks = 800) {
+  let done = null;
+  walk.then((r) => { done = r; });
+  for (let i = 0; i < ticks && !done; i++) {
+    await setImmediate();
+    bot.tick();
+  }
+  if (!done) {
+    bot.pathfinder.setGoal(null);
+    done = await walk;
+  }
+  return done;
+}
+
+const limits = { limits: { moveTimeoutSeconds: 90 } };
+
+// A tunnel with its floor at y 55, a ladder at (0, 56..59, 0) on a wall behind it, and the
+// way out on the grass at y 60.
+function ladderShaft(facing, snow) {
+  const w = world();
+  const back = { east: [-1, 0], west: [1, 0], south: [0, -1], north: [0, 1] }[facing];
+  for (let x = -4; x <= 4; x++) {
+    for (let z = -4; z <= 4; z++) {
+      w.set(x, 55, z, 'stone');
+      w.set(x, 58, z, 'stone');
+      w.set(x, 59, z, 'grass_block');
+      if (snow) w.set(x, 56, z, 'snow', { layers: 1 });
+    }
+  }
+  for (let y = 56; y <= 59; y++) {
+    w.set(0, y, 0, 'ladder', { facing, waterlogged: 'false' });
+    w.set(back[0], y, back[1], 'stone');
+  }
+  return { w, out: new GoalBlock(-back[0], 60, -back[1]) };
+}
+
+test('a ladder is climbed from in front and from either side, with snow at the feet or not', async () => {
+  for (const [facing, from] of [['east', [1, 0]], ['east', [0, 1]], ['east', [0, -1]], ['north', [1, 0]], ['south', [-1, 0]]]) {
+    for (const snow of [false, true]) {
+      const { w, out } = ladderShaft(facing, snow);
+      const bot = physicsBot(w, new Vec3(0.5 + from[0], 56, 0.5 + from[1]));
+      const result = await run(bot, walkTo({ bot, config: limits }, out, { place: false }));
+      assert.equal(result.ok, true, `${facing} ladder from ${from}${snow ? ' on snow' : ''}: ${result.message}`);
+    }
+  }
+});
+
+test('a step up a ladder from the side gets a step into the ladder block first, once', () => {
+  const { w } = ladderShaft('east', true);
+  const up = new Move(0, 56, 0, 0, 1);
+  up.x = 0.3;
+  up.y = 57;
+  up.z = 0.5;
+  const path = [up];
+  const from = new Vec3(0.5, 56, 1.3);
+  ladderEntrySteps(path, from, (p) => w.get(p));
+  assert.deepEqual(path.map((n) => [n.x, n.y, n.z]), [[0.5, 56, 0.5], [0.3, 57, 0.5]]);
+  ladderEntrySteps(path, from, (p) => w.get(p));
+  assert.equal(path.length, 2);
+});
+
+// A wall of deepslate bricks along z = 0 with an iron door at x 0, natural stone right beside
+// and over the door, and the bot to the north.
+function ironDoorWall(opener) {
+  const w = world();
+  slab(w, -6, 6, -6, 6);
+  for (let x = -6; x <= 6; x++) for (let y = 64; y <= 67; y++) w.set(x, y, 0, x === 1 || x === -1 || y === 66 ? 'stone' : 'deepslate_bricks');
+  const door = (open) => {
+    for (const [y, half] of [[64, 'lower'], [65, 'upper']]) w.set(0, y, 0, 'iron_door', { facing: 'south', half, hinge: 'left', open: String(open), powered: String(open) });
+  };
+  door(false);
+  if (opener === 'button') w.set(1, 65, -1, 'stone_button', { face: 'wall', facing: 'north', powered: 'false' });
+  if (opener === 'far button') w.set(1, 65, 1, 'stone_button', { face: 'wall', facing: 'south', powered: 'false' });
+  if (opener === 'lever') w.set(-1, 65, -1, 'lever', { face: 'wall', facing: 'north', powered: 'false' });
+  if (opener === 'plate') w.set(0, 64, -1, 'stone_pressure_plate', { powered: 'false' });
+  return { w, door };
+}
+
+// The server's side of it: a stone button holds the door open for 20 ticks, a lever until it
+// is switched back, a plate while someone stands on it and 20 ticks after.
+function ironDoorBot(opener) {
+  const { w, door } = ironDoorWall(opener);
+  let bot;
+  const setDoor = (open) => {
+    const old = [w.get(new Vec3(0, 64, 0)), w.get(new Vec3(0, 65, 0))];
+    door(open);
+    for (const b of old) bot.emit('blockUpdate', b, w.get(b.position));
+  };
+  bot = physicsBot(w, new Vec3(0.5, 64, -3.5), {
+    items: [['iron_pickaxe', 1]],
+    press: (b) => {
+      if (b.name === 'stone_button') {
+        setDoor(true);
+        bot.later(20, () => setDoor(false));
+      } else if (b.name === 'lever') {
+        const on = String(b.getProperties().powered) !== 'true';
+        w.set(b.position.x, b.position.y, b.position.z, 'lever', { face: 'wall', facing: 'north', powered: String(on) });
+        setDoor(on);
+      }
+    }
+  });
+  if (opener === 'plate') {
+    let on = false;
+    bot.on('physicsTick', () => {
+      const p = bot.entity.position;
+      const onPlate = Math.floor(p.x) === 0 && Math.floor(p.z) === -1 && Math.abs(p.y - 64) < 0.1;
+      if (onPlate && !on) setDoor(true);
+      if (!onPlate && on) bot.later(20, () => setDoor(false));
+      on = onPlate;
+    });
+  }
+  return { w, bot };
+}
+
+const through = new GoalBlock(0, 64, 3);
+
+test('an iron door with a button on this side: she presses it and goes through, digging nothing', async () => {
+  const { bot } = ironDoorBot('button');
+  const plan = await planRoute(bot, through, true);
+  assert.equal(plan.status, 'success');
+  assert.ok(steps(plan.path).some((c) => c.startsWith('0,') && c.endsWith(',0')));
+  assert.equal(builds(plan.path), false);
+  const result = await run(bot, walkTo({ bot, config: limits }, through, { place: false }));
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(bot.pressed, ['stone_button']);
+  assert.deepEqual(bot.dug, []);
+});
+
+test('an iron door with a pressure plate in front opens by walking onto it', async () => {
+  const { bot } = ironDoorBot('plate');
+  const result = await run(bot, walkTo({ bot, config: limits }, through, { place: false }));
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(bot.pressed, []);
+});
+
+test('an iron door with a lever: she switches it on, and says so when it is out of reach on the far side', async () => {
+  const { w, bot } = ironDoorBot('lever');
+  const result = await run(bot, walkTo({ bot, config: limits }, through, { place: false }));
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(bot.pressed, ['lever']);
+  assert.match(result.message, /I left the lever at -1 65 -1 on, so the iron door at 0 64 0 stays open/);
+  assert.equal(String(w.get(new Vec3(-1, 65, -1)).getProperties().powered), 'true');
+});
+
+test('an iron door that only opens from the far side: no digging round it, and the walk says why', async () => {
+  for (const opener of [null, 'far button']) {
+    const { w, bot } = ironDoorBot(opener);
+    assert.equal(doorOpener(bot, new Vec3(0, 64, 0), new Vec3(0, 64, -1)), null);
+    // The stone beside the door is terrain the walk could dig, but it touches the door.
+    const beside = w.get(new Vec3(1, 64, 0));
+    const m = bot.planModes.walk;
+    assert.equal(Object.getPrototypeOf(Object.getPrototypeOf(m)).safeToBreak.call(m, beside), true);
+    assert.equal(m.safeToBreak(beside), false);
+    const result = await run(bot, walkTo({ bot, config: limits }, through));
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'no_route');
+    assert.match(result.message, /There is an iron door at 0 64 0 with no button, lever or pressure plate on this side/);
+    assert.deepEqual(bot.dug, []);
+  }
+});
+
+test('following never digs: through an iron door with a button, and behind one without, she waits', async () => {
+  const player = { position: new Vec3(0.5, 64, 3.5) };
+  const follow = async (opener) => {
+    const { bot } = ironDoorBot(opener);
+    bot.pathfinder.setGoal(new GoalFollow(player, 1), true);
+    let caught = false;
+    for (let i = 0; i < 400 && !caught; i++) {
+      await setImmediate();
+      bot.tick();
+      caught = bot.entity.position.distanceTo(player.position) <= 1.5;
+    }
+    assert.equal(bot.pathfinder.movements.canDig, false);
+    assert.equal(bot.moveMode, 'follow');
+    bot.pathfinder.setGoal(null);
+    return { bot, caught };
+  };
+  const open = await follow('button');
+  assert.equal(open.caught, true);
+  assert.deepEqual(open.bot.pressed, ['stone_button']);
+  const shut = await follow(null);
+  assert.equal(shut.caught, false);
+  assert.deepEqual(shut.bot.dug, []);
+  assert.ok(shut.bot.entity.position.z < 0);
+
+  // Out in the open with only a dirt wall between, a follow search hands out nothing that digs.
+  const w = world();
+  slab(w, -8, 8, -4, 4);
+  for (let x = -8; x <= 8; x++) for (let y = 64; y <= 66; y++) w.set(x, y, 0, 'dirt');
+  const bot = liveBot(w, { at: new Vec3(0.5, 64, -2.5) });
+  bot.players.Steve = { username: 'Steve', entity: { position: new Vec3(0.5, 64, 2.5) } };
+  followPlayer({ bot }, { player: 'Steve' });
+  const result = bot.pathfinder.getPathFromTo(bot.pathfinder.movements, bot.entity.position, bot.pathfinder.goal, { tickTimeout: 10000 }).next().value.result;
+  assert.equal(builds(result.path), false);
+});
+
+let logs = 0;
+// A ScaffoldLog in a temp file, removed again by done().
+function tempLog() {
+  const path = join(tmpdir(), `scaffold-test-${process.pid}-${logs++}.json`);
+  const log = new ScaffoldLog(path);
+  log.done = () => {
+    log.save();
+    rmSync(path, { force: true });
+  };
+  return log;
+}
+
+const logged = (log) => [...log.blocks.values()].map((e) => new Vec3(e.x, e.y, e.z).toString());
+
+// A wall three blocks high at x 3 the whole way across, with no way up but a pillar.
+function wallWorld() {
+  const w = world();
+  w.floor();
+  for (let z = -4; z <= 4; z++) for (let y = 64; y <= 66; y++) w.set(3, y, z, 'stone');
+  return w;
+}
+
+test('a walk that pillars up keeps note of its own blocks only, and takes down the ones in reach once there', async () => {
+  const w = wallWorld();
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5), { items: [['dirt', 20]], building: true });
+  bot.walkScaffold = tempLog();
+  try {
+    // Someone else's block turns up while she is putting hers down.
+    const other = new Vec3(-3, 64, -3);
+    bot.on('physicsTick', () => {
+      if (!bot.pathfinder.isBuilding() || w.get(other).name !== 'air') return;
+      const old = w.get(other);
+      w.set(other.x, other.y, other.z, 'cobblestone');
+      bot.emit('blockUpdate', old, w.get(other));
+    });
+    const result = await run(bot, walkTo({ bot, config: limits }, new GoalNear(3, 67, 0, 0)));
+    assert.equal(result.ok, true, result.message);
+    assert.equal(w.get(other).name, 'cobblestone');
+    assert.ok(bot.placed.length >= 3, bot.placed.join(' '));
+    // Every block she put down was either taken down, top first, or is still on the list.
+    const left = logged(bot.walkScaffold);
+    assert.deepEqual([...bot.dug, ...left].sort(), [...bot.placed].sort());
+    assert.ok(bot.dug.length > 0);
+    const ys = bot.dug.map((s) => Number(s.split(', ')[1]));
+    assert.deepEqual(ys, [...ys].sort((a, b) => b - a));
+    // What's left is out of reach or under her, and is still the dirt she put down.
+    const eye = bot.entity.position.offset(0, 1.6, 0);
+    for (const e of bot.walkScaffold.blocks.values()) {
+      const p = new Vec3(e.x, e.y, e.z);
+      assert.ok(eye.distanceTo(p.offset(0.5, 0.5, 0.5)) > 4.5 || underBot(bot, p), p.toString());
+      assert.equal(e.name, 'dirt');
+      assert.equal(e.around.length, 6);
+    }
+  } finally {
+    bot.walkScaffold.done();
+  }
+});
+
+// A platform three blocks high from x 3 to 6, to be climbed onto and walked across.
+function platformWorld() {
+  const w = world();
+  slab(w, -4, 8, -4, 4);
+  for (let x = 3; x <= 6; x++) for (let z = -4; z <= 4; z++) for (let y = 64; y <= 66; y++) w.set(x, y, z, 'stone');
+  return w;
+}
+
+test('a walk stopped for something else leaves its scaffolding for later', async () => {
+  const w = platformWorld();
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5), { items: [['dirt', 20]], building: true });
+  bot.walkScaffold = tempLog();
+  try {
+    const stop = new AbortController();
+    // Stopped once she is up, with her pillar right behind her.
+    bot.on('physicsTick', () => {
+      const p = bot.entity.position;
+      if (p.x >= 3 && p.y >= 66.9 && !stop.signal.aborted) stop.abort();
+    });
+    const result = await run(bot, walkTo({ bot, config: limits, signal: stop.signal }, new GoalNear(6, 67, 0, 0)));
+    assert.equal(result.reason, 'stopped');
+    assert.ok(bot.placed.length > 0);
+    assert.deepEqual(bot.dug, []);
+    assert.deepEqual(logged(bot.walkScaffold).sort(), [...bot.placed].sort());
+  } finally {
+    bot.walkScaffold.done();
+  }
+});
+
+test("blocks the place tool puts down or a build's watcher claims are no walk scaffolding", async () => {
+  const w = wallWorld();
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5), { items: [['dirt', 20]], building: true });
+  bot.walkScaffold = tempLog();
+  try {
+    const placed = await placeOne({ bot, config: limits }, 'dirt', new Vec3(-2, 64, 0));
+    assert.equal(placed.ok, true, placed.message);
+    assert.equal(w.get(new Vec3(-2, 64, 0)).name, 'dirt');
+    assert.equal(bot.walkScaffold.blocks.size, 0);
+
+    bot.buildZone = { min: new Vec3(-4, 60, -4), max: new Vec3(4, 72, 4) };
+    const watch = watchScaffold(bot, () => true);
+    const result = await run(bot, walkTo({ bot, config: limits }, new GoalNear(3, 67, 0, 0)));
+    watch.stop();
+    bot.buildZone = null;
+    assert.equal(result.ok, true, result.message);
+    assert.ok(watch.placed.length >= 3);
+    assert.equal(bot.walkScaffold.blocks.size, 0);
+    assert.deepEqual(bot.dug, []);
+    assert.equal(bot.scaffoldClaims.size, 0);
+  } finally {
+    bot.walkScaffold.done();
+  }
+});
+
+test('with a player close by, her pillar is not taken for theirs, and a block they put down is', async () => {
+  const w = wallWorld();
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5), { items: [['dirt', 20]], building: true });
+  bot.players.Steve = { username: 'Steve', entity: { position: new Vec3(-2.5, 64, 2.5) } };
+  const theirs = new Vec3(-3, 64, 3);
+  bot.on('physicsTick', () => {
+    if (!bot.pathfinder.isBuilding() || w.get(theirs).name !== 'air') return;
+    const old = w.get(theirs);
+    w.set(theirs.x, theirs.y, theirs.z, 'dirt');
+    bot.emit('blockUpdate', old, w.get(theirs));
+  });
+  const result = await run(bot, walkTo({ bot, config: limits }, new GoalNear(3, 67, 0, 0)));
+  assert.equal(result.ok, true, result.message);
+  assert.ok(bot.placed.length >= 3);
+  for (const s of bot.placed) {
+    const p = new Vec3(...s.slice(1, -1).split(', ').map(Number));
+    assert.equal(w.get(p).name, 'dirt');
+    assert.equal(playerPlaced(bot, p), false, s);
+  }
+  assert.equal(playerPlaced(bot, theirs), true);
+});
+
+test("a build's watcher claims the scaffolding its walks put down, and the builder takes it down", async () => {
+  const w = wallWorld();
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5), { items: [['dirt', 20]], building: true });
+  bot.walkScaffold = tempLog();
+  try {
+    const site = { min: new Vec3(2, 64, -1), max: new Vec3(4, 66, 1), ground: 64 };
+    bot.buildZone = buildZone(site, site.ground);
+    const scaffold = watchBuildScaffold(bot, site, new Set());
+    const result = await run(bot, walkTo({ bot, config: limits }, new GoalNear(3, 67, 0, 0)));
+    scaffold.stop();
+    bot.buildZone = null;
+    assert.equal(result.ok, true, result.message);
+    const claimed = scaffold.leftover([]).map((p) => p.toString());
+    assert.equal(claimed.length, 3);
+    assert.deepEqual(claimed.sort(), [...bot.placed].sort());
+    assert.equal(bot.walkScaffold.blocks.size, 0);
+    assert.deepEqual(bot.dug, []);
+
+    const removed = await run(bot, removeScaffold({ bot, config: limits }, scaffold.leftover([])), 1500);
+    assert.equal(removed, 3);
+    for (const s of bot.placed) assert.equal(w.get(new Vec3(...s.slice(1, -1).split(', ').map(Number))).name, 'air', s);
+  } finally {
+    bot.walkScaffold.done();
+  }
+});
+
+test('the walk scaffolding list survives a restart, and lets go of blocks that changed or are old', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1000000000000 });
+  const log = tempLog();
+  let back = null;
+  try {
+    log.add('dirt', new Vec3(1, 64, 0), 'overworld', ['air', 'air', 'air', 'stone', 'air', 'air']);
+    log.add('cobblestone', new Vec3(1, 65, 0), 'overworld');
+    log.add('dirt', new Vec3(2, 64, 0), 'overworld');
+    log.add('netherrack', new Vec3(1, 64, 0), 'the_nether');
+    log.save();
+    back = new ScaffoldLog(log.path);
+    assert.equal(back.blocks.size, 4);
+    assert.deepEqual(back.get(new Vec3(1, 64, 0), 'overworld').around, ['air', 'air', 'air', 'stone', 'air', 'air']);
+    assert.equal(back.has(new Vec3(1, 64, 0), 'netherrack', 'overworld'), false);
+    assert.equal(back.has(new Vec3(1, 64, 0), 'netherrack', 'the_nether'), true);
+
+    // The cobblestone was broken; grass has grown over one dirt block; another chunk isn't loaded.
+    const now = { '1,64,0': 'grass_block', '1,65,0': 'air', '2,64,0': null };
+    const standing = back.standing('overworld', (e) => now[`${e.x},${e.y},${e.z}`]);
+    assert.deepEqual(standing.map((e) => `${e.x},${e.y},${e.z}`), ['1,64,0', '2,64,0']);
+    assert.equal(back.blocks.size, 3);
+    back.check(new Vec3(2, 64, 0), 'overworld', 'oak_planks');
+    assert.equal(back.get(new Vec3(2, 64, 0), 'overworld'), null);
+
+    t.mock.timers.tick(8 * 24 * 3600000);
+    assert.deepEqual(back.standing('overworld', () => 'dirt'), []);
+
+    // At most 500, the oldest go first.
+    for (let i = 0; i < 501; i++) back.add('dirt', new Vec3(i, 70, 0), 'overworld');
+    assert.equal(back.blocks.size, 500);
+    assert.equal(back.get(new Vec3(0, 70, 0), 'overworld'), null);
+  } finally {
+    back?.save();
+    log.done();
+  }
+});
+
+// Her dirt at each cell in w, noted as walk scaffolding with what was round it then.
+function leaveScaffold(w, log, cells) {
+  const faces = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  for (const c of cells) {
+    const around = faces.map(([dx, dy, dz]) => w.get(c.offset(dx, dy, dz)).name);
+    w.set(c.x, c.y, c.z, 'dirt');
+    log.add('dirt', c, undefined, around);
+  }
+}
+
+const idleFor = (bot, log) => new Idle({ getBot: () => bot, brain: {}, survival: {}, config: {}, makeCtx: () => ({ bot }), log: () => {}, scaffold: log });
+
+test('in free time she walks over on foot and takes her pillar down from the top', async () => {
+  const w = world();
+  slab(w, -6, 9, -4, 4);
+  const bot = physicsBot(w, new Vec3(-3.5, 64, 0.5), { items: [['dirt', 20]], building: true });
+  const log = tempLog();
+  bot.walkScaffold = log;
+  try {
+    leaveScaffold(w, log, [64, 65, 66, 67].map((y) => new Vec3(6, y, 0)));
+    const idle = idleFor(bot, log);
+    const tops = idle.scaffoldTops(bot);
+    assert.deepEqual(tops.map((e) => e.y), [67]);
+    let built = false;
+    bot.on('physicsTick', () => {
+      const m = bot.pathfinder.movements;
+      if (bot.pathfinder.isMoving() && (m.canDig || m.allow1by1towers)) built = true;
+    });
+    await run(bot, idle.tidy({ bot, config: limits }, tops).then(() => true), 1500);
+    assert.equal(built, false);
+    assert.deepEqual(bot.placed, []);
+    assert.deepEqual(bot.dug, ['(6, 67, 0)', '(6, 66, 0)', '(6, 65, 0)', '(6, 64, 0)']);
+    assert.equal(log.blocks.size, 0);
+    assert.ok(bot.entity.position.x > 0);
+  } finally {
+    log.done();
+  }
+});
+
+test("a pillar with a player's torch on top stays up, and is let go", async () => {
+  const w = world();
+  w.floor();
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5), { building: true });
+  const log = tempLog();
+  bot.walkScaffold = log;
+  try {
+    leaveScaffold(w, log, [new Vec3(2, 64, 0), new Vec3(2, 65, 0)]);
+    w.set(2, 66, 0, 'torch');
+    const idle = idleFor(bot, log);
+    await run(bot, idle.tidy({ bot, config: limits }, idle.scaffoldTops(bot)).then(() => true));
+    assert.deepEqual(bot.dug, []);
+    assert.equal(log.blocks.size, 0);
+    assert.equal(w.get(new Vec3(2, 65, 0)).name, 'dirt');
+  } finally {
+    log.done();
+  }
+});
+
+test('her own place-tool block next to her pillar, put down with a player close by, does not keep it up', async () => {
+  const w = world();
+  w.floor();
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5), { items: [['oak_planks', 4]], building: true });
+  bot.players.Steve = { username: 'Steve', entity: { position: new Vec3(-1.5, 64, 2.5) } };
+  const log = tempLog();
+  bot.walkScaffold = log;
+  const own = new Map();
+  bot.placedLog = { has: (p, name) => own.get(p.toString()) === name, add: (name, p) => own.set(p.toString(), name), remove: (p) => own.delete(p.toString()) };
+  try {
+    leaveScaffold(w, log, [new Vec3(2, 64, 0)]);
+    const placed = await placeOne({ bot, config: limits, placed: bot.placedLog }, 'oak_planks', new Vec3(2, 64, 1));
+    assert.equal(placed.ok, true, placed.message);
+    assert.equal(playerPlaced(bot, new Vec3(2, 64, 1)), true);
+    const idle = idleFor(bot, log);
+    await run(bot, idle.tidy({ bot, config: limits }, idle.scaffoldTops(bot)).then(() => true));
+    assert.deepEqual(bot.dug, ['(2, 64, 0)']);
+    assert.equal(w.get(new Vec3(2, 64, 1)).name, 'oak_planks');
+    assert.equal(log.blocks.size, 0);
+  } finally {
+    log.done();
+  }
+});
+
+test('a pillar too high to reach on foot gets a try a day, and is let go after three', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1000000000000 });
+  const w = world();
+  w.floor();
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5), { items: [['dirt', 20]], building: true });
+  const log = tempLog();
+  bot.walkScaffold = log;
+  try {
+    leaveScaffold(w, log, [64, 65, 66, 67, 68, 69, 70, 71].map((y) => new Vec3(3, y, 0)));
+    const idle = idleFor(bot, log);
+    for (let i = 1; i <= 3; i++) {
+      const tops = idle.scaffoldTops(bot);
+      assert.deepEqual(tops.map((e) => e.y), [71], `try ${i}`);
+      await run(bot, idle.tidy({ bot, config: limits }, tops).then(() => true));
+      assert.deepEqual(bot.placed, []);
+      assert.deepEqual(bot.dug, []);
+      assert.deepEqual(idle.scaffoldTops(bot), []);
+      t.mock.timers.tick(24 * 3600000 + 1);
+    }
+    assert.equal(log.blocks.size, 0);
+    assert.equal(w.get(new Vec3(3, 71, 0)).name, 'dirt');
+  } finally {
+    log.done();
+  }
+});
+
+test('a walk never digs the block a door stands on, not even a dig walk', () => {
+  const w = world();
+  w.floor();
+  for (let x = -4; x <= 4; x++) for (let z = -4; z <= 4; z++) w.set(x, 63, z, 'dirt');
+  w.set(0, 64, 0, 'oak_door', { facing: 'south', half: 'lower', hinge: 'left', open: 'false' });
+  w.set(0, 65, 0, 'oak_door', { facing: 'south', half: 'upper', hinge: 'left', open: 'false' });
+  const bot = liveBot(w);
+  const under = w.get(new Vec3(0, 63, 0));
+  const away = w.get(new Vec3(3, 63, 3));
+  for (const mode of ['walk', 'noPlace', 'digNoPlace', 'digClimb']) {
+    assert.equal(bot.planModes[mode].safeToBreak(under), false, mode);
+    assert.equal(bot.planModes[mode].safeToBreak(away), true, mode);
+  }
 });

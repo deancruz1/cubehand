@@ -13,6 +13,7 @@ import { canSleepNow } from '../src/actions/bed.js';
 import { craft } from '../src/actions/crafting.js';
 import { Brain } from '../src/brain.js';
 import { Idle } from '../src/idle.js';
+import { ScaffoldLog } from '../src/placed.js';
 import { GoalFollowPlayer } from '../src/actions/movement.js';
 import { setPauseScale } from '../src/actions/util.js';
 
@@ -442,6 +443,70 @@ test('a chore puts following back even when the player is out of view', async ()
   idle.tick();
   await idle.running.done;
   assert.deepEqual(bot.pathfinder.set, ['noPlace', follow]);
+});
+
+test('no chore or free time starts while a walk to a player who said come here is going', async () => {
+  // Hungry with bread on her, so a tick would start eating; free time is picked after that.
+  const bot = hurtBot({ health: 20 });
+  const walk = { going: true };
+  const idle = new Idle({
+    getBot: () => bot,
+    brain: { busy: false, paused: false, queue: [] },
+    survival: { recovering: false },
+    config: { idle: { enabled: true }, survival: { eatAtFood: 14 } },
+    makeCtx: () => ({ bot }),
+    log: () => {},
+    reflexWalking: () => walk.going
+  });
+  idle.tick();
+  assert.equal(idle.running, null);
+  walk.going = false;
+  idle.tick();
+  assert.ok(idle.running);
+  await idle.running.done;
+});
+
+test('scaffolding she left comes down in free time, never during a job, a hold or a walk to a player', async () => {
+  const path = tempPath('scaffold');
+  const scaffold = new ScaffoldLog(path);
+  try {
+    scaffold.add('dirt', new Vec3(4, 64, 0), 'overworld');
+    const bot = hurtBot({ health: 20, food: 20, game: { dimension: 'overworld' }, time: { timeOfDay: 6000 }, isRaining: false });
+    bot.blockAt = (p) => ({ name: p.x === 4 && p.y === 64 && p.z === 0 ? 'dirt' : 'air', position: p });
+    const brain = { busy: true, paused: false, queue: [], lastJobEnd: Date.now(), lastFreeTime: Date.now() };
+    const walk = { going: false };
+    const started = [];
+    const idle = new Idle({
+      getBot: () => bot,
+      brain,
+      survival: { recovering: false },
+      config: { idle: { enabled: true, freeTimeMinutes: 15 }, survival: { eatAtFood: 14 }, allowlist: [] },
+      makeCtx: () => ({ bot }),
+      log: (line) => started.push(line),
+      smeltJobs: new Map(),
+      scaffold,
+      reflexWalking: () => walk.going
+    });
+    idle.tidy = async () => {};
+    idle.tick();
+    assert.equal(idle.running, null);
+    brain.busy = false;
+    idle.hold(60000);
+    idle.tick();
+    assert.equal(idle.running, null);
+    idle.holdUntil = 0;
+    walk.going = true;
+    idle.tick();
+    assert.equal(idle.running, null);
+    walk.going = false;
+    idle.tick();
+    assert.ok(idle.running);
+    await idle.running.done;
+    assert.deepEqual(started, ['[idle] take down scaffolding I left']);
+  } finally {
+    scaffold.save();
+    rmSync(path, { force: true });
+  }
 });
 
 test('the line about backing off goes to whoever whispered the job', async () => {

@@ -432,6 +432,16 @@ export function surroundingsSummary(getBlock, feet) {
   return `Surroundings: indoors, under a built roof (${roof.name})${floor}. Use survey to see the rooms, levels and what's in them.`;
 }
 
+// Scaffolding her walks left standing (a ScaffoldLog's standing entries), so she can say whether
+// she left anything behind. Nothing when there is none.
+export function scaffoldSummary(entries, here) {
+  if (entries.length === 0) return null;
+  const dist = (e) => here.distanceTo(new Vec3(e.x + 0.5, e.y, e.z + 0.5));
+  const near = entries.reduce((a, b) => (dist(b) < dist(a) ? b : a));
+  const count = entries.length === 1 ? '1 block' : `${entries.length} blocks`;
+  return `Scaffolding left standing from walks: ${count}, nearest ${near.name} at ${near.x} ${near.y} ${near.z} (${Math.round(dist(near))} away). It comes down in free time.`;
+}
+
 export function buildSnapshot(bot, config, chatMessages, memories) {
   const origin = bot.entity.position.floored();
   const radius = config.perception.blockRadius;
@@ -475,6 +485,7 @@ export function buildSnapshot(bot, config, chatMessages, memories) {
     signsSummary(signs, LANDMARK_RANGE),
     entitiesSummary(liveEntities(bot), bot.entity.position, entityRadius, config.perception.maxEntities),
     droppedItemsSummary(droppedItems(bot), bot.entity.position, Math.min(entityRadius, 32)),
+    bot.walkScaffold && scaffoldSummary(bot.walkScaffold.standing(bot.game.dimension, (e) => bot.blockAt(new Vec3(e.x, e.y, e.z), false)?.name ?? null), bot.entity.position),
     memories ?? 'Memories: none',
     chatSummary(chatMessages, { allowlist: config.allowlist, botName: config.bot?.username })
   ]

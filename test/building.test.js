@@ -7,6 +7,7 @@ import { expandParts, planBuild, nearestFirst, buildSite, buildStructure, watchB
 import { setPauseScale } from '../src/actions/util.js';
 import { planHouse, buildHouse } from '../src/actions/house.js';
 import { placeOne } from '../src/actions/blocks.js';
+import { markPathfinderPlace } from '../src/actions/movement.js';
 
 const registry = {
   itemsByName: { torch: {}, oak_stairs: {}, spruce_trapdoor: {}, oak_log: {} },
@@ -429,23 +430,23 @@ test('a group whose first block has no route is skipped after that one walk', as
 
 test('scaffolding for a build that starts high up may go up from the ground, and only the bot\'s own is claimed', () => {
   // Roof trim at y 82 on a house whose walls end at y 81, on ground at y 63.
-  let building = true;
   const solid = (p) => p.y <= 63 || (p.x >= 0 && p.x <= 4 && p.z >= 0 && p.z <= 4 && p.y <= 81);
   const bot = Object.assign(new EventEmitter(), {
     entity: { position: new Vec3(-1.5, 70, 0.5) },
     registry: { itemsByName: {} },
-    blockAt: (p) => ({ name: solid(p) ? 'stone' : 'air', position: p, boundingBox: solid(p) ? 'block' : 'empty' }),
-    pathfinder: { isBuilding: () => building }
+    blockAt: (p) => ({ name: solid(p) ? 'stone' : 'air', position: p, boundingBox: solid(p) ? 'block' : 'empty' })
   });
   const site = { min: new Vec3(0, 82, 0), max: new Vec3(4, 82, 4) };
   site.ground = groundUnder(bot, site.min, site.max);
   assert.equal(site.ground, 64);
   assert.equal(buildZone(site, site.ground).min.y, 63);
   const scaffold = watchBuildScaffold(bot, site, new Set());
-  const put = (x, y, z) => bot.emit('blockUpdate', { name: 'air', boundingBox: 'empty' }, { name: 'dirt', position: new Vec3(x, y, z) });
-  put(-2, 69, 0);
-  building = false;
-  put(-2, 69, 1);
+  const put = (x, y, z, byBot) => {
+    if (byBot) markPathfinderPlace(bot, new Vec3(x, y, z));
+    bot.emit('blockUpdate', { name: 'air', boundingBox: 'empty' }, { name: 'dirt', position: new Vec3(x, y, z) });
+  };
+  put(-2, 69, 0, true);
+  put(-2, 69, 1, false);
   scaffold.stop();
   assert.deepEqual(scaffold.leftover([]).map((p) => `${p.x} ${p.y} ${p.z}`), ['-2 69 0']);
 });
@@ -473,7 +474,6 @@ test('build_structure keeps its materials out of scaffolding and takes its scaff
   for (let x = -2; x <= 6; x++) for (let z = -3; z <= 3; z++) world.set(`${x},63,${z}`, solid('stone', new Vec3(x, 63, z)));
   const ids = { oak_planks: 5, cobblestone: 4 };
   const during = [];
-  let building = false;
   const bot = Object.assign(new EventEmitter(), {
     entity: { position: new Vec3(1.5, 64, -1.5), height: 1.62 },
     registry: { blocksByName: { oak_planks: {}, cobblestone: {} }, itemsByName: { oak_planks: { id: 5 }, cobblestone: { id: 4 } } },
@@ -489,14 +489,13 @@ test('build_structure keeps its materials out of scaffolding and takes its scaff
         const s = new Vec3(3, 64, 1);
         const old = bot.blockAt(s);
         world.set('3,64,1', solid('cobblestone', s));
-        building = true;
+        markPathfinderPlace(bot, s);
         bot.emit('blockUpdate', old, world.get('3,64,1'));
-        building = false;
       }
     },
     canDigBlock: () => true,
     dig: async (block) => world.delete(`${block.position.x},${block.position.y},${block.position.z}`),
-    pathfinder: { bestHarvestTool: () => null, isBuilding: () => building }
+    pathfinder: { bestHarvestTool: () => null, isBuilding: () => false }
   });
   const ctx = { bot, config: { limits: { maxBuildBlocks: 100 } } };
   const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, parts: [{ shape: 'line', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 2, dy: 0, dz: 0 }, block: 'oak_planks' }] });
@@ -517,15 +516,13 @@ test('build_structure digs its scaffolding out of planned spots and leaves block
   const world = new Map();
   const solid = (name, pos) => ({ name, position: pos, boundingBox: 'block', shapes: [[0, 0, 0, 1, 1, 1]], getProperties: () => ({}) });
   for (let x = -2; x <= 6; x++) for (let z = -3; z <= 3; z++) world.set(`${x},63,${z}`, solid('stone', new Vec3(x, 63, z)));
-  let building = false;
   let placings = 0;
   const put = (name, x, y, z, byBot) => {
     const s = new Vec3(x, y, z);
     const old = bot.blockAt(s);
     world.set(`${x},${y},${z}`, solid(name, s));
-    building = byBot;
+    if (byBot) markPathfinderPlace(bot, s);
     bot.emit('blockUpdate', old, world.get(`${x},${y},${z}`));
-    building = false;
   };
   const bot = Object.assign(new EventEmitter(), {
     entity: { position: new Vec3(1.5, 64, -1.5), height: 1.62 },
@@ -546,7 +543,7 @@ test('build_structure digs its scaffolding out of planned spots and leaves block
     },
     canDigBlock: () => true,
     dig: async (block) => world.delete(`${block.position.x},${block.position.y},${block.position.z}`),
-    pathfinder: { bestHarvestTool: () => null, isBuilding: () => building }
+    pathfinder: { bestHarvestTool: () => null, isBuilding: () => false }
   });
   const ctx = { bot, config: { limits: { maxBuildBlocks: 100 } } };
   const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, parts: [{ shape: 'line', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 2, dy: 0, dz: 0 }, block: 'oak_planks' }] });
@@ -562,21 +559,18 @@ test('build_house notes scaffolding on its planned spots and only claims its own
   const plan = planHouse({ x: 0, y: 64, z: 0, width: 5, depth: 5, roof: 'flat', materials: { walls: 'cobblestone', floor: 'oak_planks', door: 'none', windows: 'none' } });
   const planned = new Map(plan.blocks.map((b) => [`${b.x},${b.y},${b.z}`, b]));
   const world = new Map();
-  let building = false;
   const bot = Object.assign(new EventEmitter(), {
     entity: { position: new Vec3(3.5, 64, 3.5) },
     registry: { itemsByName: { cobblestone: { id: 4 }, oak_planks: { id: 5 }, dirt: { id: 3 } } },
     buildKeep: new Set([4, 5]),
-    blockAt: (p) => ({ name: world.get(`${p.x},${p.y},${p.z}`) ?? 'air', position: p, getProperties: () => ({}) }),
-    pathfinder: { isBuilding: () => building }
+    blockAt: (p) => ({ name: world.get(`${p.x},${p.y},${p.z}`) ?? 'air', position: p, getProperties: () => ({}) })
   });
   const scaffold = watchBuildScaffold(bot, plan, planned);
   const put = (name, x, y, z, byBot) => {
     bot.entity.position = new Vec3(x + 1.5, y + 1, z + 0.5);
     world.set(`${x},${y},${z}`, name);
-    building = byBot;
+    if (byBot) markPathfinderPlace(bot, new Vec3(x, y, z));
     bot.emit('blockUpdate', { boundingBox: 'empty' }, { name, position: new Vec3(x, y, z) });
-    building = false;
   };
   const wall = plan.blocks.find((b) => b.block === 'cobblestone' && b.y === 65);
   put('dirt', wall.x, wall.y, wall.z, true);

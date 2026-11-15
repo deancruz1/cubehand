@@ -1,27 +1,38 @@
+import { Vec3 } from 'vec3';
 import pathfinderPkg from 'mineflayer-pathfinder';
-import { pause, delay } from './actions/util.js';
-import { walkTo, useMoveMode } from './actions/movement.js';
+import { pause, delay, posText } from './actions/util.js';
+import { walkTo, useMoveMode, scaffoldRemovable, underBot } from './actions/movement.js';
 import { attackEntity } from './actions/combat.js';
 import { collectDrops, dropsNear, leftThere } from './actions/items.js';
-import { findNearest } from './actions/blocks.js';
+import { findNearest, digBlock, inReach } from './actions/blocks.js';
+import { DigSpot } from './actions/mining.js';
 import { sleep, canSleepNow, ownBed } from './actions/bed.js';
 import { smelt, readyJob, rawFoodToCook } from './actions/furnace.js';
 import { needsFood, hasFood, eatBest, isThreat, isDeadly, threatsNear, flee, getFood } from './survival.js';
 
 const { GoalNear, GoalFollow } = pathfinderPkg.goals;
 
+// How far off walk scaffolding she left is still hers to go and take down, and how close
+// together the blocks one go takes down are.
+const TIDY_RANGE = 48;
+const TIDY_GROUP = 6;
+
 // What the bot does on its own between jobs, one chore at a time, most urgent first. A player's
 // request stops the chore right away.
 export class Idle {
-  constructor({ getBot, brain, survival, config, makeCtx, log, smeltJobs, placed }) {
+  // reflexWalking() is true while a walk started on a player's "come here" is still going.
+  // scaffold is the ScaffoldLog of blocks her walks left standing.
+  constructor({ getBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold = null, reflexWalking = () => false }) {
     this.getBot = getBot;
     this.brain = brain;
     this.survival = survival;
+    this.reflexWalking = reflexWalking;
     this.config = config;
     this.makeCtx = makeCtx;
     this.log = log;
     this.smeltJobs = smeltJobs;
     this.placed = placed;
+    this.scaffold = scaffold;
     this.running = null;
     this.until = new Map();
     this.skipMobs = new Set();
@@ -60,7 +71,7 @@ export class Idle {
     const bot = this.getBot();
     if (this.brain.busy) this.anchor = null;
     if (!this.config.idle.enabled || !bot?.entity || this.running || this.brain.busy || this.brain.paused) return;
-    if (this.survival.recovering || bot.isSleeping || bot.health <= 0 || Date.now() < this.holdUntil) return;
+    if (this.survival.recovering || bot.isSleeping || bot.health <= 0 || Date.now() < this.holdUntil || this.reflexWalking()) return;
     this.anchor ??= bot.entity.position.clone();
     const chore = this.pick(bot);
     if (!chore) return;
@@ -156,6 +167,10 @@ export class Idle {
         }
       };
     }
+    const tops = this.ready('tidy') ? this.scaffoldTops(bot) : [];
+    if (tops.length && threatsNear(bot, 12).length === 0) {
+      return { name: 'take down scaffolding I left', run: (ctx) => this.tidy(ctx, tops) };
+    }
 
     const minutes = idle.freeTimeMinutes;
     const online = this.config.allowlist.some((name) => bot.players[name]);
@@ -203,6 +218,75 @@ export class Idle {
         }
       }
     };
+  }
+
+  // Walk scaffolding she left within TIDY_RANGE that can come down next: the top block of each
+  // pillar, and none waiting for another try or inside a build going on.
+  scaffoldTops(bot) {
+    if (!this.scaffold) return [];
+    const dim = bot.game?.dimension;
+    const here = bot.entity.position;
+    const nameAt = (e) => bot.blockAt(new Vec3(e.x, e.y, e.z), false)?.name ?? null;
+    const zone = bot.buildZone;
+    return this.scaffold.standing(dim, nameAt).filter((e) => {
+      if ((e.next ?? 0) > Date.now() || nameAt(e) === null) return false;
+      if (zone && e.x >= zone.min.x && e.x <= zone.max.x && e.y >= zone.min.y && e.y <= zone.max.y && e.z >= zone.min.z && e.z <= zone.max.z) return false;
+      if (here.distanceTo(new Vec3(e.x + 0.5, e.y + 0.5, e.z + 0.5)) > TIDY_RANGE) return false;
+      const above = new Vec3(e.x, e.y + 1, e.z);
+      return !this.scaffold.has(above, bot.blockAt(above, false)?.name, dim);
+    });
+  }
+
+  // Goes over to the nearest of her walk scaffolding on foot (no digging, no placing on the way)
+  // and takes it down with the blocks close to it, top first, like a player taking their pillar
+  // down. A block she can't get to that way gets another try a day later (see ScaffoldLog.failed),
+  // and one with something on it that isn't hers stays up.
+  async tidy(ctx, tops) {
+    const { bot, signal } = ctx;
+    const log = this.scaffold;
+    const dim = bot.game?.dimension;
+    this.later('tidy', 15000);
+    const at = (e) => new Vec3(e.x, e.y, e.z);
+    const here = bot.entity.position;
+    const first = tops.reduce((a, b) => (here.distanceTo(at(b)) < here.distanceTo(at(a)) ? b : a));
+    const queue = tops.filter((e) => at(e).distanceTo(at(first)) <= TIDY_GROUP);
+    let removed = 0;
+    while (queue.length > 0 && !signal?.aborted) {
+      queue.sort((a, b) => b.y - a.y);
+      const pos = at(queue.shift());
+      const block = bot.blockAt(pos, false);
+      if (!block) continue;
+      if (!log.has(pos, block.name, dim)) {
+        log.remove(pos, dim);
+        continue;
+      }
+      const safe = scaffoldRemovable(bot, pos);
+      if (safe === 'unsafe') {
+        log.removeColumn(pos, dim);
+        this.log(`[idle] left the ${block.name} at ${posText(pos)} standing, something that isn't mine is on it`);
+        continue;
+      }
+      if (safe !== 'ok') continue;
+      if (!inReach(bot, pos) || underBot(bot, pos)) {
+        const walked = await walkTo(ctx, new DigSpot(pos, bot.world, { reach: 4 }), { onFoot: true });
+        if (signal?.aborted || walked.reason === 'interrupted') break;
+        if (!inReach(bot, pos) || underBot(bot, pos)) {
+          log.failed(pos, dim);
+          continue;
+        }
+      }
+      const dug = await digBlock(ctx, pos, { anyTool: true });
+      if (signal?.aborted) break;
+      if (!dug.ok) {
+        log.failed(pos, dim);
+        continue;
+      }
+      log.remove(pos, dim);
+      removed++;
+      const below = log.get(pos.offset(0, -1, 0), dim);
+      if (below) queue.push(below);
+    }
+    if (removed) this.log(`[idle] took down ${removed} blocks of scaffolding`);
   }
 
   // A few steps to an open spot close by, then a look around, like a player waiting for something.

@@ -4,6 +4,7 @@ import AStar from 'mineflayer-pathfinder/lib/astar.js';
 import Move from 'mineflayer-pathfinder/lib/move.js';
 import { ok, fail, botPos, posText, guarded, customName, TimeoutError, AbortedError, StalledError } from './util.js';
 import { leaveDrops } from './items.js';
+import { digBlock, inReach } from './blocks.js';
 
 const { GoalNear, GoalFollow } = pathfinderPkg.goals;
 const { Movements } = pathfinderPkg;
@@ -35,6 +36,68 @@ export function isHandTrapdoor(name) {
   return name.endsWith('_trapdoor') && name !== 'iron_trapdoor';
 }
 
+const lowerHalf = (b) => (b.getProperties().half === 'upper' ? b.position.offset(0, -1, 0) : b.position);
+
+// The cell in front of a door on the side of pos, at the door's floor.
+function frontOf(door, facing, pos) {
+  if (facing === 'east' || facing === 'west') return door.offset(pos.x < door.x + 0.5 ? -1 : 1, 0, 0);
+  return door.offset(0, 0, pos.z < door.z + 0.5 ? -1 : 1);
+}
+
+const doorSide = (door, front) => `${door.x},${door.y},${door.z}>${front.x},${front.z}`;
+
+// What opens the iron door at door for someone standing in front, the cell in front of it on
+// their side: a pressure plate in that cell (walked onto), or a button or a lever that is off,
+// on that side of the wall within two blocks of the doorway, from the floor to just over the door.
+export function doorOpener(bot, door, front) {
+  const at = (p) => bot.blockAt(p, false);
+  if (at(front)?.name.endsWith('_pressure_plate')) return { plate: front };
+  const along = door.x === front.x ? [1, 0] : [0, 1];
+  for (let a = -2; a <= 2; a++) {
+    for (let dy = 0; dy <= 2; dy++) {
+      const b = at(front.offset(along[0] * a, dy, along[1] * a));
+      if (!b || !(b.name.endsWith('_button') || b.name === 'lever')) continue;
+      if (b.name === 'lever' && String(b.getProperties().powered) === 'true') continue;
+      return { press: b.position, lever: b.name === 'lever' };
+    }
+  }
+  return null;
+}
+
+// Whether the walk may go through the iron door at door from front: it's open, or there is
+// something on that side to open it with that hasn't already failed to.
+function canPassIron(bot, door, front) {
+  const b = bot.blockAt(door, false);
+  if (b && isOpen(b)) return true;
+  if ((bot.ironDoorFails?.get(doorSide(door, front)) ?? 0) > Date.now()) return false;
+  return doorOpener(bot, door, front) !== null;
+}
+
+// Blocks that sit on or hang from the block next to them and pop off when it is dug.
+const ATTACHED = /(_door|torch|lantern|sign|rail|ladder|banner|button|lever|pressure_plate|redstone_wire|_bed)$/;
+// Natural blocks the walk doesn't dig, which are no sign of a build either.
+const WILD_SOLID = /sandstone$|terracotta$|ice$|obsidian$|basalt$|^blackstone$|^bedrock$|^magma_block$|^glowstone$|amethyst|mushroom|^infested_|coral_block$|^sculk|^suspicious_|_nylium$|wart_block$|^shroomlight$/;
+const FACES6 = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+
+// True when a block touching pos face to face is part of a build: a door, torch, ladder or
+// other block that would pop off, or, unless attachedOnly, a solid block that isn't terrain
+// (cobblestone counts unless the bot placed it).
+function touchesBuild(bot, pos, attachedOnly) {
+  for (const [dx, dy, dz] of FACES6) {
+    const p = pos.offset(dx, dy, dz);
+    const b = bot.blockAt(p, false);
+    if (!b) continue;
+    if (ATTACHED.test(b.name)) return true;
+    if (attachedOnly || b.boundingBox !== 'block') continue;
+    if (b.name === 'cobblestone' || b.name === 'cobbled_deepslate') {
+      if (!bot.placedLog?.has(p, b.name)) return true;
+    } else if (!looksNatural(b.name) && !WILD_SOLID.test(b.name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Snow up to 5 layers is low enough to step onto; deeper snow has to be dug out of the way.
 export function deepSnow(layers) {
   return layers >= 6;
@@ -47,7 +110,8 @@ class DoorMovements extends Movements {
   getBlock(pos, dx, dy, dz) {
     const b = super.getBlock(pos, dx, dy, dz);
     if (!b.name) return b;
-    if (isHandDoor(b.name) || isGate(b.name)) {
+    if (b.name.endsWith('_door') || isGate(b.name)) {
+      // Iron doors only count as a way through from a side that can open them (ironShut).
       b.safe = true;
       b.physical = false;
       b.openable = false;
@@ -73,10 +137,13 @@ class DoorMovements extends Movements {
 
   // Never dig what the bot built itself, even when it's made of something that looks natural,
   // like a tuff wall, or what a player just put down (see watchPlayerBlocks).
+  // Nor terrain touching a build: a dug block under a door or behind a torch drops it, and a
+  // hole next to a wall opens up someone's house. A dig walk only keeps to the first part.
   safeToBreak(block) {
     if (block.position && this.bot.placedLog?.has(block.position, block.name)) return false;
     if (block.position && playerPlaced(this.bot, block.position)) return false;
-    return super.safeToBreak(block);
+    if (!super.safeToBreak(block)) return false;
+    return !(block.position && touchesBuild(this.bot, block.position, this.digWalk));
   }
 
   // Doors and gates can only be walked through straight on, along the way they face. From the
@@ -85,7 +152,29 @@ class DoorMovements extends Movements {
   intoPassageSideways(node, dir, dys) {
     const along = dir.x !== 0 ? ['east', 'west'] : ['north', 'south'];
     const cells = [this.getBlock(node, 0, 0, 0), ...dys.map((dy) => this.getBlock(node, dir.x, dy, dir.z))];
-    return cells.some((b) => b.passage && (isHandDoor(b.name) || isGate(b.name)) && !along.includes(b.getProperties().facing));
+    return cells.some((b) => b.passage && (b.name.endsWith('_door') || isGate(b.name)) && !along.includes(b.getProperties().facing));
+  }
+
+  // A closed iron door at the given heights of the block the move goes to, with nothing on
+  // this side to open it.
+  ironShut(node, dir, dys) {
+    for (const dy of dys) {
+      const b = this.getBlock(node, dir.x, dy, dir.z);
+      if (!b.passage || b.name !== 'iron_door') continue;
+      const door = lowerHalf(b);
+      const front = door.offset(-dir.x, 0, -dir.z);
+      if (canPassIron(this.bot, door, front)) continue;
+      this.onRefusedDoor?.(door, front);
+      return true;
+    }
+    return false;
+  }
+
+  getMoveParkourForward(node, dir, neighbors) {
+    for (let d = 1; d <= 4; d++) {
+      if (this.getBlock(node, dir.x * d, 0, dir.z * d).name === 'iron_door' || this.getBlock(node, dir.x * d, 1, dir.z * d).name === 'iron_door') return;
+    }
+    super.getMoveParkourForward(node, dir, neighbors);
   }
 
   // A ladder counts as solid to the pathfinder, so it would happily walk across the top of a
@@ -95,17 +184,17 @@ class DoorMovements extends Movements {
   }
 
   getMoveForward(node, dir, neighbors) {
-    if (this.overLadder(node, dir.x, 0, dir.z) || this.intoPassageSideways(node, dir, [0, 1])) return;
+    if (this.overLadder(node, dir.x, 0, dir.z) || this.intoPassageSideways(node, dir, [0, 1]) || this.ironShut(node, dir, [0, 1])) return;
     super.getMoveForward(node, dir, neighbors);
   }
 
   getMoveDropDown(node, dir, neighbors) {
-    if (this.intoPassageSideways(node, dir, [0, 1])) return;
+    if (this.intoPassageSideways(node, dir, [0, 1]) || this.ironShut(node, dir, [0, 1])) return;
     super.getMoveDropDown(node, dir, neighbors);
   }
 
   getMoveJumpUp(node, dir, neighbors) {
-    if (this.overLadder(node, dir.x, 1, dir.z) || this.intoPassageSideways(node, dir, [1, 2])) return;
+    if (this.overLadder(node, dir.x, 1, dir.z) || this.intoPassageSideways(node, dir, [1, 2]) || this.ironShut(node, dir, [1, 2])) return;
     const before = neighbors.length;
     super.getMoveJumpUp(node, dir, neighbors);
     // Three or more snow layers on the step make the jump too high, so clear them first.
@@ -165,7 +254,7 @@ export function fixPassageSteps(path, getBlock) {
   for (const node of path) {
     const cell = new Vec3(Math.floor(node.x), Math.floor(node.y) - 1, Math.floor(node.z));
     const b = getBlock(cell);
-    if (!b || !(isHandDoor(b.name) || isGate(b.name))) continue;
+    if (!b || !(b.name.endsWith('_door') || isGate(b.name))) continue;
     node.x = cell.x + 0.5;
     node.y = cell.y;
     node.z = cell.z + 0.5;
@@ -178,7 +267,40 @@ function passagesOnPath(bot) {
   let path = [];
   const lastTry = new Map();
   const opened = new Map();
+  const pressed = new Map();
+  const levers = new Map();
   bot.openedPassages = opened;
+  bot.ironDoorFails = new Map();
+  bot.leverWait = levers;
+  bot.leversLeftOn = [];
+
+  // An iron door ahead opens with what is on the bot's side of it, once she stands in front of
+  // it: a plate needs nothing, a button or lever gets pressed. A button only holds the door for
+  // a second or so, so she presses again when it shut before she got through. When two presses
+  // in a row left it shut, the door doesn't open from this side and walks leave it for 5 minutes.
+  const openIron = (door, here) => {
+    const block = bot.blockAt(door, false);
+    if (!block || block.name !== 'iron_door') return;
+    const key = door.toString();
+    const press = pressed.get(key);
+    if (isOpen(block)) {
+      if (press) press.opened = true;
+      return;
+    }
+    const front = frontOf(door, block.getProperties().facing, here);
+    if (Math.hypot(here.x - front.x - 0.5, here.z - front.z - 0.5) > 1.2 || Math.abs(here.y - front.y) > 1) return;
+    const opener = doorOpener(bot, door, front);
+    if (!opener?.press || (press && Date.now() - press.at < 1500)) return;
+    const tries = press && !press.opened ? press.tries : 0;
+    if (tries >= 2) {
+      bot.ironDoorFails.set(doorSide(door, front), Date.now() + 300000);
+      pressed.delete(key);
+      return;
+    }
+    pressed.set(key, { at: Date.now(), tries: tries + 1, opened: false });
+    if (opener.lever) levers.set(key, { lever: opener.press, door, at: Date.now() });
+    bot.activateBlock(bot.blockAt(opener.press, false)).catch(() => {});
+  };
   bot.on('path_update', (results) => {
     path = results.path;
     fixPassageSteps(path, (p) => bot.blockAt(p, false));
@@ -193,6 +315,7 @@ function passagesOnPath(bot) {
       for (const cell of [cellOf(here), ...path.slice(0, 3).map(cellOf)]) {
         for (const dy of [0, 1]) {
           let block = bot.blockAt(cell.offset(0, dy, 0));
+          if (block?.name === 'iron_door') openIron(lowerHalf(block), here);
           if (!block || !isPassage(block)) continue;
           // Both halves toggle the same door, so always use the bottom half. Using both
           // in one tick opens the door and shuts it again straight away.
@@ -226,7 +349,45 @@ function passagesOnPath(bot) {
       const block = bot.blockAt(pos);
       if (block && isPassage(block) && isOpen(block)) bot.activateBlock(block).catch(() => {});
     }
+
+    for (const [key, { lever, door, at }] of levers) {
+      if (Date.now() - at < 800 || door.offset(0.5, 0.5, 0.5).distanceTo(here) < 2.5 || replanning) continue;
+      if (path.slice(0, 4).some((n) => Math.floor(n.x) === door.x && Math.floor(n.z) === door.z && Math.abs(n.y - door.y) <= 1)) continue;
+      if (Object.values(bot.players).some((p) => p.entity && p.entity !== bot.entity && p.entity.position.distanceTo(door.offset(0.5, 0, 0.5)) < 2)) continue;
+      levers.delete(key);
+      putLeverBack(bot, { lever, door });
+    }
+    for (const [key, { at }] of pressed) if (Date.now() - at > 60000) pressed.delete(key);
   });
+}
+
+// A lever the bot switched on to get through an iron door goes back off when she can still
+// reach it and see it from where she is now. Otherwise it stays on, and the walk says so.
+function putLeverBack(bot, { lever, door }) {
+  const b = bot.blockAt(lever, false);
+  if (!b || b.name !== 'lever' || String(b.getProperties().powered) !== 'true') return;
+  if (inSight(bot, lever)) {
+    bot.activateBlock(b).catch(() => {});
+    return;
+  }
+  bot.leversLeftOn.push({ lever, door });
+}
+
+function inSight(bot, pos) {
+  const eye = bot.entity.position.offset(0, 1.62, 0);
+  const dir = pos.offset(0.5, 0.5, 0.5).minus(eye);
+  const dist = dir.norm();
+  if (dist > 4.5) return false;
+  const hit = bot.world?.raycast?.(eye, dir.normalize(), dist);
+  return !hit || hit.position.equals(pos);
+}
+
+// Levers still waiting to go back off when a walk ends, sorted out right away.
+function settleLevers(bot) {
+  for (const [key, l] of bot.leverWait ?? []) {
+    bot.leverWait.delete(key);
+    putLeverBack(bot, l);
+  }
 }
 
 // Cheap blocks the pathfinder may place to tower up or bridge gaps.
@@ -235,17 +396,145 @@ export const SCAFFOLD_BLOCKS = [
   'andesite', 'diorite', 'granite', 'tuff', 'deepslate', 'coarse_dirt', 'blackstone'
 ];
 
-// Notes where scaffolding blocks appear inside inArea(pos) until stop() is called, so a job
-// can clean up after itself.
+// Notes where the pathfinder puts scaffolding blocks down inside inArea(pos) until stop() is
+// called, so a job can clean up after itself. A build's watcher (one started while
+// bot.buildZone is set) claims what it notes in bot.scaffoldClaims: the build takes that down
+// itself, so it is no walk scaffolding.
 export function watchScaffold(bot, inArea) {
   const placed = [];
+  const claims = bot.buildZone ? (bot.scaffoldClaims ??= new Set()) : null;
   const onUpdate = (oldBlock, newBlock) => {
     if (!newBlock || !SCAFFOLD_BLOCKS.includes(newBlock.name)) return;
     if (oldBlock && oldBlock.boundingBox === 'block') return;
-    if (inArea(newBlock.position)) placed.push(newBlock.position.clone());
+    if (!pathfinderPlacing(bot, newBlock.position) || !inArea(newBlock.position)) return;
+    placed.push(newBlock.position.clone());
+    claims?.add(cellKey(newBlock.position));
   };
   bot.on('blockUpdate', onUpdate);
-  return { placed, stop: () => bot.removeListener('blockUpdate', onUpdate) };
+  const stop = () => {
+    bot.removeListener('blockUpdate', onUpdate);
+    for (const p of placed) claims?.delete(cellKey(p));
+  };
+  return { placed, stop };
+}
+
+const AIR = new Set(['air', 'cave_air', 'void_air']);
+
+// The pathfinder's own placing (isBuilding) is over by the time any other blockUpdate listener
+// hears of the block: its own listener comes first and resets the path. So its blocks are
+// caught where it calls placeBlock instead. The spot goes in bot.pathfinderPlaces from just
+// before the call until PLACING_GRACE_MS after it settles (an update can come after a timed out
+// call), for every listener to check with pathfinderPlacing. The block goes in bot.walkScaffold
+// (a ScaffoldLog), and in bot.walkPlacements for the walk going on.
+const PLACING_GRACE_MS = 2000;
+
+export function markPathfinderPlace(bot, pos, until = Infinity) {
+  const places = (bot.pathfinderPlaces ??= new Map());
+  for (const [key, t] of places) if (t <= Date.now()) places.delete(key);
+  places.set(cellKey(pos), until);
+}
+
+export function pathfinderPlacing(bot, pos) {
+  return (bot.pathfinderPlaces?.get(cellKey(pos)) ?? 0) > Date.now();
+}
+
+function watchWalkScaffold(bot) {
+  const placeBlock = bot.placeBlock;
+  if (placeBlock) {
+    bot.placeBlock = async (reference, face, ...rest) => {
+      const walk = bot.pathfinder.isBuilding();
+      const pos = reference.position.plus(face);
+      const before = bot.blockAt(pos, false);
+      if (walk) markPathfinderPlace(bot, pos);
+      try {
+        return await placeBlock(reference, face, ...rest);
+      } finally {
+        if (walk) {
+          markPathfinderPlace(bot, pos, Date.now() + PLACING_GRACE_MS);
+          if (before && before.boundingBox !== 'block') noteWalkScaffold(bot, pos);
+        }
+      }
+    };
+  }
+  bot.on('blockUpdate', (oldBlock, newBlock) => {
+    if (newBlock?.position) bot.walkScaffold?.check(newBlock.position, bot.game?.dimension, newBlock.name);
+  });
+}
+
+function noteWalkScaffold(bot, pos) {
+  const log = bot.walkScaffold;
+  const block = bot.blockAt(pos, false);
+  if (!log || !block || !SCAFFOLD_BLOCKS.includes(block.name) || bot.scaffoldClaims?.has(cellKey(pos))) return;
+  const around = FACES6.map(([dx, dy, dz]) => bot.blockAt(pos.offset(dx, dy, dz), false)?.name ?? null);
+  log.add(block.name, pos, bot.game?.dimension, around);
+  bot.walkPlacements?.push(pos);
+}
+
+// True when pos is the block the bot stands on, or one further down under her.
+export function underBot(bot, pos) {
+  const p = bot.entity.position;
+  if (pos.y > Math.floor(p.y - 0.01)) return false;
+  return pos.x >= Math.floor(p.x - 0.3) && pos.x <= Math.floor(p.x + 0.3) && pos.z >= Math.floor(p.z - 0.3) && pos.z <= Math.floor(p.z + 0.3);
+}
+
+// Whether her walk scaffolding at pos may come down now. 'wait' while a build going on is round
+// it, a block of hers on top of it still stands (top first), or a neighbour isn't loaded.
+// 'unsafe' when something that isn't terrain or hers has turned up against it since she put it
+// there, like a player's torch or block: then it stays up for good. A neighbour that was already
+// there can't hang from her block, which wasn't there yet.
+export function scaffoldRemovable(bot, pos) {
+  const log = bot.walkScaffold;
+  const dim = bot.game?.dimension;
+  const entry = log?.get(pos, dim);
+  if (!entry || inZone(bot.buildZone, pos)) return 'wait';
+  for (let i = 0; i < FACES6.length; i++) {
+    const p = pos.offset(...FACES6[i]);
+    const b = bot.blockAt(p, false);
+    if (!b) return 'wait';
+    if (log.has(p, b.name, dim)) {
+      if (FACES6[i][1] === 1) return 'wait';
+      continue;
+    }
+    if (b.name === entry.around?.[i] || AIR.has(b.name) || b.name === 'water') continue;
+    if (ATTACHED.test(b.name)) return 'unsafe';
+    if (bot.placedLog?.has(p, b.name)) continue;
+    if (playerPlaced(bot, p)) return 'unsafe';
+    if (isNaturalBlock(b.name)) continue;
+    return 'unsafe';
+  }
+  return 'ok';
+}
+
+// Right after a walk she takes down this many of its blocks at most, the ones in reach that each
+// break within QUICK_DIG_MS. The rest are left for free time (the tidy chore in idle.js).
+const TAKE_DOWN_MAX = 4;
+const QUICK_DIG_MS = 1500;
+
+function slowToBreak(bot, block) {
+  const tool = bot.pathfinder.bestHarvestTool?.(block);
+  return block.digTime(tool?.type ?? null, false, false, false, [], {}) > QUICK_DIG_MS;
+}
+
+// Takes down what a walk just put down, top first, from where she stands: never the block under
+// her or one holding it up.
+async function takeDownBehind(ctx, placed) {
+  const { bot } = ctx;
+  const log = bot.walkScaffold;
+  const dim = bot.game?.dimension;
+  let removed = 0;
+  for (const pos of [...placed].sort((a, b) => b.y - a.y)) {
+    if (removed >= TAKE_DOWN_MAX || ctx.signal?.aborted || bot.pathfinder.goal) break;
+    const block = bot.blockAt(pos, false);
+    if (!block || !log.has(pos, block.name, dim) || underBot(bot, pos) || !inReach(bot, pos) || slowToBreak(bot, block)) continue;
+    const safe = scaffoldRemovable(bot, pos);
+    if (safe === 'unsafe') log.removeColumn(pos, dim);
+    if (safe !== 'ok') continue;
+    if ((await digBlock(ctx, pos, { anyTool: true })).ok) {
+      log.remove(pos, dim);
+      removed++;
+    }
+  }
+  return removed;
 }
 
 // Terrain the pathfinder may dig through while walking. Anything else, like planks, glass,
@@ -289,7 +578,7 @@ function nearBuild(bot, pos) {
 // block is worth about 7. Nothing is ever placed next to builds.
 //
 // MODES are for the pathfinder's own searches, which follow a moving goal (a player, a mob)
-// as they go; a placed block costs 40 there so following never builds. Walks to a fixed spot
+// as they go, in follow, which never digs or places. Walks to a fixed spot
 // are planned in full first (planRoute) with PLAN_MODES: on foot first, so digging and placing
 // only come in when no existing way is short enough, and then a placed block can be cheap (one
 // extra block of walking). The search has to rule out everything cheaper before it settles on
@@ -297,7 +586,8 @@ function nearBuild(bot, pos) {
 const MODES = {
   walk: { digCost: 8, placeCost: 40, place: true },
   climb: { digCost: 3, placeCost: 12, place: true },
-  noPlace: { digCost: 8, place: false }
+  noPlace: { digCost: 8, place: false },
+  follow: { dig: false, place: false }
 };
 
 const PLAN_MODES = {
@@ -305,13 +595,14 @@ const PLAN_MODES = {
   walk: { digCost: 8, placeCost: 1, place: true },
   climb: { digCost: 3, placeCost: 1, place: true },
   noPlace: { digCost: 8, place: false },
-  digClimb: { digCost: 2, placeCost: 1, place: true },
-  digNoPlace: { digCost: 2, place: false }
+  digClimb: { digCost: 2, placeCost: 1, place: true, digWalk: true },
+  digNoPlace: { digCost: 2, place: false, digWalk: true }
 };
 
-function makeMovements(bot, cantBreak, { digCost = 0, placeCost = 0, place, dig = true }) {
+function makeMovements(bot, cantBreak, { digCost = 0, placeCost = 0, place, dig = true, digWalk = false }) {
   const m = new DoorMovements(bot);
   m.canDig = dig;
+  m.digWalk = digWalk;
   m.digCost = digCost;
   m.placeCost = placeCost;
   // Plan around players and mobs where there's room, so someone standing in one half of a
@@ -461,9 +752,32 @@ export function centreRawSteps(path) {
   }
 }
 
+// The pathfinder aims a step up a ladder at the middle of the ladder's thin plate, on the wall
+// side of the block, so the bot presses on the plate and climbs. Coming from the side, along
+// the wall, the bot's body runs into the end of the plate at the edge of the block and never
+// gets onto the ladder. A step into the middle of the ladder's block at the floor goes first,
+// and from there the climb presses on the plate.
+export function ladderEntrySteps(path, from, getBlock) {
+  for (let i = 0; i < path.length; i++) {
+    const step = path[i];
+    if (step.toBreak.length > 0 || step.toPlace.length > 0) return;
+    const prev = i > 0 ? path[i - 1] : from;
+    const ladder = new Vec3(Math.floor(step.x), Math.floor(step.y) - 1, Math.floor(step.z));
+    if (step.y - prev.y < 0.5 || (Math.floor(prev.x) === ladder.x && Math.floor(prev.z) === ladder.z)) continue;
+    const floor = new Vec3(ladder.x, Math.floor(prev.y), ladder.z);
+    if (floor.y > ladder.y || getBlock(ladder)?.name !== 'ladder' || getBlock(floor)?.name !== 'ladder') continue;
+    const entry = copyStep(step);
+    entry.x = floor.x + 0.5;
+    entry.y = floor.y;
+    entry.z = floor.z + 0.5;
+    path.splice(i, 0, entry);
+    i++;
+  }
+}
+
 // A block that fills an empty spot with a player close by, like dirt patched into a hole. It
 // looks like terrain, so walks would dig it, but someone put it there: walks leave it for an
-// hour. Not while the pathfinder is putting down scaffolding right there itself.
+// hour. Not a block the pathfinder put down there itself (pathfinderPlacing).
 const PLAYER_BLOCK_MS = 3600000;
 const PLAYER_BLOCK_MAX = 5000;
 
@@ -479,7 +793,7 @@ function watchPlayerBlocks(bot) {
     }
     if (oldBlock.boundingBox !== 'empty') return;
     const centre = newBlock.position.offset(0.5, 0.5, 0.5);
-    if (bot.pathfinder.isBuilding() && bot.entity.position.distanceTo(centre) <= 6) return;
+    if (pathfinderPlacing(bot, newBlock.position)) return;
     if (!Object.values(bot.players).some((p) => p.entity && p.entity !== bot.entity && p.entity.position.distanceTo(centre) <= 6)) return;
     blocks.delete(key);
     blocks.set(key, Date.now() + PLAYER_BLOCK_MS);
@@ -511,8 +825,24 @@ export function setupMovements(bot) {
       return walk && walk.goal === goal ? walk.handOut() : getPathTo(movements, goal, timeout);
     };
   }
-  bot.on('path_update', (results) => centreRawSteps(results.path));
+  bot.on('path_update', (results) => {
+    centreRawSteps(results.path);
+    if (bot.entity) ladderEntrySteps(results.path, bot.entity.position, (p) => bot.blockAt(p, false));
+  });
+  // A moving goal (a player or mob to keep up with) never digs: wherever they went there is a
+  // way that needs none, and when the bot can't keep up it waits there instead of tunnelling.
+  const setGoal = bot.pathfinder.setGoal;
+  if (setGoal) {
+    bot.pathfinder.setGoal = (goal, dynamic) => {
+      if (goal && 'entity' in goal && bot.pathfinder.movements?.canDig) {
+        bot.pathfinder.setMovements(bot.moveModes.follow);
+        bot.moveMode = 'follow';
+      }
+      setGoal(goal, dynamic);
+    };
+  }
   watchPlayerBlocks(bot);
+  watchWalkScaffold(bot);
   passagesOnPath(bot);
   watchStalls(bot);
 }
@@ -609,8 +939,16 @@ function nowhereToStand(m, goal) {
   return true;
 }
 
-function noRouteText(bot, goal, m, tried, refused) {
+function noRouteText(bot, goal, m, tried, refused, doors = new Map()) {
   const parts = [`no route found, so nothing was dug or placed. Tried ${tried.join(', then ')}`];
+  const here = bot.entity.position;
+  const door = [...doors.values()].sort((a, b) => a.door.distanceTo(here) - b.door.distanceTo(here))[0];
+  if (door) {
+    const failed = (bot.ironDoorFails?.get(doorSide(door.door, door.front)) ?? 0) > Date.now();
+    parts.push(failed
+      ? `The iron door at ${posText(door.door)} didn't open with the button or lever on this side`
+      : `There is an iron door at ${posText(door.door)} with no button, lever or pressure plate on this side`);
+  }
   const target = goalPos(goal);
   if (target && nowhereToStand(m, goal)) {
     const r = Math.round(Math.sqrt(goal.rangeSq ?? 0));
@@ -659,8 +997,22 @@ function digGoal(goal, weight) {
 // way that only gets closer (left is the distance it leaves), or { status: 'none', message }
 // when there is nothing worth walking. A partial way is on foot, except on a dig walk (dig set,
 // for a block to dig out), where it may dig: it only goes through what the walk may dig anyway.
-// Null when stopped.
-export async function planRoute(bot, goal, place, { dig = false, onFootMs = PLAN_BUDGET.onFoot, buildMs = PLAN_BUDGET.build, stopped = () => false } = {}) {
+// With onFoot set there is only the first search. Null when stopped.
+export async function planRoute(bot, goal, place, options = {}) {
+  const doors = new Map();
+  const m = options.onFoot ? bot.planModes.onFoot : bot.planModes[planModeName(place, options.dig)];
+  const onDoor = (door, front) => doors.set(doorSide(door, front), { door, front });
+  bot.planModes.onFoot.onRefusedDoor = onDoor;
+  m.onRefusedDoor = onDoor;
+  try {
+    return await planSearches(bot, goal, place, m, doors, options);
+  } finally {
+    bot.planModes.onFoot.onRefusedDoor = null;
+    m.onRefusedDoor = null;
+  }
+}
+
+async function planSearches(bot, goal, place, m, doors, { dig = false, onFoot = false, onFootMs = PLAN_BUDGET.onFoot, buildMs = PLAN_BUDGET.build, stopped = () => false }) {
   const here = bot.entity.position.floored();
   if (goal.isEnd(here)) return { status: 'success', path: [] };
   const digging = dig && goal.pos;
@@ -674,10 +1026,13 @@ export async function planRoute(bot, goal, place, { dig = false, onFootMs = PLAN
   const tried = [foot.status === 'noPath'
     ? `on foot (no way within ${Math.round(h + onFootRadius(h))} blocks of walking)`
     : `on foot (nothing complete after ${onFootMs / 1000}s)`];
-  const m = bot.planModes[planModeName(place, dig)];
   const closer = foot.path.length > 0 && h - left >= 2 ? { status: 'partial', path: foot.path, left } : null;
   // Still getting closer on foot when time ran out: keep walking and look again from there.
-  if (foot.status === 'timeout' && closer && h - left >= Math.max(8, h / 4)) return { ...closer, message: noRouteText(bot, goal, m, tried, 0) };
+  if (foot.status === 'timeout' && closer && h - left >= Math.max(8, h / 4)) return { ...closer, message: noRouteText(bot, goal, m, tried, 0, doors) };
+  if (onFoot) {
+    const message = noRouteText(bot, goal, m, tried, 0, doors);
+    return closer ? { ...closer, message } : { status: 'none', message };
+  }
 
   let refused = 0;
   const target = goalPos(goal);
@@ -688,7 +1043,7 @@ export async function planRoute(bot, goal, place, { dig = false, onFootMs = PLAN
   if (build.status === 'success') return { status: 'success', path: build.path };
   const how = m.allow1by1towers ? 'digging and placing' : 'digging';
   tried.push(build.status === 'noPath' ? `${how} (no way at all)` : `${how} (nothing complete after ${buildMs / 1000}s)`);
-  const message = noRouteText(bot, goal, m, tried, refused);
+  const message = noRouteText(bot, goal, m, tried, refused, doors);
   if (build.status === 'timeout' && digging && build.path.length > 0) {
     const dug = goal.heuristic(build.context.bestNode.data);
     if (h - dug >= 2) return { status: 'partial', path: build.path, left: dug, message };
@@ -723,7 +1078,7 @@ function pathError(name, message) {
 // it gets the rest of the same steps back. Any other reason (stuck, a block on the way changed
 // by someone else, out of blocks, the steps ran out short of the goal) makes the bot stand
 // still and plan again from where it is.
-async function plannedGoto(bot, goal, place, dig) {
+async function plannedGoto(bot, goal, place, dig, onFoot) {
   const walk = { goal, ready: null, steps: [], expected: new Set(), reset: null, dirty: false, following: false, replan: false, end: null };
   let wake = () => {};
   const again = () => {
@@ -786,7 +1141,7 @@ async function plannedGoto(bot, goal, place, dig) {
     let best = Infinity;
     while (!walk.end) {
       walk.replan = false;
-      const plan = await planRoute(bot, goal, place, { dig, stopped: () => walk.end !== null });
+      const plan = await planRoute(bot, goal, place, { dig, onFoot, stopped: () => walk.end !== null });
       if (!plan || walk.end) break;
       if (plan.status === 'none') throw pathError('NoRoute', plan.message);
       if (plan.path.length === 0) break;
@@ -823,10 +1178,37 @@ function walkFail(reason, message) {
 // for moveTimeoutSeconds, or a short walk sooner (see walkPatience), not counting time spent
 // digging or placing blocks on the way. A fixed goal gets its route planned first
 // (plannedGoto); a moving one (an entity) is left to the pathfinder, which keeps up with it.
-// Set dig when the walk is to a block the bot will dig out, so a buried one can be dug to.
-export async function walkTo(ctx, goal, { place = true, dig = false } = {}) {
+// Set dig when the walk is to a block the bot will dig out, so a buried one can be dug to, and
+// onFoot for a walk that neither digs nor places. A lever left on to get through an iron door is
+// mentioned at the end. Scaffolding the walk put down comes down again where she can reach it
+// from where she ends up, unless the walk was stopped for something else.
+export async function walkTo(ctx, goal, options = {}) {
+  const { bot } = ctx;
+  bot.leversLeftOn?.splice(0);
+  const placed = [];
+  const outer = bot.walkPlacements;
+  bot.walkPlacements = placed;
+  let result;
+  try {
+    result = await walkOnce(ctx, goal, options);
+  } finally {
+    bot.walkPlacements = outer;
+  }
+  settleLevers(bot);
+  if (placed.length && bot.walkScaffold && result.reason !== 'stopped' && result.reason !== 'interrupted') await takeDownBehind(ctx, placed);
+  const left = bot.leversLeftOn?.splice(0) ?? [];
+  if (left.length === 0) return result;
+  const text = left.map(({ lever, door }) => `I left the lever at ${posText(lever)} on, so the iron door at ${posText(door)} stays open`).join('. ');
+  return { ...result, message: `${result.message}. ${text}` };
+}
+
+async function walkOnce(ctx, goal, { place = true, dig = false, onFoot = false }) {
   const { bot, config, signal } = ctx;
-  useMoveMode(bot, place);
+  if (!onFoot) useMoveMode(bot, place);
+  else if (bot.moveModes && bot.moveMode !== 'follow') {
+    bot.pathfinder.setMovements(bot.moveModes.follow);
+    bot.moveMode = 'follow';
+  }
   const planned = bot.planModes && !('entity' in goal);
   const full = config.limits.moveTimeoutSeconds * 1000;
   const target = goalPos(goal);
@@ -849,7 +1231,7 @@ export async function walkTo(ctx, goal, { place = true, dig = false } = {}) {
     return now - bestAt > full || waited > patience;
   };
   try {
-    await guarded(() => (planned ? plannedGoto(bot, goal, place, dig) : bot.pathfinder.goto(goal)), {
+    await guarded(() => (planned ? plannedGoto(bot, goal, place, dig, onFoot) : bot.pathfinder.goto(goal)), {
       ms: target ? full * 8 : full,
       signal,
       stalled: target ? stalled : undefined,

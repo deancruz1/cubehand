@@ -445,20 +445,15 @@ function scaffoldInSite(site, p) {
   return p.x >= site.min.x - 2 && p.x <= site.max.x + 2 && p.z >= site.min.z - 2 && p.z <= site.max.z + 2 && p.y >= bottom && p.y <= site.max.y + 3;
 }
 
-// A block that shows up at p is the bot's own scaffolding when the pathfinder is placing one
-// right then, next to the bot. Anything a player or the world puts there stays.
-function placingScaffold(bot, p) {
-  return Boolean(bot.pathfinder?.isBuilding?.()) && bot.entity.position.distanceTo(p.offset(0.5, 0.5, 0.5)) <= 6;
-}
-
-// Notes the bot's scaffolding around a build until stop(). strays gets the keys of planned
-// spots (planned.has(key)) it went on, for placeAll to dig out first. leftover(blocks) is what
+// Notes the bot's scaffolding around a build until stop(): only blocks the pathfinder put down
+// (see watchScaffold), so anything a player or the world puts there stays. strays gets the keys
+// of planned spots (planned.has(key)) it went on, for placeAll to dig out first. leftover(blocks) is what
 // to take down afterwards: the scaffolding beside the build, and any still on the spot of one
 // of blocks that didn't get placed.
 export function watchBuildScaffold(bot, site, planned) {
   const strays = new Set();
   const { placed, stop } = watchScaffold(bot, (p) => {
-    if (!scaffoldInSite(site, p) || !placingScaffold(bot, p)) return false;
+    if (!scaffoldInSite(site, p)) return false;
     const key = `${p.x},${p.y},${p.z}`;
     if (!planned.has(key)) return true;
     if (!bot.buildKeep?.has(bot.registry.itemsByName[bot.blockAt(p, false)?.name]?.id)) strays.add(key);
