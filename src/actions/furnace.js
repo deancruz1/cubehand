@@ -1,10 +1,10 @@
 import { Vec3 } from 'vec3';
 import pathfinderPkg from 'mineflayer-pathfinder';
-import { ok, fail, posText, pause } from './util.js';
+import { ok, fail, posText, pause, delay, TimeoutError, AbortedError } from './util.js';
 import { walkTo } from './movement.js';
 import { findNearest, inReach, placeOne } from './blocks.js';
 import { craft, placeSpot } from './crafting.js';
-import { countItems } from './containers.js';
+import { countItems, openWindow } from './containers.js';
 import { gainedText } from './items.js';
 
 const { GoalLookAtBlock } = pathfinderPkg.goals;
@@ -73,7 +73,7 @@ export function pickFuel(counts, items, { exclude, only } = {}) {
   return best;
 }
 
-function furnaceKind(input) {
+export function furnaceKind(input) {
   if (/^raw_|_ore$|^ancient_debris$/.test(input)) return 'blast_furnace';
   if (RAW_FOOD.includes(input)) return 'smoker';
   return 'furnace';
@@ -94,8 +94,10 @@ async function openAt(ctx, pos) {
   await bot.lookAt(pos.offset(0.5, 0.5, 0.5)).catch(() => {});
   await pause(200, 450);
   try {
-    return { furnace: await bot.openFurnace(block), kind: block.name };
+    return { furnace: await openWindow(ctx, () => bot.openFurnace(block)), kind: block.name };
   } catch (err) {
+    if (err instanceof AbortedError) return { error: 'stopped' };
+    if (err instanceof TimeoutError) return { error: `the furnace at ${posText(pos)} wouldn't open` };
     return { error: `could not open the furnace at ${posText(pos)}: ${err.message}` };
   }
 }
@@ -159,7 +161,7 @@ async function waitForFurnace(ctx, furnace, perItem, seconds) {
       problem = 'stopped';
       break;
     }
-    await pause(1000);
+    await delay(1000);
     if ((furnace.outputItem()?.count ?? 0) >= 56) await furnace.takeOutput().catch(() => {});
     const now = furnace.inputItem()?.count ?? 0;
     ctx.status?.progress(`smelting, ${now} left`);

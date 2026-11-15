@@ -10,9 +10,23 @@ export function botPos(bot) {
   return `now at ${posText(bot.entity.position)}`;
 }
 
+let pauseScale = 1;
+
+// bot.pauseScale in config: 1 keeps the pauses as they are, 0 drops them.
+export function setPauseScale(scale = 1) {
+  pauseScale = scale;
+}
+
 // A short random wait, so actions don't happen with inhuman speed (opening a chest and
 // slamming it shut in the same tick, and so on).
 export function pause(minMs, maxMs = minMs) {
+  const ms = (minMs + Math.random() * (maxMs - minMs)) * pauseScale;
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// A wait the bot's behaviour depends on (attack cooldowns, polling, the server catching up,
+// an item being picked up), so pauseScale never touches it.
+export function delay(minMs, maxMs = minMs) {
   const ms = minMs + Math.random() * (maxMs - minMs);
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -17,9 +17,22 @@ export function classifyMessage({ username, message, whisper = false }, { botNam
   const allowed = allowlist.some((p) => p.toLowerCase() === username.toLowerCase());
   if (!mentioned || !allowed) return { type: 'history' };
 
-  const rest = whisper ? message : message.replace(new RegExp(`^\\s*@?${name}[\\s,:]*`, 'i'), '');
-  if (/^\s*stop[\s.!]*$/i.test(rest)) return { type: 'stop' };
+  if (isStop(message, name)) return { type: 'stop' };
   return { type: 'request', text: message };
+}
+
+const STOP = /^(?:please )?(?:stop|pause|halt|cancel)(?: (?:here|now|that|it|please|everything|what you(?:'|’)?re doing|what you are doing)){0,3}$/;
+
+// "stop", "pause.", "Clodine, stop here", "stop it now please", "cancel that Clodine". Anything
+// that goes on to ask for something else ("stop by the farm") is a request.
+function isStop(message, name) {
+  const words = message
+    .toLowerCase()
+    .replace(new RegExp(`@?\\b${name}\\b`, 'gi'), ' ')
+    .replace(/[.,!?;:]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return STOP.test(words);
 }
 
 // The chat line can carry team prefixes like "<<Team> Name> hi", so cut everything up to "Name> ".

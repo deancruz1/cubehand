@@ -2,7 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Vec3 } from 'vec3';
 import { parseBlock, blockText, stateProblem, matchesState, placementOptions, itemFor } from '../src/actions/states.js';
-import { expandParts, planBuild } from '../src/actions/build.js';
+import { EventEmitter } from 'node:events';
+import { expandParts, planBuild, nearestFirst, buildSite, buildStructure, watchBuildScaffold } from '../src/actions/build.js';
+import { setPauseScale } from '../src/actions/util.js';
 import { planHouse, buildHouse } from '../src/actions/house.js';
 import { placeOne } from '../src/actions/blocks.js';
 
@@ -216,4 +218,182 @@ test('inspecting a box puts runs of the same block on one line', async () => {
   assert.equal(result.message.split('\n').slice(1).join('|'), '0 64 0..1: stone|0 64 2..4: air');
   const one = await inspectBlocks({ bot, config: { limits: { maxInspectBlocks: 600 } } }, { x1: 0, y1: 64, z1: 3 });
   assert.equal(one.message, '0 64 3: air');
+});
+
+// Walks through placements like the bot does: it only moves when the next block is out of
+// reach, then stands right by it. Counts the walks and the blocks walked.
+function walkThrough(order, start) {
+  const at = { ...start };
+  const eye = () => ({ x: at.x, y: at.y + 1.6, z: at.z });
+  let walks = 0;
+  let walked = 0;
+  for (const p of order(eye)) {
+    const e = eye();
+    if (Math.hypot(p.x + 0.5 - e.x, p.y + 0.5 - e.y, p.z + 0.5 - e.z) > 4.5) {
+      walks++;
+      walked += Math.hypot(p.x + 0.5 - at.x, p.z + 0.5 - at.z);
+      Object.assign(at, { x: p.x + 0.5, z: p.z + 1.5 });
+    }
+  }
+  return { walks, walked };
+}
+
+test('a ring of walls goes up around the ring, not from two ends at once', () => {
+  const blocks = expandParts([{ shape: 'walls', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 10, dy: 0, dz: 10 }, block: 'oak_planks' }]);
+  const start = { x: 5.5, y: 64, z: -1.5 };
+  const plan = planBuild({ origin: { x: 0, y: 64, z: 0 }, blocks, botPos: { x: 5, y: 64, z: -2 }, getName: () => 'air', inventory: new Map(), maxBlocks: 500, isKnownBlock: () => true });
+  const before = walkThrough(() => plan.placements, start);
+  const after = walkThrough((eye) => nearestFirst(plan.placements, eye), start);
+  assert.equal([...nearestFirst(plan.placements, () => start)].length, 40);
+  assert.ok(after.walks <= 8, `walked ${after.walks} times`);
+  assert.ok(after.walks < before.walks / 2, `${after.walks} walks against ${before.walks}`);
+  assert.ok(after.walked < before.walked / 2, `${Math.round(after.walked)} blocks against ${Math.round(before.walked)}`);
+});
+
+test('everything in reach is placed before the bot walks on', () => {
+  const blocks = Array.from({ length: 12 }, (_, i) => ({ x: i * 2, y: 64, z: 0 }));
+  const at = { x: 0.5, y: 65.6, z: 1.5 };
+  const order = [];
+  for (const p of nearestFirst(blocks, () => at)) {
+    const inReach = (q) => Math.hypot(q.x + 0.5 - at.x, q.y + 0.5 - at.y, q.z + 0.5 - at.z) <= 4.5;
+    const left = blocks.filter((q) => !order.includes(q) && q !== p);
+    if (!inReach(p)) {
+      assert.ok(!left.some(inReach));
+      Object.assign(at, { x: p.x + 0.5, z: 1.5 });
+    }
+    order.push(p);
+  }
+  assert.deepEqual(order.map((p) => p.x), [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]);
+});
+
+test('the site of a structure is the box its blocks fill', () => {
+  const site = buildSite({ x: 10, y: 64, z: -5 }, [{ dx: 0, dy: 0, dz: 0 }, { dx: 3, dy: 4, dz: -2 }]);
+  assert.deepEqual([site.min.x, site.min.y, site.min.z], [10, 64, -7]);
+  assert.deepEqual([site.max.x, site.max.y, site.max.z], [13, 68, -5]);
+  assert.ok(site.planned.has('13,68,-7'));
+});
+
+test('build_structure keeps its materials out of scaffolding and takes its scaffolding down', async () => {
+  setPauseScale(0);
+  const world = new Map();
+  const solid = (name, pos) => ({ name, position: pos, boundingBox: 'block', shapes: [[0, 0, 0, 1, 1, 1]], getProperties: () => ({}) });
+  for (let x = -2; x <= 6; x++) for (let z = -3; z <= 3; z++) world.set(`${x},63,${z}`, solid('stone', new Vec3(x, 63, z)));
+  const ids = { oak_planks: 5, cobblestone: 4 };
+  const during = [];
+  let building = false;
+  const bot = Object.assign(new EventEmitter(), {
+    entity: { position: new Vec3(1.5, 64, -1.5), height: 1.62 },
+    registry: { blocksByName: { oak_planks: {}, cobblestone: {} }, itemsByName: { oak_planks: { id: 5 }, cobblestone: { id: 4 } } },
+    inventory: { items: () => [{ name: 'oak_planks', count: 10, type: ids.oak_planks }] },
+    blockAt: (p) => world.get(`${p.x},${p.y},${p.z}`) ?? { name: 'air', position: p, boundingBox: 'empty', getProperties: () => ({}) },
+    equip: async () => {},
+    placeBlock: async (ref, face) => {
+      const pos = ref.position.plus(face);
+      world.set(`${pos.x},${pos.y},${pos.z}`, solid('oak_planks', pos));
+      during.push({ zone: bot.buildZone, keep: bot.buildKeep });
+      if (during.length === 1) {
+        // The pathfinder pillars up on cobblestone next to the build.
+        const s = new Vec3(3, 64, 1);
+        const old = bot.blockAt(s);
+        world.set('3,64,1', solid('cobblestone', s));
+        building = true;
+        bot.emit('blockUpdate', old, world.get('3,64,1'));
+        building = false;
+      }
+    },
+    canDigBlock: () => true,
+    dig: async (block) => world.delete(`${block.position.x},${block.position.y},${block.position.z}`),
+    pathfinder: { bestHarvestTool: () => null, isBuilding: () => building }
+  });
+  const ctx = { bot, config: { limits: { maxBuildBlocks: 100 } } };
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, parts: [{ shape: 'line', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 2, dy: 0, dz: 0 }, block: 'oak_planks' }] });
+  setPauseScale(1);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /placed 3, skipped 0, failed 0, took down 1 scaffolding blocks/);
+  assert.equal(during.length, 3);
+  assert.deepEqual([during[0].zone.min.x, during[0].zone.min.y, during[0].zone.max.x, during[0].zone.max.y], [-2, 63, 4, 66]);
+  assert.deepEqual([...during[0].keep], [5]);
+  assert.equal(bot.buildZone, null);
+  assert.equal(bot.buildKeep, null);
+  assert.equal(bot.blockAt(new Vec3(3, 64, 1)).name, 'air');
+  assert.equal(bot.listenerCount('blockUpdate'), 0);
+});
+
+test('build_structure digs its scaffolding out of planned spots and leaves blocks it did not place', async () => {
+  setPauseScale(0);
+  const world = new Map();
+  const solid = (name, pos) => ({ name, position: pos, boundingBox: 'block', shapes: [[0, 0, 0, 1, 1, 1]], getProperties: () => ({}) });
+  for (let x = -2; x <= 6; x++) for (let z = -3; z <= 3; z++) world.set(`${x},63,${z}`, solid('stone', new Vec3(x, 63, z)));
+  let building = false;
+  let placings = 0;
+  const put = (name, x, y, z, byBot) => {
+    const s = new Vec3(x, y, z);
+    const old = bot.blockAt(s);
+    world.set(`${x},${y},${z}`, solid(name, s));
+    building = byBot;
+    bot.emit('blockUpdate', old, world.get(`${x},${y},${z}`));
+    building = false;
+  };
+  const bot = Object.assign(new EventEmitter(), {
+    entity: { position: new Vec3(1.5, 64, -1.5), height: 1.62 },
+    registry: { blocksByName: { oak_planks: {}, cobblestone: {}, dirt: {} }, itemsByName: { oak_planks: { id: 5 }, cobblestone: { id: 4 }, dirt: { id: 3 } } },
+    inventory: { items: () => [{ name: 'oak_planks', count: 10, type: 5 }] },
+    blockAt: (p) => world.get(`${p.x},${p.y},${p.z}`) ?? { name: 'air', position: p, boundingBox: 'empty', getProperties: () => ({}) },
+    equip: async () => {},
+    placeBlock: async (ref, face) => {
+      const pos = ref.position.plus(face);
+      world.set(`${pos.x},${pos.y},${pos.z}`, solid('oak_planks', pos));
+      if (++placings === 1) {
+        // The pathfinder leaves dirt on a spot the plan still needs, and pillars up far over the
+        // build; a player puts dirt down beside it.
+        put('dirt', 2, 64, 0, true);
+        put('cobblestone', 2, 68, 0, true);
+        put('dirt', 3, 64, 1, false);
+      }
+    },
+    canDigBlock: () => true,
+    dig: async (block) => world.delete(`${block.position.x},${block.position.y},${block.position.z}`),
+    pathfinder: { bestHarvestTool: () => null, isBuilding: () => building }
+  });
+  const ctx = { bot, config: { limits: { maxBuildBlocks: 100 } } };
+  const result = await buildStructure(ctx, { origin: { x: 0, y: 64, z: 0 }, parts: [{ shape: 'line', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 2, dy: 0, dz: 0 }, block: 'oak_planks' }] });
+  setPauseScale(1);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /placed 3, skipped 0, failed 0$/);
+  assert.equal(bot.blockAt(new Vec3(2, 64, 0)).name, 'oak_planks');
+  assert.equal(bot.blockAt(new Vec3(2, 68, 0)).name, 'cobblestone');
+  assert.equal(bot.blockAt(new Vec3(3, 64, 1)).name, 'dirt');
+});
+
+test('build_house notes scaffolding on its planned spots and only claims its own blocks near the house', () => {
+  const plan = planHouse({ x: 0, y: 64, z: 0, width: 5, depth: 5, roof: 'flat', materials: { walls: 'cobblestone', floor: 'oak_planks', door: 'none', windows: 'none' } });
+  const planned = new Map(plan.blocks.map((b) => [`${b.x},${b.y},${b.z}`, b]));
+  const world = new Map();
+  let building = false;
+  const bot = Object.assign(new EventEmitter(), {
+    entity: { position: new Vec3(3.5, 64, 3.5) },
+    registry: { itemsByName: { cobblestone: { id: 4 }, oak_planks: { id: 5 }, dirt: { id: 3 } } },
+    buildKeep: new Set([4, 5]),
+    blockAt: (p) => ({ name: world.get(`${p.x},${p.y},${p.z}`) ?? 'air', position: p, getProperties: () => ({}) }),
+    pathfinder: { isBuilding: () => building }
+  });
+  const scaffold = watchBuildScaffold(bot, plan, planned);
+  const put = (name, x, y, z, byBot) => {
+    bot.entity.position = new Vec3(x + 1.5, y + 1, z + 0.5);
+    world.set(`${x},${y},${z}`, name);
+    building = byBot;
+    bot.emit('blockUpdate', { boundingBox: 'empty' }, { name, position: new Vec3(x, y, z) });
+    building = false;
+  };
+  const wall = plan.blocks.find((b) => b.block === 'cobblestone' && b.y === 65);
+  put('dirt', wall.x, wall.y, wall.z, true);
+  put('dirt', 4, 64, 4, true);
+  put('dirt', 4, plan.max.y + 4, 4, true);
+  put('dirt', 3, 64, 4, false);
+  scaffold.stop();
+  assert.deepEqual([...scaffold.strays], [`${wall.x},${wall.y},${wall.z}`]);
+  assert.deepEqual(scaffold.leftover(plan.blocks).map((p) => `${p.x},${p.y},${p.z}`), ['4,64,4', `${wall.x},${wall.y},${wall.z}`]);
+  world.set(`${wall.x},${wall.y},${wall.z}`, 'cobblestone');
+  assert.deepEqual(scaffold.leftover(plan.blocks).map((p) => `${p.x},${p.y},${p.z}`), ['4,64,4']);
+  assert.equal(bot.listenerCount('blockUpdate'), 0);
 });

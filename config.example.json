@@ -5,7 +5,8 @@
     "version": "26.1"
   },
   "bot": {
-    "username": "Clodine"
+    "username": "Clodine",
+    "pauseScale": 1
   },
   "allowlist": ["YourName", "FriendName"],
   "admins": ["YourName"],
@@ -30,6 +31,7 @@
     "queueSize": 3,
     "maxBuildBlocks": 2000,
     "maxInspectBlocks": 600,
+    "maxDigBlocks": 1000,
     "moveTimeoutSeconds": 90,
     "stuckSeconds": 45,
     "quietSeconds": 60

@@ -1,6 +1,6 @@
 import { Vec3 } from 'vec3';
 import pathfinderPkg from 'mineflayer-pathfinder';
-import { ok, fail, posText, pause } from './util.js';
+import { ok, fail, posText, pause, delay } from './util.js';
 import { walkTo, isGate, isOpen, SCAFFOLD_BLOCKS } from './movement.js';
 import { collectDrops } from './items.js';
 import { parseBlock, blockText, stateText, stateProblem, matchesState, placementOptions, itemFor } from './states.js';
@@ -145,7 +145,7 @@ export async function placeOne(ctx, name, pos, { attach, props } = {}) {
   // The right block turned the wrong way: its own blocks get redone, anyone else's stay.
   if (target.name === name) {
     if (!ctx.placed?.has(pos, name)) return fail(`position occupied by ${stateText(target)}: ${posText(pos)}`);
-    const dug = await digBlock(ctx, pos);
+    const dug = await digBlock(ctx, pos, { anyTool: true });
     if (!dug.ok) return dug;
     target = bot.blockAt(pos, false);
   }
@@ -188,7 +188,7 @@ export async function placeOne(ctx, name, pos, { attach, props } = {}) {
   if (props?.open !== undefined && placed?.name === name && !name.startsWith('iron_') && String(placed.getProperties?.().open) !== props.open) {
     try {
       await bot.activateBlock(placed);
-      await pause(150, 250);
+      await delay(150, 250);
       placed = bot.blockAt(pos, false);
     } catch {}
   }
@@ -241,15 +241,25 @@ export async function breakBlock(ctx, { x, y, z, confirmed }) {
   const mine = ctx.placed?.has(pos, block.name);
   if (isProtected(block.name, config.protectedBlocks) && !mine) {
     if (!confirmed) return fail(`protected block: ${block.name}. Only break it if a player clearly asked for this one (then set confirmed), or if you placed it yourself.`);
-    if (ctx.requester && !isAdmin(config, ctx.requester)) return fail(`protected block: ${block.name}. Only an admin can have you break someone's ${block.name}, and ${ctx.requester} isn't one.`);
+    if (!ctx.requester) return fail(`protected block: ${block.name}. Nobody asked for this job, so you can't break someone's ${block.name}. Only an admin's request can.`);
+    if (!isAdmin(config, ctx.requester)) return fail(`protected block: ${block.name}. Only an admin can have you break someone's ${block.name}, and ${ctx.requester} isn't one.`);
   }
   const result = await digBlock(ctx, pos);
   if (result.ok) await collectDrops(ctx, { radius: 3, center: pos.offset(0.5, 0.5, 0.5), max: 3 });
   return result;
 }
 
-// Walks over and digs the block with the best tool. No protection checks.
-export async function digBlock(ctx, pos) {
+// True when the tool type can't harvest the block and breaking it anyway would take long. Without
+// the right tool a block takes 5 seconds per point of hardness, so soft ones like snow layers
+// and snow blocks go in a second and aren't worth refusing.
+export function needsBetterTool(block, type) {
+  if (!block.harvestTools || block.canHarvest(type)) return false;
+  return !(block.hardness <= 0.2);
+}
+
+// Walks over and digs the block with the best tool. No protection checks. anyTool digs it even
+// when the tools can't harvest it, for blocks where getting them out matters more than the drop.
+export async function digBlock(ctx, pos, { anyTool = false } = {}) {
   const { bot, signal } = ctx;
   const { y } = pos;
   const block = bot.blockAt(pos, false);
@@ -270,6 +280,10 @@ export async function digBlock(ctx, pos) {
 
   const tool = bot.pathfinder.bestHarvestTool(fresh);
   if (tool) await bot.equip(tool, 'hand');
+  if (!anyTool && needsBetterTool(fresh, bot.heldItem?.type ?? null)) {
+    const needs = Object.keys(fresh.harvestTools).map((id) => bot.registry.items[id]?.name).filter(Boolean);
+    return fail(`need a better tool to break ${fresh.name} at ${posText(pos)}: with ${bot.heldItem?.name ?? 'my hand'} it would take long and drop nothing${needs.length ? `. It takes one of: ${needs.join(', ')}` : ''}`);
+  }
 
   const onAbort = () => bot.stopDigging();
   signal?.addEventListener('abort', onAbort);
@@ -292,7 +306,7 @@ export async function removeScaffold(ctx, positions) {
     if (ctx.signal?.aborted) break;
     const block = bot.blockAt(pos, false);
     if (!block || !SCAFFOLD_BLOCKS.includes(block.name)) continue;
-    if ((await digBlock(ctx, pos)).ok) removed++;
+    if ((await digBlock(ctx, pos, { anyTool: true })).ok) removed++;
   }
   return removed;
 }
@@ -319,7 +333,7 @@ export async function useBlock(ctx, { x, y, z, open }) {
   await bot.lookAt(pos.offset(0.5, 0.5, 0.5));
   await pause(150, 350);
   await bot.activateBlock(bot.blockAt(pos, false));
-  await pause(300);
+  await delay(300);
   const now = bot.blockAt(pos, false);
   if (openable) return ok(`${now.name} at ${posText(pos)} is now ${isOpen(now) ? 'open' : 'closed'}`);
   return ok(`used ${now.name} at ${posText(pos)}`);

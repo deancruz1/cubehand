@@ -1,6 +1,7 @@
 import { Vec3 } from 'vec3';
 import { ok, fail } from './util.js';
-import { placeOne } from './blocks.js';
+import { placeOne, removeScaffold, digBlock } from './blocks.js';
+import { watchScaffold, SCAFFOLD_BLOCKS } from './movement.js';
 import { parseBlock, itemFor, matchesState, stateProblem } from './states.js';
 
 const range = (a, b) => {
@@ -159,11 +160,27 @@ export function inventoryCounts(items) {
   return counts;
 }
 
-// Places blocks one y layer at a time, in the order given. Blocks with nothing to place
-// against yet are retried once the rest of their layer is down, then with the layers above
-// (a hanging lantern needs the block over it). Afterwards every block is checked once more,
-// and the ones that are missing or turned the wrong way get one more go.
-export async function placeAll(ctx, placements) {
+// Hands out blocks one at a time, always the one closest to here() at that moment. The bot
+// doesn't move while something is still in reach, so it places all of that before walking on,
+// then walks to the nearest of the rest instead of back and forth between two ends.
+export function* nearestFirst(blocks, here) {
+  const left = [...blocks];
+  const dist = (p, at) => (p.x + 0.5 - at.x) ** 2 + (p.y + 0.5 - at.y) ** 2 + (p.z + 0.5 - at.z) ** 2;
+  while (left.length > 0) {
+    const at = here();
+    let best = 0;
+    for (let i = 1; i < left.length; i++) if (dist(left[i], at) < dist(left[best], at)) best = i;
+    yield left.splice(best, 1)[0];
+  }
+}
+
+// Places blocks one y layer at a time, in the order given, or with nearest set, always the
+// one closest to the bot next. Blocks with nothing to place against yet are retried once the
+// rest of their layer is down, then with the layers above (a hanging lantern needs the block
+// over it). Afterwards every block is checked once more, and the ones that are missing or
+// turned the wrong way get one more go. strays holds the keys of planned spots where
+// scaffolding went up; it is dug out before the block goes there.
+export async function placeAll(ctx, placements, { nearest = false, strays } = {}) {
   const { signal } = ctx;
   let placed = 0;
   const failures = [];
@@ -176,7 +193,17 @@ export async function placeAll(ctx, placements) {
   }
 
   const place = async (p) => {
-    const result = await placeOne(ctx, p.block, new Vec3(p.x, p.y, p.z), { attach: p.attach, props: p.props });
+    const pos = new Vec3(p.x, p.y, p.z);
+    const key = `${p.x},${p.y},${p.z}`;
+    if (strays?.has(key)) {
+      const here = ctx.bot.blockAt(pos, false);
+      if (here && SCAFFOLD_BLOCKS.includes(here.name) && !matchesState(here, p.block, p.props)) {
+        const dug = await digBlock(ctx, pos, { anyTool: true });
+        if (!dug.ok) return dug;
+      }
+      strays.delete(key);
+    }
+    const result = await placeOne(ctx, p.block, pos, { attach: p.attach, props: p.props });
     if (result.ok) p.done = true;
     return result;
   };
@@ -189,7 +216,8 @@ export async function placeAll(ctx, placements) {
     while (pending.length > 0) {
       const retry = [];
       let progress = false;
-      for (const p of pending) {
+      const order = nearest ? nearestFirst(pending, () => ctx.bot.entity.position.offset(0, 1.6, 0)) : pending;
+      for (const p of order) {
         if (signal?.aborted) {
           stoppedReason = 'stopped';
           break outer;
@@ -232,6 +260,56 @@ export async function placeAll(ctx, placements) {
   return { placed, failures, wrong, stoppedReason };
 }
 
+// The box a structure fills, and the spots its blocks go.
+export function buildSite(origin, blocks) {
+  const planned = new Set();
+  const min = new Vec3(Infinity, Infinity, Infinity);
+  const max = new Vec3(-Infinity, -Infinity, -Infinity);
+  for (const b of blocks) {
+    const p = new Vec3(origin.x + b.dx, origin.y + b.dy, origin.z + b.dz);
+    planned.add(`${p.x},${p.y},${p.z}`);
+    min.x = Math.min(min.x, p.x);
+    min.y = Math.min(min.y, p.y);
+    min.z = Math.min(min.z, p.z);
+    max.x = Math.max(max.x, p.x);
+    max.y = Math.max(max.y, p.y);
+    max.z = Math.max(max.z, p.z);
+  }
+  return { min, max, planned };
+}
+
+// Where a build's scaffolding may be: next to the build (min..max) and a few blocks over it.
+function scaffoldInSite(site, p) {
+  return p.x >= site.min.x - 2 && p.x <= site.max.x + 2 && p.z >= site.min.z - 2 && p.z <= site.max.z + 2 && p.y >= site.min.y - 2 && p.y <= site.max.y + 3;
+}
+
+// A block that shows up at p is the bot's own scaffolding when the pathfinder is placing one
+// right then, next to the bot. Anything a player or the world puts there stays.
+function placingScaffold(bot, p) {
+  return Boolean(bot.pathfinder?.isBuilding?.()) && bot.entity.position.distanceTo(p.offset(0.5, 0.5, 0.5)) <= 6;
+}
+
+// Notes the bot's scaffolding around a build until stop(). strays gets the keys of planned
+// spots (planned.has(key)) it went on, for placeAll to dig out first. leftover(blocks) is what
+// to take down afterwards: the scaffolding beside the build, and any still on the spot of one
+// of blocks that didn't get placed.
+export function watchBuildScaffold(bot, site, planned) {
+  const strays = new Set();
+  const { placed, stop } = watchScaffold(bot, (p) => {
+    if (!scaffoldInSite(site, p) || !placingScaffold(bot, p)) return false;
+    const key = `${p.x},${p.y},${p.z}`;
+    if (!planned.has(key)) return true;
+    if (!bot.buildKeep?.has(bot.registry.itemsByName[bot.blockAt(p, false)?.name]?.id)) strays.add(key);
+    return false;
+  });
+  const leftover = (blocks) => {
+    const wanted = new Map(blocks.map((b) => [`${b.x},${b.y},${b.z}`, b]));
+    const on = [...strays].map((k) => wanted.get(k)).filter((b) => b && !matchesState(bot.blockAt(new Vec3(b.x, b.y, b.z), false), b.block, b.props));
+    return [...placed, ...on.map((b) => new Vec3(b.x, b.y, b.z))];
+  };
+  return { strays, stop, leftover };
+}
+
 function slabFinder(bot) {
   return (stairs) => {
     const slab = stairs.replace(/_stairs$/, '_slab');
@@ -269,8 +347,25 @@ export async function buildStructure(ctx, { origin, blocks = [], parts = [], dry
   }
   if (plan.missing.length > 0) return fail(`missing items: ${missingText}. Nothing was placed.`);
 
-  const { placed, failures, wrong, stoppedReason } = await placeAll(ctx, plan.placements);
+  // Like build_house: scaffolding may go up next to its own blocks, never made of the build's
+  // materials, and comes down again afterwards.
+  const site = buildSite(origin, all);
+  bot.buildZone = { min: site.min.offset(-2, -1, -2), max: site.max.offset(2, 2, 2) };
+  bot.buildKeep = new Set([...plan.needed.keys()].map((n) => bot.registry.itemsByName[n]?.id).filter((id) => id !== undefined));
+  const scaffold = watchBuildScaffold(bot, site, site.planned);
+  let result;
+  try {
+    result = await placeAll(ctx, plan.placements, { nearest: true, strays: scaffold.strays });
+  } finally {
+    scaffold.stop();
+    bot.buildZone = null;
+    bot.buildKeep = null;
+  }
+  const removed = await removeScaffold(ctx, scaffold.leftover(plan.placements));
+
+  const { placed, failures, wrong, stoppedReason } = result;
   let message = `placed ${placed}, skipped ${plan.skipped}, failed ${failures.length}`;
+  if (removed) message += `, took down ${removed} scaffolding blocks`;
   if (wrong.length > 0) message += `. ${wrong.length} came out turned the wrong way, first: ${wrong.slice(0, 3).join('; ')}`;
   if (failures.length > 0) message += `. First failures: ${failures.slice(0, 5).join('; ')}`;
   if (stoppedReason) message += `. Stopped early: ${stoppedReason}`;

@@ -1,8 +1,8 @@
 import { Vec3 } from 'vec3';
 import { ok, fail, posText } from './util.js';
-import { isNaturalBlock, watchScaffold } from './movement.js';
+import { isNaturalBlock } from './movement.js';
 import { digBlock, removeScaffold, isReplaceable, isProtected } from './blocks.js';
-import { placeAll, inventoryCounts, expandParts } from './build.js';
+import { placeAll, inventoryCounts, expandParts, watchBuildScaffold } from './build.js';
 import { collectDrops } from './items.js';
 import { parseBlock, dirVector, opposite, matchesState } from './states.js';
 
@@ -446,7 +446,7 @@ export async function buildHouse(ctx, input) {
   // building materials for it.
   bot.buildZone = { min: plan.min.offset(-2, -1, -2), max: plan.max.offset(2, 2, 2) };
   bot.buildKeep = new Set(Object.values(materials).filter(Boolean).map((n) => bot.registry.itemsByName[n]?.id).filter((id) => id !== undefined));
-  const scaffold = watchScaffold(bot, (p) => !planned.has(keyOf(p.x, p.y, p.z)) && p.x >= plan.min.x - 2 && p.x <= plan.max.x + 2 && p.z >= plan.min.z - 2 && p.z <= plan.max.z + 2);
+  const scaffold = watchBuildScaffold(bot, plan, planned);
   let result = { placed: 0, failures: [], wrong: [], stoppedReason: null };
   let digProblem = null;
   try {
@@ -466,13 +466,13 @@ export async function buildHouse(ctx, input) {
     if (own && !digProblem && !signal?.aborted) {
       await collectDrops(ctx, { radius: Math.max(width, depth) + 4, center: new Vec3(input.x + 0.5, input.y, input.z + 0.5), max: 48 });
     }
-    if (!digProblem && !signal?.aborted) result = await placeAll(ctx, todo.sort(placeOrder(plan)));
+    if (!digProblem && !signal?.aborted) result = await placeAll(ctx, todo.sort(placeOrder(plan)), { strays: scaffold.strays });
   } finally {
     scaffold.stop();
     bot.buildZone = null;
     bot.buildKeep = null;
   }
-  const removed = await removeScaffold(ctx, scaffold.placed);
+  const removed = await removeScaffold(ctx, scaffold.leftover(todo));
 
   const { placed, failures, wrong, stoppedReason } = result;
   let message = `${summary} Placed ${placed} of ${todo.length} blocks`;

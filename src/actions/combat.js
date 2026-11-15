@@ -1,5 +1,5 @@
 import pathfinderPkg from 'mineflayer-pathfinder';
-import { ok, fail, posText, pause, customName } from './util.js';
+import { ok, fail, posText, delay, customName } from './util.js';
 import { useMoveMode } from './movement.js';
 import { collectDrops } from './items.js';
 
@@ -18,6 +18,11 @@ const WEAPONS = [
 // Hostile mobs that minecraft-data files under another type.
 const ALSO_HOSTILE = new Set(['slime', 'magma_cube', 'ghast', 'phantom', 'shulker', 'hoglin', 'ender_dragon', 'wither']);
 const MOB_TYPES = new Set(['hostile', 'mob', 'animal', 'passive', 'ambient', 'water_creature']);
+const ANY_HOSTILE = new Set(['hostile', 'monster', 'mob']);
+// Left out of "any hostile mob": creepers blow up next to builds, neutral mobs only fight once
+// provoked, the warden and the bosses are far too strong, and the creaking can't be hurt.
+// They are still attacked when named.
+const ONLY_BY_NAME = new Set(['creeper', 'enderman', 'piglin', 'zombified_piglin', 'warden', 'wither', 'ender_dragon', 'creaking']);
 
 export function isHostile(entity) {
   return entity.type === 'hostile' || ALSO_HOSTILE.has(entity.name);
@@ -35,8 +40,14 @@ export function isTarget(entity, target) {
   const tag = customName(entity)?.toLowerCase();
   const wanted = (target ?? 'hostile').toLowerCase();
   if (tag) return tag === wanted;
-  if (wanted === 'hostile' || wanted === 'monster' || wanted === 'mob') return isHostile(entity);
+  if (ANY_HOSTILE.has(wanted)) return isHostile(entity) && !ONLY_BY_NAME.has(entity.name);
   return entity.name === wanted || entity.name === wanted.replace(/s$/, '');
+}
+
+// A hostile mob that would have been a target, but is only attacked when asked for by name.
+export function leftAlone(entity, target) {
+  if (!ANY_HOSTILE.has((target ?? 'hostile').toLowerCase()) || !MOB_TYPES.has(entity.type) || customName(entity)) return false;
+  return isHostile(entity) && ONLY_BY_NAME.has(entity.name);
 }
 
 function reachTo(bot, entity) {
@@ -72,9 +83,9 @@ async function fight(ctx, mob, cooldown, minHealth = 6) {
       if (reachTo(bot, mob) <= REACH) {
         await bot.lookAt(mob.position.offset(0, (mob.height ?? 1.8) * 0.8, 0), true);
         bot.attack(mob);
-        await pause(cooldown, cooldown + 150);
+        await delay(cooldown, cooldown + 150);
       } else {
-        await pause(100);
+        await delay(100);
       }
     }
     return 'killed';
@@ -111,11 +122,13 @@ export async function attack(ctx, { target, count }) {
   let kills = 0;
   let stopReason = '';
   const skip = new Set();
+  const spared = new Map();
   while (kills < wanted) {
     const here = bot.entity.position;
-    const mob = Object.values(bot.entities)
-      .filter((e) => e !== bot.entity && e.position && !skip.has(e.id) && isTarget(e, target))
-      .filter((e) => e.position.distanceTo(here) <= SEARCH_RANGE)
+    const near = Object.values(bot.entities).filter((e) => e !== bot.entity && e.position && e.position.distanceTo(here) <= SEARCH_RANGE);
+    for (const e of near) if (leftAlone(e, target)) spared.set(e.id, e.name);
+    const mob = near
+      .filter((e) => !skip.has(e.id) && isTarget(e, target))
       .sort((a, b) => a.position.distanceTo(here) - b.position.distanceTo(here))[0];
     if (!mob) {
       stopReason = kills ? `no more ${label} within ${SEARCH_RANGE} blocks` : `no ${label} within ${SEARCH_RANGE} blocks`;
@@ -133,6 +146,15 @@ export async function attack(ctx, { target, count }) {
 
   const using = weapon ? ` with my ${weapon[0]}` : ' bare-handed';
   const summary = `killed ${kills} ${label}${using}, now at ${posText(bot.entity.position)}`;
-  if (kills >= wanted) return ok(summary);
-  return kills ? ok(`${summary}. Stopped early: ${stopReason}`) : fail(`${summary}. ${stopReason}`);
+  const note = sparedText(spared);
+  if (kills >= wanted) return ok(`${summary}${note}`);
+  return kills ? ok(`${summary}. Stopped early: ${stopReason}${note}`) : fail(`${summary}. ${stopReason}${note}`);
+}
+
+export function sparedText(spared) {
+  if (!spared.size) return '';
+  const counts = new Map();
+  for (const name of spared.values()) counts.set(name, (counts.get(name) ?? 0) + 1);
+  const list = [...counts].map(([name, n]) => `${n} ${name}`).join(', ');
+  return `. Left ${list} alone: creepers, neutral mobs, wardens, creakings and bosses are only attacked when you name them as the target`;
 }

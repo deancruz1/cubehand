@@ -1,5 +1,5 @@
 import pathfinderPkg from 'mineflayer-pathfinder';
-import { ok, fail, pause } from './util.js';
+import { ok, fail, delay } from './util.js';
 import { walkTo } from './movement.js';
 
 const { GoalNear } = pathfinderPkg.goals;
@@ -48,6 +48,21 @@ export function leftThere(bot, entity) {
   return Boolean(left && left.until > Date.now() && entity.position.distanceTo(left.pos) <= 5);
 }
 
+// Items it found no way to are remembered on the bot for a while, so jobs that pick up every
+// few blocks don't spend a long path search on the same item each time.
+const SKIP_DROP_MS = 60000;
+
+export function skippedDrop(bot, id) {
+  return (bot.skippedDrops?.get(id) ?? 0) > Date.now();
+}
+
+function skipDrop(bot, id) {
+  bot.skippedDrops ??= new Map();
+  const now = Date.now();
+  for (const [key, until] of bot.skippedDrops) if (until <= now) bot.skippedDrops.delete(key);
+  bot.skippedDrops.set(id, now + SKIP_DROP_MS);
+}
+
 // Walks over dropped items so they get picked up. Items it can't get to are skipped, and so
 // are any that ignore(entity) says to leave.
 export async function collectDrops(ctx, { radius = 6, center, item, max = 8, ignore } = {}) {
@@ -55,12 +70,15 @@ export async function collectDrops(ctx, { radius = 6, center, item, max = 8, ign
   const skip = new Set();
   for (let i = 0; i < max; i++) {
     if (ctx.signal?.aborted) return;
-    const target = dropsNear(bot, center ?? bot.entity.position, radius, item).find((e) => !skip.has(e.id) && !ignore?.(e));
+    const target = dropsNear(bot, center ?? bot.entity.position, radius, item).find((e) => !skip.has(e.id) && !skippedDrop(bot, e.id) && !ignore?.(e));
     if (!target) return;
     const p = target.position;
-    if (p.distanceTo(bot.entity.position) > 1) await walkTo(ctx, new GoalNear(p.x, p.y, p.z, 1), { place: false });
-    await pause(250, 450);
-    if (bot.entities[target.id]) skip.add(target.id);
+    let walked = null;
+    if (p.distanceTo(bot.entity.position) > 1) walked = await walkTo(ctx, new GoalNear(p.x, p.y, p.z, 1), { place: false });
+    await delay(250, 450);
+    if (!bot.entities[target.id]) continue;
+    skip.add(target.id);
+    if (walked && !walked.ok && !ctx.signal?.aborted) skipDrop(bot, target.id);
   }
 }
 

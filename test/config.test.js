@@ -36,6 +36,18 @@ test('missing username is rejected', () => {
   assert.throws(() => validateConfig(raw, env), /bot\.username/);
 });
 
+test('pauseScale defaults to 1 and must be a number, 0 or more', () => {
+  const raw = copy();
+  delete raw.bot.pauseScale;
+  const config = validateConfig(raw, env);
+  assert.equal(config.bot.pauseScale, 1);
+  assert.equal(config.bot.username, 'Clodine');
+  raw.bot.pauseScale = 0;
+  assert.equal(validateConfig(raw, env).bot.pauseScale, 0);
+  raw.bot.pauseScale = -1;
+  assert.throws(() => validateConfig(raw, env), /pauseScale/);
+});
+
 test('empty allowlist is rejected', () => {
   const raw = copy();
   raw.allowlist = [];

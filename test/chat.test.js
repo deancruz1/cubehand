@@ -76,6 +76,38 @@ test('stop inside a longer request is not the stop command', () => {
   assert.equal(classifyMessage({ username: 'Steve', message: 'Clodine stop at the river and build a bridge' }, opts).type, 'request');
 });
 
+test('pause, halt and cancel stop too, with a short tail and the name on either side', () => {
+  for (const message of [
+    'clodine, pause.',
+    'clodine, stop here.',
+    'stop clodine',
+    'Stop, Clodine!',
+    'clodine halt',
+    'clodine cancel that',
+    'Clodine stop it now please',
+    'clodine stop everything',
+    "clodine stop what you're doing",
+    'clodine please stop',
+    '@Clodine pause now'
+  ]) {
+    assert.equal(classifyMessage({ username: 'Steve', message }, opts).type, 'stop', message);
+  }
+  assert.equal(classifyMessage({ username: 'Alex', message: 'pause please', whisper: true }, opts).type, 'stop');
+});
+
+test('a stop word that asks for something else is still a request', () => {
+  for (const message of [
+    'clodine stop mining and come here',
+    'clodine stop by the farm',
+    'clodine pause for a minute then carry on',
+    'clodine cancel the tower and build a hut',
+    'clodine stop here and build a hut',
+    'clodine cancel that and come here'
+  ]) {
+    assert.equal(classifyMessage({ username: 'Steve', message }, opts).type, 'request', message);
+  }
+});
+
 test('a name that only contains the bot name is not a mention', () => {
   assert.equal(classifyMessage({ username: 'Steve', message: 'Clodines are cool' }, opts).type, 'history');
 });

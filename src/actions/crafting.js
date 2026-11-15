@@ -1,5 +1,5 @@
 import pathfinderPkg from 'mineflayer-pathfinder';
-import { ok, fail, posText, pause, guarded, TimeoutError } from './util.js';
+import { ok, fail, posText, pause, delay, guarded, TimeoutError } from './util.js';
 import { walkTo } from './movement.js';
 import { findNearest, inReach, placeOne } from './blocks.js';
 
@@ -26,7 +26,7 @@ function inventoryText(bot) {
 export async function settleInventory(bot) {
   if (bot.currentWindow) return;
   bot.closeWindow(bot.inventory);
-  if (!bot._syncWindow) return pause(300);
+  if (!bot._syncWindow) return delay(300);
   await guarded(() => bot._syncWindow(bot.inventory), { ms: 3000 }).catch(() => {});
 }
 

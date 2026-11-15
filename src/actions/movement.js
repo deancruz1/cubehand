@@ -462,28 +462,43 @@ function goalPos(goal) {
   return null;
 }
 
+// How long a walk of this many blocks may go without getting closer: 3 s a block, at least
+// 20 s (a couple of path searches and a retry), at most maxSeconds.
+export function walkPatience(distance, maxSeconds) {
+  return Math.min(maxSeconds, Math.max(20, distance * 3)) * 1000;
+}
+
 // Walks to a goal and turns the usual failures into a result message. With place off, the
 // bot never puts blocks down on the way (used when carrying items to hand over, and so on).
 // A long walk is fine as long as the bot keeps getting closer; it gives up once it hasn't
-// for moveTimeoutSeconds.
+// for moveTimeoutSeconds, or a short walk sooner (see walkPatience), not counting time spent
+// digging or placing blocks on the way.
 export async function walkTo(ctx, goal, { place = true } = {}) {
   const { bot, config, signal } = ctx;
   useMoveMode(bot, place);
-  const patience = config.limits.moveTimeoutSeconds * 1000;
+  const full = config.limits.moveTimeoutSeconds * 1000;
   const target = goalPos(goal);
+  const patience = target ? walkPatience(bot.entity.position.distanceTo(target), config.limits.moveTimeoutSeconds) : full;
   let best = Infinity;
   let bestAt = Date.now();
+  let waited = 0;
+  let checkedAt = Date.now();
   const stalled = () => {
+    const now = Date.now();
     const d = bot.entity.position.distanceTo(target);
     if (d < best - 1) {
       best = d;
-      bestAt = Date.now();
+      bestAt = now;
+      waited = 0;
+    } else if (!bot.pathfinder.isMining() && !bot.pathfinder.isBuilding()) {
+      waited += now - checkedAt;
     }
-    return Date.now() - bestAt > patience;
+    checkedAt = now;
+    return now - bestAt > full || waited > patience;
   };
   try {
     await guarded(() => bot.pathfinder.goto(goal), {
-      ms: target ? patience * 8 : patience,
+      ms: target ? full * 8 : full,
       signal,
       stalled: target ? stalled : undefined,
       onCancel: () => bot.pathfinder.setGoal(null)
@@ -496,7 +511,7 @@ export async function walkTo(ctx, goal, { place = true } = {}) {
     return ok(`arrived, ${botPos(bot)}`);
   } catch (err) {
     if (err instanceof AbortedError) return fail('stopped');
-    if (err instanceof StalledError) return fail(`stuck, got no closer for ${config.limits.moveTimeoutSeconds}s, ${botPos(bot)}`);
+    if (err instanceof StalledError) return fail(`stuck, got no closer for ${Math.round((Date.now() - bestAt) / 1000)}s, ${botPos(bot)}`);
     if (err instanceof TimeoutError) return fail(`timed out walking, ${botPos(bot)}`);
     if (err.name === 'NoPath' || err.name === 'Timeout') return fail(`no path, ${botPos(bot)}`);
     if (err.name === 'GoalChanged' || err.name === 'PathStopped') return fail(`movement was interrupted, ${botPos(bot)}`);
@@ -515,11 +530,31 @@ export async function goToPlayer(ctx, { player, range }, options) {
   return walkTo(ctx, new GoalNear(p.x, p.y, p.z, range ?? 2), options);
 }
 
+// Follows someone by name. Once they go out of view their entity is dropped, so the goal keeps
+// the last one seen (the bot heads to where they were) and takes the new one when they're back.
+export class GoalFollowPlayer extends GoalFollow {
+  constructor(bot, name, entity, range) {
+    super(entity, range);
+    this.bot = bot;
+    this.name = name;
+  }
+
+  get entity() {
+    const seen = this.seen;
+    if (this.bot && !(seen && this.bot.entities[seen.id] === seen)) this.seen = findPlayer(this.bot, this.name) ?? seen;
+    return this.seen;
+  }
+
+  set entity(entity) {
+    this.seen = entity;
+  }
+}
+
 export async function followPlayer({ bot }, { player, range }) {
   const entity = findPlayer(bot, player);
   if (!entity) return fail(`player not found: ${player} (offline or too far away to see)`);
   useMoveMode(bot, false);
-  bot.pathfinder.setGoal(new GoalFollow(entity, range ?? 2), true);
+  bot.pathfinder.setGoal(new GoalFollowPlayer(bot, player, entity, range ?? 2), true);
   return ok(`following ${player}`);
 }
 

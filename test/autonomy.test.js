@@ -7,11 +7,14 @@ import { Vec3 } from 'vec3';
 import { outlineFrom, inArea, areaBounds, AreaRecorder, TravelLog } from '../src/areas.js';
 import { Memory } from '../src/memory.js';
 import { recordArea } from '../src/actions/memory.js';
-import { smeltOutput, inputFor, pickFuel } from '../src/actions/furnace.js';
-import { pickFood, needsFood, preyNear } from '../src/survival.js';
+import { smeltOutput, inputFor, pickFuel, smelt } from '../src/actions/furnace.js';
+import { pickFood, needsFood, preyNear, recoveryReport, Survival, isThreat, threatsNear, getFood } from '../src/survival.js';
 import { canSleepNow } from '../src/actions/bed.js';
 import { craft } from '../src/actions/crafting.js';
 import { Brain } from '../src/brain.js';
+import { Idle } from '../src/idle.js';
+import { GoalFollowPlayer } from '../src/actions/movement.js';
+import { setPauseScale } from '../src/actions/util.js';
 
 // A walk around a 20 x 10 field, a little wobbly.
 function fieldWalk() {
@@ -279,19 +282,283 @@ test('a player request stops free time and runs right away', async () => {
   assert.match(client.calls[1].messages[0].content, /Request from Steve: come here/);
 });
 
-test('a job paused for safety waits in the queue and carries on after resume', async () => {
-  const client = slowThenClient('Done.');
-  const { brain, said } = brainWith(client);
-  brain.start({ player: 'Steve', text: 'mine some stone' });
-  await settle();
+test('a job paused for safety is held, and carries on in the same conversation after resume', async () => {
+  const calls = [];
+  const client = {
+    beta: {
+      messages: {
+        create: async (params) => {
+          calls.push(structuredClone(params));
+          return calls.length === 1 ? { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'a', name: 'mine', input: {} }], usage: {} } : answer('Done.');
+        }
+      }
+    }
+  };
+  let started;
+  const toolStarted = new Promise((r) => (started = r));
+  const brain = new Brain({
+    client,
+    config: brainConfig,
+    runTool: (name, input, signal) =>
+      new Promise((resolve) => {
+        started();
+        signal.addEventListener('abort', () => resolve({ ok: false, message: 'mined 2' }));
+      }),
+    snapshot: () => 'SNAPSHOT',
+    say: () => {},
+    log: () => {}
+  });
+  const job = brain.start({ player: 'Steve', text: 'mine some stone' });
+  await toolStarted;
   await brain.pause();
+  assert.equal(brain.busy, true);
+  assert.deepEqual(brain.queue, []);
+  brain.resume('danger', 'You ate bread.');
+  await job;
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].messages[0].content, /Request from Steve: mine some stone$/);
+  assert.match(calls[1].messages[2].content[0].content, /look after yourself/);
+  assert.match(calls[1].messages.at(-1).content, /^You ate bread\./);
+});
+
+test('free time just ends when the bot has to look after itself', async () => {
+  const client = slowThenClient('Nothing.');
+  const { brain } = brainWith(client);
+  brain.freeTime();
+  await settle();
+  const free = brain.current;
+  await brain.pause();
+  await free.done;
   assert.equal(brain.busy, false);
-  brain.enqueue('Alex', 'hi');
-  assert.deepEqual(said, ["Alex, got it. I'll do that once I'm safe."]);
-  assert.deepEqual(brain.queue.map((r) => r.player), ['Steve', 'Alex']);
   brain.resume();
-  await brain.current.done;
-  assert.match(client.calls[1].messages[0].content, /mine some stone\n\(You stopped this job earlier/);
-  await brain.current?.done;
-  assert.deepEqual(said.slice(1), ['Done.', 'Done.']);
+  assert.equal(brain.busy, false);
+});
+
+test('the account of a recovery says what happened and where the bot is now', () => {
+  const report = recoveryReport({
+    critical: true,
+    before: { health: 5, food: 9 },
+    done: ['backed off from 2 zombie and skeleton', 'ate 2 bread'],
+    health: 13.4,
+    food: 19,
+    position: new Vec3(10.5, 64, -3.2)
+  });
+  assert.equal(
+    report,
+    "Your health got down to 5/20, so you stopped to look after yourself. You backed off from 2 zombie and skeleton, then ate 2 bread. Health is now 13/20 and food 19/20, and you're at 10 64 -4."
+  );
+  assert.equal(
+    recoveryReport({ critical: false, before: { health: 18, food: 3 }, done: [], health: 18, food: 3, position: null }),
+    'You were starving (food 3/20), so you stopped to look after yourself. Health is now 18/20 and food 3/20.'
+  );
+});
+
+test('recovery holds the job and hands it an account when done', async () => {
+  const bread = { name: 'bread', count: 3 };
+  const bot = {
+    health: 5,
+    food: 10,
+    entity: { position: new Vec3(1, 64, 2) },
+    entities: {},
+    pathfinder: { goal: null },
+    registry: { foodsByName: FOODS },
+    inventory: { items: () => [bread] },
+    heldItem: null,
+    equip: async () => {},
+    consume: async () => {
+      bot.food = Math.min(20, bot.food + 5);
+      bot.health += 4;
+    }
+  };
+  const calls = [];
+  const brain = { busy: true, pause: async (reason) => calls.push(['pause', reason]), resume: (reason, report) => calls.push(['resume', reason, report]) };
+  const survival = new Survival({ getBot: () => bot, brain, config: { survival: { criticalHealth: 8 } }, makeCtx: () => ({ bot }), log: () => {}, say: () => {} });
+  await survival.recover(bot, true);
+  assert.deepEqual(calls[0], ['pause', 'danger']);
+  assert.equal(calls[1][1], 'danger');
+  assert.equal(calls[1][2], "Your health got down to 5/20, so you stopped to look after yourself. You ate 2 bread. Health is now 13/20 and food 20/20, and you're at 1 64 2.");
+  assert.equal(survival.recovering, false);
+});
+
+// Just enough of a bot for recovery: no mobs about, bread to eat.
+function hurtBot(extra = {}) {
+  const bot = {
+    health: 5,
+    food: 10,
+    entity: { position: new Vec3(1, 64, 2) },
+    entities: {},
+    players: {},
+    pathfinder: { goal: null, set: [], setGoal: (goal) => bot.pathfinder.set.push(goal) },
+    registry: { foodsByName: FOODS },
+    inventory: { items: () => [{ name: 'bread', count: 3 }] },
+    heldItem: null,
+    equip: async () => {},
+    consume: async () => {
+      bot.food = Math.min(20, bot.food + 5);
+      bot.health += 4;
+    },
+    ...extra
+  };
+  return bot;
+}
+
+const fakeBrain = (holds = []) => ({ busy: true, holds: new Set(holds), pause: async () => {}, resume: () => {} });
+
+test('recovery puts following back even when the player is out of view', async () => {
+  const bot = hurtBot();
+  const follow = new GoalFollowPlayer(bot, 'Steve', { id: 7, position: new Vec3(5, 64, 5) }, 2);
+  bot.pathfinder.goal = follow;
+  const survival = new Survival({ getBot: () => bot, brain: fakeBrain(), config: { survival: { criticalHealth: 8 } }, makeCtx: () => ({ bot }), log: () => {}, say: () => {} });
+  await survival.recover(bot, true);
+  assert.deepEqual(bot.pathfinder.set, [follow]);
+});
+
+test('a chore puts following back even when the player is out of view', async () => {
+  const bot = hurtBot({ health: 20 });
+  const follow = new GoalFollowPlayer(bot, 'Steve', { id: 7, position: new Vec3(5, 64, 5) }, 2);
+  bot.pathfinder.goal = follow;
+  // Eating stands in for a chore that walks and so replaces the follow goal.
+  bot.equip = async () => {
+    bot.pathfinder.goal = null;
+  };
+  const idle = new Idle({
+    getBot: () => bot,
+    brain: { busy: false, paused: false, queue: [] },
+    survival: { recovering: false },
+    config: { idle: { enabled: true }, survival: { eatAtFood: 14 } },
+    makeCtx: () => ({ bot }),
+    log: () => {}
+  });
+  idle.tick();
+  await idle.running.done;
+  assert.deepEqual(bot.pathfinder.set, [follow]);
+});
+
+test('the line about backing off goes to whoever whispered the job', async () => {
+  const heard = [];
+  for (const replyTo of ['Steve', null]) {
+    const bot = hurtBot();
+    const brain = { ...fakeBrain(), replyTo };
+    const survival = new Survival({ getBot: () => bot, brain, config: { survival: { criticalHealth: 8 } }, makeCtx: () => ({ bot }), log: () => {}, say: (text, to) => heard.push({ text, to }) });
+    await survival.recover(bot, true);
+  }
+  assert.deepEqual(heard, [
+    { text: "I'm hurt, backing off to heal.", to: 'Steve' },
+    { text: "I'm hurt, backing off to heal.", to: null }
+  ]);
+});
+
+test('survival leaves the old bot alone while the connection is down', async () => {
+  const bot = hurtBot();
+  let recovered = 0;
+  const survival = new Survival({ getBot: () => bot, brain: fakeBrain(['offline']), config: { survival: { criticalHealth: 8, eatAtFood: 14 } }, makeCtx: () => ({ bot }), log: () => {}, say: () => {} });
+  survival.recover = async () => recovered++;
+  survival.check();
+  await survival.eatIfHungry();
+  assert.equal(recovered, 0);
+  assert.equal(bot.food, 10);
+  survival.brain.holds.clear();
+  survival.check();
+  assert.equal(recovered, 1);
+});
+
+test('waiting for health to come back is not sped up by pauseScale', async () => {
+  setPauseScale(0);
+  try {
+    let looks = 0;
+    const bot = hurtBot({ health: 9, food: 20 });
+    Object.defineProperty(bot, 'entities', { get: () => (looks++, {}) });
+    const survival = new Survival({ getBot: () => bot, brain: fakeBrain(), config: { survival: { criticalHealth: 8 } }, makeCtx: () => ({ bot }), log: () => {}, say: () => {} });
+    const done = survival.recover(bot, true);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.ok(looks <= 4, `looked ${looks} times in 100 ms`);
+    bot.health = 20;
+    await done;
+  } finally {
+    setPauseScale(1);
+  }
+});
+
+test('the warden, bosses and the creaking are never fought unprompted, but are backed off from', () => {
+  const mob = (id, name, x) => ({ id, name, type: 'hostile', position: new Vec3(x, 64, 0) });
+  for (const name of ['warden', 'wither', 'ender_dragon', 'creaking']) assert.equal(isThreat(mob(1, name, 3)), false, name);
+  assert.equal(isThreat(mob(1, 'zombie', 3)), true);
+  const self = { position: new Vec3(0, 64, 0) };
+  const bot = { entity: self, entities: { 0: self, 1: mob(1, 'warden', 4), 2: mob(2, 'zombie', 5), 3: mob(3, 'enderman', 3) } };
+  assert.deepEqual(threatsNear(bot, 10).map((e) => e.name), ['warden', 'zombie']);
+});
+
+test('in free time the bot backs away from a warden in range and leaves creepers to their own rule', async () => {
+  const self = { position: new Vec3(0.5, 64, 0.5) };
+  const goals = [];
+  const bot = {
+    entity: self,
+    entities: {},
+    players: {},
+    world: { raycast: () => null },
+    pathfinder: { goto: async (goal) => goals.push(goal), setGoal: () => {} }
+  };
+  const idle = new Idle({ getBot: () => bot, brain: {}, survival: {}, config: { idle: { defendRadius: 12 } }, makeCtx: () => ({}), log: () => {} });
+  bot.entities = { 0: self, 1: { id: 1, name: 'warden', type: 'hostile', position: new Vec3(10.5, 64, 0.5) } };
+  const away = idle.threat(bot);
+  assert.equal(away.name, 'back away from warden');
+  await away.run({ bot });
+  assert.ok(goals[0].x < -20, `ran to x ${goals[0].x}`);
+  bot.entities[1].position = new Vec3(20.5, 64, 0.5);
+  assert.equal(idle.threat(bot), null);
+  // A creeper about to blow still comes first, as before.
+  bot.entities[1].position = new Vec3(10.5, 64, 0.5);
+  bot.entities[2] = { id: 2, name: 'creeper', type: 'hostile', position: new Vec3(0.5, 64, 4.5) };
+  assert.equal(idle.threat(bot)?.name, 'back away from a creeper');
+});
+
+// Two chests and a furnace in reach. Opening the trapped chest or the furnace never answers.
+function storageBot() {
+  const names = ['air', 'chest', 'trapped_chest', 'furnace'];
+  const blocks = new Map([['1,64,0', 'trapped_chest'], ['-2,64,0', 'chest'], ['0,64,2', 'furnace']]);
+  const opened = [];
+  const at = (p) => `${p.x},${p.y},${p.z}`;
+  const bot = {
+    opened,
+    entity: { position: new Vec3(0.5, 64, 0.5) },
+    entities: {},
+    players: {},
+    game: { dimension: 'overworld' },
+    registry: { blocksArray: names.map((name, id) => ({ id, name })), foodsByName: { bread: { foodPoints: 5, saturation: 6 } } },
+    inventory: { items: () => [] },
+    blockAt: (p) => ({ name: blocks.get(at(p)) ?? 'air', position: p, getProperties: () => ({}) }),
+    findBlocks: ({ matching }) => [...blocks].filter(([, n]) => matching.includes(names.indexOf(n))).map(([k]) => new Vec3(...k.split(',').map(Number))),
+    lookAt: async () => {},
+    openContainer: async (block) => {
+      opened.push(at(block.position));
+      if (block.name === 'trapped_chest') await new Promise(() => {});
+      return { containerItems: () => [{ name: 'bread', count: 3, type: 9 }], withdraw: async () => {}, close: () => {} };
+    },
+    openFurnace: () => new Promise(() => {})
+  };
+  return bot;
+}
+
+test('looking for food never opens a trapped chest', async () => {
+  setPauseScale(0);
+  try {
+    const bot = storageBot();
+    const got = await getFood({ bot, openMs: 50 });
+    assert.match(got, /3 bread from the chest at -2 64 0/);
+    assert.deepEqual(bot.opened, ['-2,64,0']);
+  } finally {
+    setPauseScale(1);
+  }
+});
+
+test('a furnace that never opens is given up on with a clear result', async () => {
+  setPauseScale(0);
+  try {
+    const bot = storageBot();
+    const result = await smelt({ bot, openMs: 50, smeltJobs: new Map() }, { x: 0, y: 64, z: 2 });
+    assert.equal(result.ok, false);
+    assert.match(result.message, /the furnace at 0 64 2 wouldn't open/);
+  } finally {
+    setPauseScale(1);
+  }
 });

@@ -1,12 +1,12 @@
 import pathfinderPkg from 'mineflayer-pathfinder';
-import { pause } from './actions/util.js';
+import { pause, delay } from './actions/util.js';
 import { walkTo } from './actions/movement.js';
 import { attackEntity } from './actions/combat.js';
 import { collectDrops, dropsNear, leftThere } from './actions/items.js';
 import { findNearest } from './actions/blocks.js';
 import { sleep, canSleepNow, ownBed } from './actions/bed.js';
 import { smelt, readyJob, rawFoodToCook } from './actions/furnace.js';
-import { needsFood, hasFood, eatBest, isThreat, threatsNear, flee, getFood } from './survival.js';
+import { needsFood, hasFood, eatBest, isThreat, isDeadly, threatsNear, flee, getFood } from './survival.js';
 
 const { GoalNear, GoalFollow } = pathfinderPkg.goals;
 
@@ -46,7 +46,7 @@ export class Idle {
     const run = this.running;
     if (!run) return;
     run.controller.abort('player');
-    await Promise.race([run.done, pause(5000)]);
+    await Promise.race([run.done, delay(5000)]);
   }
 
   // No chores for a while, like after a player says stop.
@@ -73,7 +73,8 @@ export class Idle {
       .catch((err) => this.log(`[idle] ${chore.name} failed: ${err.message}`))
       .finally(() => {
         const follow = run.follow;
-        if (follow?.entity && bot.entities[follow.entity.id] && !bot.pathfinder.goal) bot.pathfinder.setGoal(follow, true);
+        // A player out of view right now is picked up again by the goal when they're back.
+        if (follow && !bot.pathfinder.goal) bot.pathfinder.setGoal(follow, true);
         if (this.running === run) this.running = null;
       });
     this.running = run;
@@ -167,7 +168,9 @@ export class Idle {
     return null;
   }
 
-  // Hostile mobs close to the bot or to a player near it. Creepers get a wide berth instead.
+  // Hostile mobs close to the bot or to a player near it. Creepers get a wide berth instead,
+  // and so do the warden, bosses and the creaking, from further off: the warden's sonic boom
+  // reaches about 15 blocks, through walls.
   threat(bot) {
     if (!this.ready('defend')) return null;
     const here = bot.entity.position;
@@ -183,6 +186,8 @@ export class Idle {
       .sort((a, b) => a.position.distanceTo(here) - b.position.distanceTo(here));
     const creeper = mobs.find((e) => e.name === 'creeper' && e.position.distanceTo(here) <= 5);
     if (creeper) return { name: 'back away from a creeper', run: (ctx) => flee(ctx, [creeper], 10) };
+    const deadly = Object.values(bot.entities).filter((e) => e !== bot.entity && e.position && isDeadly(e) && e.position.distanceTo(here) <= 16);
+    if (deadly.length) return { name: `back away from ${deadly[0].name}`, run: (ctx) => flee(ctx, deadly, 24) };
     const mob = mobs.find((e) => e.name !== 'creeper');
     if (!mob || bot.health < 12) return null;
     return {

@@ -3,6 +3,7 @@ import { reasonText } from './connection.js';
 import { customName } from './actions/util.js';
 import { isNaturalBlock } from './actions/movement.js';
 import { droppedItem } from './actions/items.js';
+import { contentsText } from './chests.js';
 
 const AIR = new Set(['air', 'cave_air', 'void_air']);
 const FACINGS = ['north', 'west', 'south', 'east'];
@@ -20,16 +21,91 @@ export function timeLabel(timeOfDay) {
   return 'sunrise';
 }
 
-export function inventorySummary(items, heldItem) {
-  const held = heldItem ? heldItem.name : 'nothing';
+// How many more uses a tool, weapon or armor piece has, or null for items that don't wear out.
+// From 1.20.5 on, damage and a changed maximum come as item components.
+export function usesLeft(item) {
+  if (!item?.maxDurability) return null;
+  let used = 0;
+  try {
+    used = item.durabilityUsed ?? 0;
+  } catch {}
+  const max = item.componentMap?.get('max_damage')?.data ?? item.maxDurability;
+  return Math.max(max - used, 0);
+}
+
+function itemText(item) {
+  const left = usesLeft(item);
+  return left === null ? item.name : `${item.name} (${left} uses left)`;
+}
+
+// Items that wear out are listed one by one with their uses left, the rest are counted by name.
+// armor, offHand, freeSlots and level are what's worn, held in the off hand, the empty inventory
+// slots and the experience level.
+export function inventorySummary(items, heldItem, { armor = [], offHand = null, freeSlots, level } = {}) {
+  const extras = [heldItem ? heldItem.name : 'nothing'];
+  if (offHand) extras.push(`Off hand: ${itemText(offHand)}`);
+  if (armor.length) extras.push(`Wearing: ${armor.map(itemText).join(', ')}`);
+  if (level > 0) extras.push(`Experience level ${level}`);
+  const held = extras.join('. ');
   if (items.length === 0) return `Inventory: empty\nHolding: ${held}`;
 
   const counts = new Map();
+  const worn = [];
   for (const item of items) {
-    counts.set(item.name, (counts.get(item.name) ?? 0) + item.count);
+    if (usesLeft(item) !== null) worn.push(itemText(item));
+    else counts.set(item.name, (counts.get(item.name) ?? 0) + item.count);
   }
-  const lines = [...counts].map(([name, count]) => `${name}: ${count}`);
-  return `Inventory: ${lines.join(', ')}\nHolding: ${held}`;
+  const lines = [...[...counts].map(([name, count]) => `${name}: ${count}`), ...worn];
+  const free = freeSlots === undefined ? '' : ` (${freeSlots} slots free)`;
+  return `Inventory${free}: ${lines.join(', ')}\nHolding: ${held}`;
+}
+
+const ARMOR_SLOTS = [5, 6, 7, 8];
+const OFF_HAND_SLOT = 45;
+// Armor, then the inventory and hotbar, then the off hand.
+const BODY_SLOTS = { start: 5, end: 46 };
+
+// What a tool call can change about the bot, read before and after it. Null when there's no bot.
+export function takeStock(bot) {
+  try {
+    if (!bot?.entity) return null;
+    const counts = new Map();
+    const wear = new Map();
+    for (let slot = BODY_SLOTS.start; slot < BODY_SLOTS.end; slot++) {
+      const item = bot.inventory.slots[slot];
+      if (!item) continue;
+      counts.set(item.name, (counts.get(item.name) ?? 0) + item.count);
+      const left = usesLeft(item);
+      if (left !== null) wear.set(slot, { name: item.name, left, max: item.componentMap?.get('max_damage')?.data ?? item.maxDurability });
+    }
+    return { position: bot.entity.position.floored(), health: bot.health, food: bot.food, counts, wear };
+  } catch {
+    return null;
+  }
+}
+
+// One line for the end of a tool result: where the bot is now, and only when there's something to
+// say, its health and food, what the call added to or took from the inventory, and any tool it
+// wore down that is nearly worn out.
+export function stateLine(before, after) {
+  if (!after) return '';
+  const p = after.position;
+  let line = `Now at ${p.x} ${p.y} ${p.z}`;
+  if (after.health < 20 || after.food < 20) line += `, health ${Math.round(after.health)}/20, food ${after.food}/20`;
+  line += '.';
+  if (!before) return line;
+  const changes = [];
+  for (const name of new Set([...before.counts.keys(), ...after.counts.keys()])) {
+    const change = (after.counts.get(name) ?? 0) - (before.counts.get(name) ?? 0);
+    if (change) changes.push(`${change > 0 ? '+' : ''}${change} ${name}`);
+  }
+  if (changes.length) line += ` Inventory ${changes.join(', ')}.`;
+  for (const [slot, now] of after.wear) {
+    const was = before.wear.get(slot);
+    if (was?.name !== now.name || now.left >= was.left) continue;
+    if (now.left <= Math.max(10, now.max / 10)) line += ` ${now.name} is nearly worn out (${now.left} uses left).`;
+  }
+  return line;
 }
 
 // getName(x, y, z) returns a block name, or null when the position is not loaded.
@@ -262,16 +338,25 @@ function findStorage(bot, range, signs) {
   return containers.sort((a, b) => a.distance - b.distance);
 }
 
-export function storageSummary(containers, range, max = 12) {
+// Containers within range of the bot ({ name, parts, distance, labels }), closest first.
+export function nearbyStorage(bot, range) {
+  return findStorage(bot, range, findSigns(bot, range));
+}
+
+// c.seen is what the chest index remembers about a container, if anything.
+export function storageSummary(containers, range, max = 12, now = Date.now()) {
   if (containers.length === 0) return `Storage within ${range}: none`;
-  const lines = containers.slice(0, max).map((c) => {
+  const shown = containers.slice(0, max);
+  const lines = shown.map((c) => {
     const where = c.parts.map((p) => `${p.x} ${p.y} ${p.z}`).join(' + ');
     const kind = c.parts.length > 1 ? `double ${c.name}` : c.name;
     const label = c.labels.length ? `, ${c.labels.join(', ')}` : '';
-    return `- ${kind} at ${where} (${Math.round(c.distance)} away)${label}`;
+    const inside = c.seen ? `; ${contentsText(c.seen, now)}` : '';
+    return `- ${kind} at ${where} (${Math.round(c.distance)} away)${label}${inside}`;
   });
   const more = containers.length > max ? `\n(${containers.length - max} more further away)` : '';
-  return `Storage within ${range}:\n${lines.join('\n')}${more}`;
+  const note = shown.some((c) => c.seen) ? ' (contents as you last saw them; players may have changed them since)' : '';
+  return `Storage within ${range}${note}:\n${lines.join('\n')}${more}`;
 }
 
 const LANDMARK_TYPES = ['crafting_table', 'furnace', 'blast_furnace', 'smoker', 'anvil', 'enchanting_table', 'brewing_stand', 'smithing_table', 'stonecutter'];
@@ -360,6 +445,12 @@ export function buildSnapshot(bot, config, chatMessages, memories) {
   const under = bot.blockAt(origin.offset(0, -1, 0), false)?.name;
   const signs = findSigns(bot, LANDMARK_RANGE);
   const storage = findStorage(bot, LANDMARK_RANGE, signs);
+  const chests = bot.chestIndex;
+  if (chests) {
+    const dim = bot.game.dimension;
+    chests.prune(dim, bot.entity.position, LANDMARK_RANGE, (p) => bot.blockAt(new Vec3(p.x, p.y, p.z), false)?.name ?? null);
+    for (const c of storage) c.seen = chests.find(c.parts[0], dim);
+  }
 
   return [
     statusSummary({
@@ -371,7 +462,12 @@ export function buildSnapshot(bot, config, chatMessages, memories) {
       gameMode: bot.game.gameMode,
       timeOfDay: bot.time.timeOfDay
     }),
-    inventorySummary(bot.inventory.items(), bot.heldItem),
+    inventorySummary(bot.inventory.items(), bot.heldItem, {
+      armor: ARMOR_SLOTS.map((slot) => bot.inventory.slots[slot]).filter(Boolean),
+      offHand: bot.inventory.slots[OFF_HAND_SLOT],
+      freeSlots: bot.inventory.emptySlotCount(),
+      level: bot.experience?.level
+    }),
     surroundingsSummary((p) => bot.blockAt(p, false), origin),
     blocksSummary(countNearbyBlocks(getName, origin, radius), under, radius),
     storageSummary(storage, LANDMARK_RANGE),

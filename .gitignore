@@ -3,4 +3,8 @@ config.json
 node_modules/
 memory.json
 placed.json
+placed.json.tmp
+chests.json
+chests.json.tmp
 requests.json
+jobs.jsonl

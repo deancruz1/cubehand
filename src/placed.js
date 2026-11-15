@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 
-const MAX_ENTRIES = 5000;
+// Enough for dozens of large builds. The oldest entries go first once it's full.
+const MAX_ENTRIES = 100000;
 
 // Blocks the bot placed itself, saved to a file, so it may break them again later (like its
 // own crafting table) even when that kind of block is protected.
@@ -36,7 +37,9 @@ export class PlacedLog {
     if (this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      writeFileSync(this.path, JSON.stringify([...this.blocks]));
+      // Written beside the file and then swapped in, so a crash mid-write can't leave half a file.
+      writeFileSync(`${this.path}.tmp`, JSON.stringify([...this.blocks]));
+      renameSync(`${this.path}.tmp`, this.path);
     }, 2000);
     this.timer.unref?.();
   }

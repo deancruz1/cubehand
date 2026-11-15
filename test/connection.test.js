@@ -1,6 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { nextDelay, reasonText, isPermanentKick } from '../src/connection.js';
+import { nextDelay, reasonText, isPermanentKick, isWhisperLine } from '../src/connection.js';
+
+test('whisper lines are told apart from public chat', () => {
+  assert.equal(isWhisperLine('Alice whispers to you: Clodine come here', 'Alice'), true);
+  assert.equal(isWhisperLine('[Red] Alice whispers to you: hi', 'Alice'), true);
+  assert.equal(isWhisperLine('You whisper to Alice: On my way.', 'Clodine'), true);
+  assert.equal(isWhisperLine('[Alice -> me] hi', 'Alice'), true);
+  assert.equal(isWhisperLine('<Alice> Clodine come here', 'Alice'), false);
+  assert.equal(isWhisperLine('<Alice> Bob whispers to you: hi', 'Alice'), false);
+  assert.equal(isWhisperLine('<Bo> x whispers to you: y', 'Bo'), false);
+});
 
 test('reconnect delay doubles from 5s and caps at 60s', () => {
   const delays = [0, 1, 2, 3, 4, 5].map((attempt) => nextDelay(attempt, 5, 60));

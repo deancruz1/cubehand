@@ -53,6 +53,21 @@ export function isPermanentKick(text) {
   return PERMANENT_KICKS.some((pattern) => pattern.test(text));
 }
 
+// The prefix Mineflayer allows before a name, like a team tag.
+const NAME_PREFIX = '(?:\\(.{1,15}\\)|\\[.{1,15}\\]|.){0,5}?';
+const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Whispers come in on the chat position too: "Alice whispers to you: hi" from sender Alice,
+// "You whisper to Alice: hi" for the bot's own, or "[Alice -> me] hi". Mineflayer's whisper
+// event already reports the incoming ones, by the same patterns.
+export function isWhisperLine(line, sender) {
+  return (
+    line.startsWith('You whisper to ') ||
+    new RegExp(`^${NAME_PREFIX}${escapeRegex(sender)} whispers(?: to you)?:? `).test(line) ||
+    new RegExp(`^\\[${NAME_PREFIX}\\w+ -> \\w+\\s?\\] `).test(line)
+  );
+}
+
 export function startBot(config, hooks = {}) {
   const log = hooks.log ?? console.log;
   let bot = null;
@@ -118,7 +133,7 @@ export function startBot(config, hooks = {}) {
 
     bot.on('end', (reason) => {
       log(`Disconnected: ${reason}`);
-      hooks.onEnd?.();
+      hooks.onEnd?.({ reconnecting: !shuttingDown && !stopRetrying });
       if (shuttingDown || stopRetrying) {
         hooks.onStopped?.();
         return;
