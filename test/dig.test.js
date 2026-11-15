@@ -1,13 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { Vec3 } from 'vec3';
-import { digArea, digReason, holdsUp, lavaNext, dropBelow, leftText, falls } from '../src/actions/dig.js';
+import { digArea, digReason, holdsUp, lavaNext, dropBelow, leftText, falls, builtAgainst } from '../src/actions/dig.js';
 import { digBlock, removeScaffold, needsBetterTool, breakBlock, fixToolMaterials } from '../src/actions/blocks.js';
 import { validateConfig } from '../src/config.js';
 import { setPauseScale } from '../src/actions/util.js';
 import { Status } from '../src/status.js';
+import { PlacedLog, ScaffoldLog } from '../src/placed.js';
+import { Idle } from '../src/idle.js';
 
 setPauseScale(0);
 
@@ -16,7 +20,7 @@ const registry = require('prismarine-registry')('26.1');
 const Block = require('prismarine-block')(registry);
 
 const key = (p) => `${p.x},${p.y},${p.z}`;
-const boxOf = (name) => (['air', 'cave_air', 'water', 'lava', 'short_grass'].includes(name) ? 'empty' : 'block');
+const boxOf = (name) => (['air', 'cave_air', 'water', 'lava', 'short_grass', 'torch', 'wall_torch'].includes(name) ? 'empty' : 'block');
 const DIRS = [new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)];
 const noPath = () => {
   const err = new Error('no path');
@@ -30,7 +34,7 @@ const noPath = () => {
 // (steps, one-block step ups, drops of up to 3) when it can, and with tunnel set it digs a
 // straight 2-high tunnel at its feet to a spot it can't walk to, unless the walk may not break
 // those blocks.
-function fakeBot(blocks, { at = new Vec3(0.5, 64, 0.5), spots = null, fill = (p) => (p.y < 64 ? 'dirt' : 'air'), tunnel = false, items = [] } = {}) {
+function fakeBot(blocks, { at = new Vec3(0.5, 64, 0.5), spots = null, fill = (p) => (p.y < 64 ? 'dirt' : 'air'), tunnel = false, items = [], states = {} } = {}) {
   const world = new Map(Object.entries(blocks));
   const nameAt = (p) => world.get(key(p)) ?? fill(p);
   const open = (p) => boxOf(nameAt(p)) === 'empty' && nameAt(p) !== 'lava';
@@ -78,8 +82,9 @@ function fakeBot(blocks, { at = new Vec3(0.5, 64, 0.5), spots = null, fill = (p)
     heldItem: null,
     stopDigging: () => {},
     placeBlock: async (ref, face) => {
-      world.set(key(ref.position.plus(face)), items[0].name);
-      items[0].count--;
+      const item = bot.heldItem ?? items[0];
+      world.set(key(ref.position.plus(face)), item.name);
+      item.count--;
     },
     moveModes: Object.fromEntries(['walk', 'climb', 'noPlace', 'follow'].map((n) => [n, { exclusionAreasBreak: [] }])),
     pathfinder: {
@@ -120,10 +125,12 @@ function fakeBot(blocks, { at = new Vec3(0.5, 64, 0.5), spots = null, fill = (p)
     },
     blockAt: (p) => {
       const name = nameAt(p);
-      return { name, position: p, boundingBox: boxOf(name), getProperties: () => ({}) };
+      return { name, position: p, boundingBox: boxOf(name), getProperties: () => states[key(p)] ?? {} };
     },
     canDigBlock: () => true,
-    equip: async () => {},
+    equip: async (item) => {
+      if (items.includes(item)) bot.heldItem = item;
+    },
     dig: async (block) => {
       const p = block.position;
       dug.push({ pos: key(p), from: key(bot.entity.position.floored()) });
@@ -248,13 +255,13 @@ test('dig_area leaves built, own, lava-side and cave-top blocks and lists them',
   assert.equal(left.ok, false);
   assert.match(left.message, /dug 0 blocks/);
   assert.match(left.message, /not natural terrain/);
-  assert.match(left.message, /terrain touching something built \(at 3 64 0\)/);
+  assert.match(left.message, /terrain touching oak_planks at 2 64 0 \(at 3 64 0\)/);
 });
 
 test("dig_area leaves terrain against someone's cobblestone wall, but not against its own", async () => {
   const wall = fakeBot({ '2,64,0': 'stone', '3,64,0': 'cobblestone' });
   const left = await digArea(fakeCtx(wall), { x1: 2, y1: 64, z1: 0, x2: 2, y2: 64, z2: 0 });
-  assert.match(left.message, /terrain touching something built \(at 2 64 0\)/);
+  assert.match(left.message, /terrain touching cobblestone at 3 64 0 \(at 2 64 0\)/);
   assert.equal(wall.world.get('2,64,0'), 'stone');
   const own = fakeBot({ '2,64,0': 'stone', '3,64,0': 'cobblestone' });
   const dug = await digArea(fakeCtx(own, new Set(['3,64,0'])), { x1: 2, y1: 64, z1: 0, x2: 2, y2: 64, z2: 0 });
@@ -524,15 +531,16 @@ test('dig_area with ores takes a vein it uncovers in the wall and floor and carr
   };
   const config = { protectedBlocks: [], limits: { moveTimeoutSeconds: 5, maxDigBlocks: 1000 } };
   const box = { x1: 1, y1: 64, z1: 0, x2: 10, y2: 65, z2: 0 };
-  const bot = fakeBot({ ...mineWorld([0, 64, -5, 0, 65, 5]), ...ores }, { at: new Vec3(0.5, 64, 3.5), fill: rock, items: [{ name: 'cobbled_deepslate', count: 4 }] });
+  const bot = fakeBot({ ...mineWorld([0, 64, -5, 0, 65, 5]), ...ores }, { at: new Vec3(0.5, 64, 3.5), fill: rock, items: [{ name: 'cobbled_deepslate', count: 10 }] });
   const own = new Set();
   const ctx = { ...fakeCtx(bot, own), config };
   ctx.placed.add = (name, p) => own.add(key(p));
   const result = await digArea(ctx, { ...box, ores: true });
   assert.equal(result.ok, true, result.message);
-  assert.match(result.message, /^dug 20 blocks .*Mined out the ore I uncovered: 3 deepslate_diamond_ore, 2 deepslate_redstone_ore \(put 1 blocks back in the floor where ore came out\)\..*now at 9 64 0$/);
-  for (const k of Object.keys(ores)) assert.notEqual(bot.world.get(k), ores[k], k);
-  assert.equal(bot.world.get('8,63,0'), 'cobbled_deepslate');
+  assert.match(result.message, /^dug 20 blocks .*Mined out the ore I uncovered: 3 deepslate_diamond_ore, 2 deepslate_redstone_ore\. Filled 3 ore holes in the walls, floor and ceiling with 3 cobbled_deepslate\..*now at 9 64 0$/);
+  // The face cells are filled, the ore further in leaves its hole behind them.
+  for (const k of ['8,63,0', '8,64,1', '5,66,0']) assert.equal(bot.world.get(k), 'cobbled_deepslate', k);
+  for (const k of ['5,67,0', '6,67,0']) assert.equal(bot.world.get(k), 'air', k);
   assert.equal(bot.dug.filter((d) => inside(box)(d.pos)).length, 20);
 
   const leave = fakeBot({ ...mineWorld([0, 64, -5, 0, 65, 5]), ...ores }, { at: new Vec3(0.5, 64, 3.5), fill: rock });
@@ -540,4 +548,223 @@ test('dig_area with ores takes a vein it uncovers in the wall and floor and carr
   assert.equal(listed.ok, true, listed.message);
   assert.match(listed.message, /Ore showing in the walls, left in place: 1 deepslate_diamond_ore \(at 5 66 0\), 2 deepslate_redstone_ore \(at 8 63 0; 8 64 1\)/);
   assert.equal(leave.dug.every((d) => inside(box)(d.pos)), true);
+});
+
+test('a torch counts against a block only when it hangs on it, and the result names what a block touches', () => {
+  const names = { '1,0,0': 'wall_torch', '0,0,1': 'wall_torch', '0,1,0': 'lantern', '0,-1,0': 'stone', '-1,0,0': 'cobblestone' };
+  const states = { '1,0,0': { facing: 'north' }, '0,0,1': { facing: 'south' }, '0,1,0': { hanging: 'true' } };
+  const getBlock = (p) => {
+    const name = names[key(p)] ?? 'air';
+    return { name, position: p, boundingBox: boxOf(name), getProperties: () => states[key(p)] ?? {} };
+  };
+  const mine = (p) => key(p) === '-1,0,0';
+  // The wall torch at x 1 hangs on the block north of it, the one at z 1 on this block, and the
+  // lantern hangs from the block above it.
+  assert.deepEqual(builtAgainst(getBlock, new Vec3(0, 0, 0), mine), { name: 'wall_torch', pos: new Vec3(0, 0, 1) });
+  delete names['0,0,1'];
+  assert.equal(builtAgainst(getBlock, new Vec3(0, 0, 0), mine), null);
+  // Standing on this block, the lantern counts.
+  states['0,1,0'] = { hanging: 'false' };
+  assert.equal(builtAgainst(getBlock, new Vec3(0, 0, 0), mine).name, 'lantern');
+  delete names['0,1,0'];
+  assert.deepEqual(builtAgainst(getBlock, new Vec3(0, 0, 0)), { name: 'cobblestone', pos: new Vec3(-1, 0, 0) });
+  // Corners and edges don't count.
+  names['1,1,1'] = 'oak_planks';
+  assert.equal(builtAgainst(getBlock, new Vec3(0, 0, 0), mine), null);
+  assert.equal(digReason('stone', { touchesBuild: () => ({ name: 'wall_torch', pos: new Vec3(1, 2, 3) }) }), 'terrain touching wall_torch at 1 2 3');
+  assert.equal(digReason('wall_torch'), '');
+  assert.equal(digReason('redstone_torch'), 'not natural terrain');
+  assert.equal(digReason('cobbled_deepslate', { own: true }), 'placed by me');
+  assert.equal(digReason('cobbled_deepslate', { own: true, fill: true }), null);
+});
+
+const bigConfig = { protectedBlocks: [], limits: { moveTimeoutSeconds: 5, maxDigBlocks: 1000 } };
+
+test('torches along a tunnel and at its mouth do not stop it, and one hanging on a block of it keeps that block', async () => {
+  // Corridors along x 0 and x 11, the tunnel between them along z 0, its first column already open
+  // with a torch on the floor, torches in the far corridor, and one in a niche hanging on 10 65 0.
+  const blocks = {
+    ...mineWorld([0, 64, -5, 0, 65, 5], [11, 64, -5, 11, 65, 5], [1, 64, 0, 1, 65, 0], [10, 65, 1, 10, 65, 1]),
+    '1,64,0': 'torch', '11,64,0': 'torch', '11,65,0': 'wall_torch', '11,64,1': 'wall_torch', '10,65,1': 'wall_torch'
+  };
+  const states = { '11,65,0': { facing: 'west' }, '11,64,1': { facing: 'west' }, '10,65,1': { facing: 'south' } };
+  const bot = fakeBot(blocks, { at: new Vec3(0.5, 64, 3.5), fill: rock, states });
+  const box = { x1: 1, y1: 64, z1: 0, x2: 10, y2: 65, z2: 0 };
+  const result = await digArea({ ...fakeCtx(bot), config: bigConfig }, box);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^dug 17 blocks .*\(17 deepslate\)\. Left 1 terrain touching wall_torch at 10 65 1 \(at 10 65 0\)\. Picked up/);
+  assert.equal(bot.world.get('1,64,0'), 'torch');
+  assert.equal(bot.world.get('10,64,0'), 'air');
+  assert.equal(bot.dug.every((d) => inside(box)(d.pos)), true);
+});
+
+test('one step forward that fails does not leave the rest of the tunnel as out of reach', async () => {
+  // Left like a dig stopped part-way: two columns open and the head of the third.
+  const bot = fakeBot(mineWorld([0, 64, -6, 0, 65, 4], [1, 64, -3, 20, 65, -3], [1, 64, 0, 2, 65, 0], [3, 65, 0, 3, 65, 0]), { at: new Vec3(18.5, 64, -2.5), fill: rock });
+  const goto = bot.pathfinder.goto;
+  let failOnce = true;
+  bot.pathfinder.goto = async (goal) => {
+    if (failOnce && goal.x === 3 && goal.z === 0) {
+      failOnce = false;
+      throw noPath();
+    }
+    return goto(goal);
+  };
+  const box = { x1: 1, y1: 64, z1: 0, x2: 20, y2: 65, z2: 0 };
+  const result = await digArea({ ...fakeCtx(bot), config: bigConfig }, box);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^dug 35 blocks /);
+  assert.doesNotMatch(result.message, /Left/);
+  assert.equal(bot.dug.every((d) => inside(box)(d.pos) && d.from.split(',')[1] === '64'), true);
+});
+
+test('a tunnel stopped at any point and dug again with the same box comes out whole, each block dug once', async () => {
+  const box = { x1: 1, y1: 64, z1: 0, x2: 20, y2: 65, z2: 0 };
+  // A player has dug the feet of column 7 and the head of column 12 already.
+  const world = () => ({ ...mineWorld([0, 64, -5, 0, 65, 5]), '7,64,0': 'air', '12,65,0': 'air' });
+  for (const [stopAfter, moved] of [[1, false], [2, false], [3, true], [8, false], [21, true], [37, false]]) {
+    const bot = fakeBot(world(), { at: new Vec3(0.5, 64, 3.5), fill: rock, tunnel: true });
+    const controller = new AbortController();
+    const dig = bot.dig;
+    bot.dig = async (b) => {
+      await dig(b);
+      if (bot.dug.length === stopAfter) controller.abort();
+    };
+    const first = await digArea({ ...fakeCtx(bot), config: bigConfig, signal: controller.signal }, box);
+    assert.match(first.message, /Stopped early: stopped$/, `${stopAfter}: ${first.message}`);
+    // Somewhere else in the tunnel or out in the corridor when it is run again.
+    if (moved) bot.entity.position = stopAfter > 10 ? new Vec3(2.5, 64, 0.5) : new Vec3(0.5, 64, -4.5);
+    const stopped = bot.entity.position.floored();
+    const again = await digArea({ ...fakeCtx(bot), config: bigConfig }, box);
+    assert.equal(again.ok, true, `${stopAfter}: ${again.message}`);
+    assert.doesNotMatch(again.message, /Left|Stopped/, `${stopAfter}: ${again.message}`);
+    for (let x = 1; x <= 20; x++) for (const y of [64, 65]) assert.equal(bot.world.get(`${x},${y},0`), 'air', `${stopAfter}: ${x} ${y}`);
+    assert.equal(bot.dug.length, 38, `${stopAfter}`);
+    assert.equal(new Set(bot.dug.map((d) => d.pos)).size, 38, `${stopAfter}`);
+    assert.equal(bot.dug.every((d) => inside(box)(d.pos) && d.from.split(',')[1] === '64'), true, `${stopAfter}`);
+    assert.deepEqual(bot.walkDug, []);
+    // She goes on from where she stopped instead of walking back to the start of the tunnel.
+    if (!moved) assert.ok(Math.abs(Number(bot.dug[stopAfter].from.split(',')[0]) - stopped.x) <= 1, `${stopAfter}: ${bot.dug[stopAfter].from}`);
+  }
+});
+
+// A placed-block log in a temp file, removed again by done().
+function tempPlaced() {
+  const path = join(tmpdir(), `placed-dig-test-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
+  const log = new PlacedLog(path);
+  log.done = () => {
+    clearTimeout(log.timer);
+    fs.rmSync(path, { force: true });
+  };
+  return log;
+}
+
+test('filler is kept apart in the placed-block log and comes back after a restart', async () => {
+  const log = tempPlaced();
+  try {
+    log.add('cobbled_deepslate', new Vec3(1, 2, 3));
+    log.add('cobblestone', new Vec3(4, 5, 6));
+    log.markFill(new Vec3(1, 2, 3));
+    log.markFill(new Vec3(7, 7, 7));
+    assert.equal(log.isFill(new Vec3(1, 2, 3), 'cobbled_deepslate'), true);
+    assert.equal(log.isFill(new Vec3(4, 5, 6), 'cobblestone'), false);
+    assert.equal(log.isFill(new Vec3(7, 7, 7), 'stone'), false);
+    await new Promise((resolve) => setTimeout(resolve, 2200));
+    const back = new PlacedLog(log.path);
+    assert.equal(back.isFill(new Vec3(1, 2, 3), 'cobbled_deepslate'), true);
+    assert.equal(back.has(new Vec3(4, 5, 6), 'cobblestone'), true);
+    back.remove(new Vec3(1, 2, 3));
+    assert.equal(back.isFill(new Vec3(1, 2, 3), 'cobbled_deepslate'), false);
+    clearTimeout(back.timer);
+  } finally {
+    log.done();
+  }
+});
+
+test('ore taken out of a tunnel wall gets its face filled flush with the rock around it, and the filler is no build and no scaffolding', async () => {
+  const placed = tempPlaced();
+  const scaffoldPath = join(tmpdir(), `scaffold-dig-test-${process.pid}.json`);
+  const walkScaffold = new ScaffoldLog(scaffoldPath);
+  try {
+    // A redstone vein going into the wall at x 5, in a patch of tuff, and one at x 8 in deepslate.
+    const blocks = {
+      ...mineWorld([0, 64, -5, 0, 65, 5]),
+      '5,64,1': 'deepslate_redstone_ore', '5,64,2': 'deepslate_redstone_ore',
+      '4,64,1': 'tuff', '6,64,1': 'tuff', '5,63,1': 'tuff', '5,65,1': 'tuff',
+      '8,65,-1': 'deepslate_redstone_ore'
+    };
+    const items = [{ name: 'diamond', count: 3 }, { name: 'cobbled_deepslate', count: 10 }, { name: 'tuff', count: 2 }];
+    const bot = fakeBot(blocks, { at: new Vec3(0.5, 64, 3.5), fill: rock, items });
+    bot.walkScaffold = walkScaffold;
+    const ctx = { ...fakeCtx(bot), config: bigConfig, placed };
+    const box = { x1: 1, y1: 64, z1: 0, x2: 10, y2: 65, z2: 0 };
+    const result = await digArea(ctx, { ...box, ores: true });
+    assert.equal(result.ok, true, result.message);
+    assert.match(result.message, /Mined out the ore I uncovered: 3 deepslate_redstone_ore\. Filled 2 ore holes in the walls, floor and ceiling with (1 tuff, 1 cobbled_deepslate|1 cobbled_deepslate, 1 tuff)\./);
+    assert.equal(bot.world.get('5,64,1'), 'tuff');
+    assert.equal(bot.world.get('8,65,-1'), 'cobbled_deepslate');
+    // Deeper than the face, the vein's hole stays behind the filler.
+    assert.equal(bot.world.get('5,64,2'), 'air');
+    assert.equal(items[0].count, 3);
+    assert.equal(placed.isFill(new Vec3(8, 65, -1), 'cobbled_deepslate'), true);
+    // Not walk scaffolding: nothing for the tidy chore to take down.
+    assert.equal(walkScaffold.blocks.size, 0);
+    assert.deepEqual(new Idle({ scaffold: walkScaffold }).scaffoldTops(bot), []);
+
+    // A tunnel dug right beside the filled face is not held up by the filler.
+    const next = await digArea(ctx, { x1: 1, y1: 64, z1: -2, x2: 10, y2: 65, z2: -2 });
+    assert.equal(next.ok, true, next.message);
+    assert.match(next.message, /^dug 20 blocks/);
+    assert.doesNotMatch(next.message, /Left/);
+    assert.equal(bot.world.get('8,65,-2'), 'air');
+    // And a box over the filler digs it like the rock around it.
+    const over = await digArea(ctx, { x1: 8, y1: 64, z1: -1, x2: 8, y2: 65, z2: -1 });
+    assert.equal(over.ok, true, over.message);
+    assert.match(over.message, /^dug 2 blocks .*1 cobbled_deepslate/);
+    assert.equal(placed.has(new Vec3(8, 65, -1), 'cobbled_deepslate'), false);
+  } finally {
+    placed.done();
+    clearTimeout(walkScaffold.timer);
+    fs.rmSync(scaffoldPath, { force: true });
+  }
+});
+
+test('with nothing suitable to fill an ore hole she leaves it open and says so', async () => {
+  const blocks = { ...mineWorld([0, 64, -5, 0, 65, 5]), '5,64,1': 'deepslate_redstone_ore' };
+  // Diamonds are never filler, and four blocks are kept back for her walks.
+  const items = [{ name: 'diamond', count: 3 }, { name: 'cobbled_deepslate', count: 4 }];
+  const bot = fakeBot(blocks, { at: new Vec3(0.5, 64, 3.5), fill: rock, items });
+  const result = await digArea({ ...fakeCtx(bot), config: bigConfig }, { x1: 1, y1: 64, z1: 0, x2: 10, y2: 65, z2: 0, ores: true });
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /Mined out the ore I uncovered: 1 deepslate_redstone_ore\. Left 1 ore holes open in the walls \(at 5 64 1\): nothing to fill them with\./);
+  assert.equal(bot.world.get('5,64,1'), 'air');
+  assert.deepEqual(items.map((i) => i.count), [3, 4]);
+});
+
+test('a dig with ores stopped in the middle of a vein takes the rest and fills the holes when run again', async () => {
+  const ores = { '6,64,1': 'deepslate_redstone_ore', '6,64,2': 'deepslate_redstone_ore', '7,64,2': 'deepslate_redstone_ore', '6,63,0': 'deepslate_redstone_ore' };
+  const items = [{ name: 'cobbled_deepslate', count: 10 }];
+  const bot = fakeBot({ ...mineWorld([0, 64, -5, 0, 65, 5]), ...ores }, { at: new Vec3(0.5, 64, 3.5), fill: rock, items });
+  const own = new Set();
+  const ctx = { ...fakeCtx(bot, own), config: bigConfig };
+  ctx.placed.add = (name, p) => own.add(key(p));
+  const controller = new AbortController();
+  const dig = bot.dig;
+  bot.dig = async (b) => {
+    const ore = b.name.endsWith('_ore');
+    await dig(b);
+    if (ore) controller.abort();
+  };
+  const box = { x1: 1, y1: 64, z1: 0, x2: 10, y2: 65, z2: 0, ores: true };
+  const first = await digArea({ ...ctx, signal: controller.signal }, box);
+  assert.match(first.message, /Stopped early: stopped$/, first.message);
+  bot.dig = dig;
+  const again = await digArea(ctx, box);
+  assert.equal(again.ok, true, again.message);
+  assert.doesNotMatch(again.message, /Left|Stopped/, again.message);
+  for (const k of Object.keys(ores)) assert.notEqual(bot.world.get(k), 'deepslate_redstone_ore', k);
+  assert.equal(bot.world.get('6,64,1'), 'cobbled_deepslate');
+  assert.equal(bot.world.get('6,63,0'), 'cobbled_deepslate');
+  for (let x = 1; x <= 10; x++) for (const y of [64, 65]) assert.equal(bot.world.get(`${x},${y},0`), 'air', `${x} ${y}`);
+  assert.equal(bot.dug.every((d) => inside(box)(d.pos) || ores[d.pos]), true);
 });

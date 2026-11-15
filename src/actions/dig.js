@@ -2,8 +2,8 @@ import { Vec3 } from 'vec3';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import { ok, fail, posText, pause, delay } from './util.js';
 import { walkTo, watchScaffold, SCAFFOLD_BLOCKS } from './movement.js';
-import { isTerrain, isBuildTerrain, isLogName, isWild, looksBuilt, nextToBuild, buildGrid, nearBuilds, CLEAR_ZONE, falls, dropBelow, holdsUp, DigSpot, isOre, mineVein } from './mining.js';
-import { digBlock, inReach, isProtected, isReplaceable, removeScaffold, needsBetterTool, isOpenBlock, fixToolMaterials, blockReader, placeOne } from './blocks.js';
+import { isTerrain, isBuildTerrain, isLogName, isWild, looksBuilt, isBuiltBlock, buildGrid, nearBuilds, CLEAR_ZONE, falls, dropBelow, holdsUp, DigSpot, isOre, mineVein } from './mining.js';
+import { digBlock, inReach, isProtected, isReplaceable, removeScaffold, needsBetterTool, isOpenBlock, fixToolMaterials, blockReader, placeOne, settle } from './blocks.js';
 import { collectDrops, gainedText } from './items.js';
 import { nearestFirst } from './build.js';
 
@@ -31,6 +31,24 @@ const CLIMB = new Set(['ladder', 'vine', 'twisting_vines', 'twisting_vines_plant
 // Plants dug like clutter. Other wild blocks (bee nests, eggs, sculk, amethyst, pumpkins) stay.
 const PLANT = /^(dandelion|poppy|blue_orchid|allium|azure_bluet|oxeye_daisy|cornflower|lily_of_the_valley|sunflower|lilac|rose_bush|peony|pink_petals|wildflowers|brown_mushroom|red_mushroom|sugar_cane|cactus|cactus_flower|bamboo|sweet_berry_bush|kelp|kelp_plant|lily_pad|moss_carpet|azalea|flowering_azalea|bush|firefly_bush|hanging_roots|crimson_roots|warped_roots|nether_sprouts)$|_tulip$/;
 
+// What fills a hole ore came out of in each kind of rock, best match first, then any other cheap
+// block she carries, dirt last. A hole in a wall or the ceiling leaves her FILL_RESERVE of them
+// for her walks; one in the floor, which she has to walk over, may take the last.
+const FILL_MATCH = {
+  deepslate: ['deepslate', 'cobbled_deepslate', 'tuff'],
+  tuff: ['tuff', 'deepslate', 'cobbled_deepslate'],
+  stone: ['stone', 'cobblestone', 'andesite', 'diorite', 'granite'],
+  andesite: ['andesite', 'stone', 'cobblestone'],
+  diorite: ['diorite', 'stone', 'cobblestone'],
+  granite: ['granite', 'stone', 'cobblestone'],
+  netherrack: ['netherrack', 'blackstone'],
+  blackstone: ['blackstone', 'netherrack'],
+  dirt: ['dirt', 'coarse_dirt']
+};
+const FILL_ANY = ['cobblestone', 'cobbled_deepslate', 'stone', 'deepslate', 'tuff', 'andesite', 'diorite', 'granite', 'blackstone', 'netherrack', 'dirt', 'coarse_dirt'];
+const FILL_RESERVE = 4;
+const HOLES_MAX = 500;
+
 // Grass, snow layers, vines and the like, which any player clears without a thought.
 function isClutter(name) {
   return isReplaceable(name) && !AIR.has(name) && name !== 'water' && name !== 'lava';
@@ -44,19 +62,52 @@ export function lavaNext(getName, pos) {
   return FACES.some((f) => getName(pos.plus(f)) === 'lava');
 }
 
-// Why a block in the box is left alone, or null to dig it. '' means there is nothing to dig.
-// The tests that look around (touchesBuild, nearBuilt, canHarvest) are functions, so they only
-// run when they matter.
-export function digReason(name, { own = false, protectedBlocks = [], touchesBuild = () => false, nearBuilt = () => false, canHarvest = () => true } = {}) {
-  if (!name || AIR.has(name)) return '';
+// Torches and lanterns a player puts up along a tunnel. Redstone torches are part of a circuit.
+const LIGHT = /^(soul_|copper_)?(wall_)?torch$|(^|_)lantern$/;
+const FACING = { north: [0, -1], south: [0, 1], west: [-1, 0], east: [1, 0] };
+
+// The block a torch or lantern at pos hangs on or stands on, or null when that can't be told.
+function lightSupport(block, pos) {
+  const props = block.getProperties?.() ?? {};
+  if (block.name.endsWith('lantern')) return pos.offset(0, String(props.hanging) === 'true' ? 1 : -1, 0);
+  if (!block.name.includes('wall_')) return pos.offset(0, -1, 0);
+  const f = FACING[props.facing];
+  return f ? pos.offset(-f[0], 0, -f[1]) : null;
+}
+
+// The built block touching pos face to face that digging pos would harm, as { name, pos }, or
+// null. Her own blocks don't count, nor a torch or lantern that hangs on another block: digging
+// pos leaves those as they are. Blocks touching only at an edge or corner don't count either.
+export function builtAgainst(getBlock, pos, own = () => false) {
+  for (const f of FACES) {
+    const n = pos.plus(f);
+    const b = getBlock(n);
+    if (!b || !isBuiltBlock(b) || own(n, b.name)) continue;
+    if (LIGHT.test(b.name)) {
+      const support = lightSupport(b, n);
+      if (support && !support.equals(pos)) continue;
+    }
+    return { name: b.name, pos: n };
+  }
+  return null;
+}
+
+// Why a block in the box is left alone, or null to dig it. '' means there is nothing to dig, and
+// a torch or lantern in the box is part of the open space. fill marks rock she put back where she
+// took ore out, dug like any other. The tests that look around (touchesBuild, nearBuilt,
+// canHarvest) are functions, so they only run when they matter; touchesBuild gives true or what
+// the block touches ({ name, pos }).
+export function digReason(name, { own = false, fill = false, protectedBlocks = [], touchesBuild = () => false, nearBuilt = () => false, canHarvest = () => true } = {}) {
+  if (!name || AIR.has(name) || LIGHT.test(name)) return '';
   if (name === 'water' || name === 'bubble_column') return 'water';
   if (name === 'lava') return 'lava';
-  if (own) return 'placed by me';
+  if (own && !fill) return 'placed by me';
   if (isProtected(name, protectedBlocks)) return 'protected';
   if (isClutter(name)) return null;
-  const terrain = isTerrain(name) || isBuildTerrain(name);
+  const terrain = fill || isTerrain(name) || isBuildTerrain(name);
   if (!terrain && !isPlant(name)) return isLogName(name) ? 'logs' : isWild(name) ? 'wild' : 'not natural terrain';
-  if (touchesBuild()) return 'touching something built';
+  const touch = touchesBuild();
+  if (touch) return touch === true ? 'touching something built' : `terrain touching ${touch.name} at ${posText(touch.pos)}`;
   if (isBuildTerrain(name) && nearBuilt()) return 'build material near a build';
   if (!canHarvest()) return 'need a better tool';
   return null;
@@ -192,7 +243,8 @@ function limitBreaks(bot, mayBreak) {
 // block first, as before. Walks break nothing outside the box, only terrain and plants are dug,
 // never the block she stands on, nothing next to lava or over a cave. Everything else stays and is
 // listed with the reason. Ore the dig uncovers in the walls is mined out with its vein when ores
-// is set, else listed with where it is.
+// is set, and the holes it leaves in the sides of the box are filled again with rock to match,
+// else listed with where it is.
 export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
   const { bot, config, signal } = ctx;
   const min = new Vec3(Math.min(x1, x2), Math.min(y1, y2), Math.min(z1, z2));
@@ -239,13 +291,16 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
   const failed = new Map();
   const stuck = new Map();
   let scaffold = null;
-  const ownAt = (q, name) => Boolean(ctx.placed?.has(q, name)) || Boolean(scaffold?.placed.some((s) => s.equals(q)));
+  const ownAt = (q, name) => Boolean(ctx.placed?.has(q, name)) || Boolean(scaffold?.placed.some((s) => s.equals(q))) ||
+    Boolean(bot.walkScaffold?.has(q, name, bot.game?.dimension));
   const reasonAt = (p) => {
     const block = getBlock(p);
+    const own = Boolean(block && ctx.placed?.has(p, block.name));
     const reason = digReason(block?.name, {
-      own: Boolean(block && ctx.placed?.has(p, block.name)),
+      own,
+      fill: own && Boolean(ctx.placed?.isFill?.(p, block.name)),
       protectedBlocks: config.protectedBlocks,
-      touchesBuild: () => nextToBuild(getBlock, p, ownAt),
+      touchesBuild: () => builtAgainst(getBlock, p, ownAt),
       nearBuilt: () => nearBuilt(p),
       canHarvest: () => !block.harvestTools || !needsBetterTool(block, bot.pathfinder.bestHarvestTool(block)?.type ?? null)
     });
@@ -306,6 +361,12 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
     });
     return found.map((c) => ({ pos: c.pos, work: workFrom(c.pos, top).length })).sort((a, b) => b.work - a.work)[0]?.pos ?? null;
   };
+  const inSight = (eye, c) => {
+    if (!bot.world?.raycast) return true;
+    const dir = c.offset(0.5, 0.5, 0.5).minus(eye);
+    const hit = bot.world.raycast(eye, dir.normalize(), dir.norm() + 0.5);
+    return !hit || hit.position.equals(c);
+  };
   // A box block she could dig standing at s: in reach and in sight.
   const reachesBox = (s) => {
     const eye = s.offset(0.5, 1.62, 0.5);
@@ -318,10 +379,7 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
           const c = new Vec3(x, y, z);
           const centre = c.offset(0.5, 0.5, 0.5);
           if (centre.distanceTo(eye) > 4.5 || !toDig(c)) continue;
-          if (!bot.world?.raycast) return true;
-          const dir = centre.minus(eye);
-          const hit = bot.world.raycast(eye, dir.normalize(), dir.norm() + 0.5);
-          if (!hit || hit.position.equals(c)) return true;
+          if (inSight(eye, c)) return true;
         }
       }
     }
@@ -372,7 +430,6 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
   const uncovered = new Map();
   const took = new Map();
   let veinTrouble = '';
-  let patched = 0;
   const noteOres = (p) => {
     for (const f of FACES) {
       const n = p.plus(f);
@@ -381,22 +438,74 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
       if (name && isOre(name) && !ctx.placed?.has(n, name)) uncovered.set(keyOf(n), n);
     }
   };
-  // With ores set, mines out every uncovered vein, nearest first, and comes back to back.
+  // Holes the veins left in the floor, walls and ceiling of a box: the cells outside it that touch
+  // it face to face. The bot keeps them between calls, so a dig stopped before it filled them
+  // fills them when it is run again.
+  const holes = (bot.oreHoles ??= new Map());
+  const touchesBox = (p) => !inBox(p) && FACES.some((f) => inBox(p.plus(f)));
+  const filled = new Map();
+  let noFiller = false;
+  // The rock around a hole, by what most of its sides are; ore counts as the rock it sits in.
+  const rockAround = (p) => {
+    const counts = new Map();
+    for (const f of FACES) {
+      const n = p.plus(f);
+      let name = inBox(n) ? null : getName(n);
+      if (!name || !isTerrain(name)) continue;
+      if (isOre(name)) name = name.startsWith('deepslate_') ? 'deepslate' : 'stone';
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    return [...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+  };
+  const fillerFor = (p) => {
+    const counts = inventoryCounts(bot);
+    let spare = SCAFFOLD_BLOCKS.reduce((n, name) => n + (counts.get(name) ?? 0), 0);
+    if (p.y >= min.y) spare -= FILL_RESERVE;
+    if (spare <= 0) return null;
+    return [...(FILL_MATCH[rockAround(p)] ?? []), ...FILL_ANY].find((name) => counts.get(name) > 0) ?? null;
+  };
+  const openHoles = () => [...holes.values()].filter((p) => {
+    const name = getName(p);
+    if (name && !AIR.has(name) && name !== 'water') holes.delete(keyOf(p));
+    return touchesBox(p) && holes.has(keyOf(p));
+  });
+  // Fills the holes in reach, or with walk all of them, floor first so she can walk over it.
+  const fillHoles = async (walk) => {
+    for (const p of openHoles().sort((a, b) => a.y - b.y)) {
+      if (!walk && !inReach(bot, p)) continue;
+      const name = fillerFor(p);
+      if (!name) {
+        noFiller = true;
+        continue;
+      }
+      const placed = await placeOne(ctx, name, p);
+      if (signal?.aborted) return 'stopped';
+      if (!placed.ok) continue;
+      holes.delete(keyOf(p));
+      ctx.placed?.markFill?.(p);
+      filled.set(name, (filled.get(name) ?? 0) + 1);
+    }
+    return '';
+  };
+  // With ores set, mines out every uncovered vein, nearest first, comes back to back and fills
+  // the holes it left in the sides of the box, as a player keeps a strip mine neat.
   const takeOres = async (back) => {
     if (!ores) return '';
     for (;;) {
       const eye = bot.entity.position.offset(0, 1.6, 0);
       const next = [...uncovered.values()].filter((p) => isOre(getName(p) ?? '')).sort((a, b) => a.distanceTo(eye) - b.distanceTo(eye))[0];
-      if (!next) return '';
+      if (!next) break;
       uncovered.delete(keyOf(next));
       const rule = mayBreak;
       mayBreak = () => true;
-      const veinCells = [];
       const vein = await mineVein(ctx, [next], {
         onDug: (p, name) => {
           took.set(name, (took.get(name) ?? 0) + 1);
           uncovered.delete(keyOf(p));
-          veinCells.push(p);
+          if (!touchesBox(p)) return;
+          holes.delete(keyOf(p));
+          holes.set(keyOf(p), p);
+          if (holes.size > HOLES_MAX) holes.delete(holes.keys().next().value);
         }
       });
       mayBreak = rule;
@@ -404,16 +513,9 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
       if (vein.problem) veinTrouble = vein.problem;
       if (!feetCell().equals(back)) await stepTo(back);
       if (signal?.aborted) return 'stopped';
-      // Ore taken out of the floor leaves a hole she can't walk over, so it gets a block put back,
-      // as a player would.
-      for (const p of veinCells) {
-        if (p.y !== min.y - 1 || !inBox(p.offset(0, 1, 0)) || !open(p)) continue;
-        const item = bot.inventory.items().find((i) => SCAFFOLD_BLOCKS.includes(i.name));
-        if (!item) break;
-        if ((await placeOne(ctx, item.name, p)).ok) patched++;
-        if (signal?.aborted) return 'stopped';
-      }
+      if (await fillHoles(false)) return 'stopped';
     }
+    return fillHoles(false);
   };
 
   // Counts a dig that worked, or a block that stays. Returns a reason to stop, or ''.
@@ -450,10 +552,18 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
   const faceDig = async (top) => {
     face = true;
     let walkFails = 0;
+    const forced = new Set();
     for (;;) {
       if (signal?.aborted) return 'stopped';
       const s = feetCell();
-      const work = s.y === min.y ? workFrom(s, top).filter((c) => !holdsUp(bot.entity.position, c, getName)) : [];
+      const all = s.y === min.y ? workFrom(s, top) : [];
+      let work = all.filter((c) => !holdsUp(bot.entity.position, c, getName));
+      if (all.length && !work.length) {
+        // Still in the air from the last step, she seems to stand on the block in front.
+        await settle(bot);
+        work = all.filter((c) => !holdsUp(bot.entity.position, c, getName));
+        if (!work.length) badSpots.add(keyOf(s));
+      }
       if (work.length) {
         for (const c of work) {
           if (signal?.aborted) return 'stopped';
@@ -480,7 +590,33 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
         continue;
       }
       const spot = nextSpot(s, top);
-      if (!spot) return '';
+      if (!spot) {
+        // No spot on the floor to go on from, as when a step forward failed: rather than leave
+        // the rest as out of reach, she digs the nearest of it she can reach and see from here,
+        // and goes on face by face from there. Each block gets one such try.
+        if (height < 2) return '';
+        const eye = bot.entity.position.offset(0, 1.6, 0);
+        const rest = [];
+        for (let y = min.y; y <= top; y++) {
+          for (const c of layer(y)) {
+            const k = keyOf(c);
+            if (forced.has(k) || stuck.has(k) || (failed.has(k) && failed.get(k) !== 'out of reach')) continue;
+            if (reasonAt(c) !== null || !inReach(bot, c) || holdsUp(bot.entity.position, c, getName) || !inSight(eye, c)) continue;
+            rest.push(c);
+          }
+        }
+        if (!rest.length) return '';
+        const c = nearestFirst(rest, () => eye).next().value;
+        forced.add(keyOf(c));
+        failed.delete(keyOf(c));
+        const name = getName(c);
+        const result = await digBlock(ctx, c);
+        const stop = !signal?.aborted || result.ok ? await afterDig(c, name, digResult(result)) : '';
+        if (signal?.aborted) return 'stopped';
+        if (stop) return stop;
+        if (result.ok) badSpots.clear();
+        continue;
+      }
       const walked = await stepTo(spot);
       if (signal?.aborted) return 'stopped';
       if (!feetCell().equals(spot) || spot.equals(s)) {
@@ -553,6 +689,13 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
     return '';
   };
 
+  // A dig run again after one that was stopped takes the ore that one uncovered too, and the rest
+  // of a vein it was stopped in.
+  if (ores) {
+    for (let y = min.y; y <= max.y; y++) for (const p of layer(y)) if (reasonAt(p) === '') noteOres(p);
+    for (const p of openHoles()) noteOres(p);
+  }
+
   let dugIn = '';
   try {
     if (total > 0) {
@@ -617,6 +760,12 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
     }
     if (signal?.aborted) stopReason = 'stopped';
     mayBreak = () => false;
+    // Ore still showing and holes not filled yet, out of reach on the way, or left by a dig that
+    // was stopped.
+    if (ores && !stopReason) {
+      stopReason = (await takeOres(feetCell())) || (await fillHoles(true));
+      if (signal?.aborted) stopReason = 'stopped';
+    }
     // End on the floor of the box once any of it is dug.
     if (!signal?.aborted && dug > 0 && feetCell().y !== min.y) {
       const { found } = walkMap(feetCell(), (p) => roomAt(p, true), open, { climb, within: local, goal: (p) => p.y === min.y && inBox(p) });
@@ -654,16 +803,22 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
   const what = dugNames.size ? ` (${[...dugNames].map(([n, c]) => `${c} ${n}`).join(', ')})` : '';
   let message = `dug ${dug} blocks from ${posText(min)} to ${posText(max)}${what}${dugIn}`;
   if (left.size) message += `. Left ${leftText(left)}`;
-  if (took.size) {
-    const notes = [veinTrouble, patched ? `put ${patched} blocks back in the floor where ore came out` : ''].filter(Boolean).join('; ');
-    message += `. Mined out the ore I uncovered: ${[...took].map(([n, c]) => `${c} ${n}`).join(', ')}${notes ? ` (${notes})` : ''}`;
+  if (took.size) message += `. Mined out the ore I uncovered: ${[...took].map(([n, c]) => `${c} ${n}`).join(', ')}${veinTrouble ? ` (${veinTrouble})` : ''}`;
+  if (filled.size) {
+    const count = [...filled.values()].reduce((a, b) => a + b, 0);
+    message += `. Filled ${count} ore holes in the walls, floor and ceiling with ${[...filled].map(([n, c]) => `${c} ${n}`).join(', ')}`;
+  }
+  const gaps = ores ? openHoles() : [];
+  if (gaps.length) {
+    const why = noFiller ? 'nothing to fill them with' : stopReason ? 'not filled yet' : 'could not place a block there';
+    message += `. Left ${gaps.length} ore holes open in the walls (at ${gaps.slice(0, 3).map(posText).join('; ')}${gaps.length > 3 ? '; ...' : ''}): ${why}`;
   }
   const showing = [...uncovered.values()].filter((p) => isOre(getName(p) ?? ''));
   if (showing.length) message += `. Ore showing in the walls, left in place: ${oreText(showing, getName)}`;
   if (removed) message += `. Took down ${removed} scaffolding blocks`;
   message += `. Picked up ${gainedText(before, inventoryCounts(bot)) || 'nothing'}, now at ${posText(bot.entity.position)}`;
   if (stopReason) message += `. Stopped early: ${stopReason}`;
-  if (dug > 0) return ok(message);
+  if (dug > 0 || took.size || filled.size) return ok(message);
   if (!stopReason && !left.size) return ok(`nothing to dig: ${message}`);
   return fail(message);
 }

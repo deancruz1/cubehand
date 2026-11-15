@@ -4,11 +4,14 @@ import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 const MAX_ENTRIES = 100000;
 
 // Blocks the bot placed itself, saved to a file, so it may break them again later (like its
-// own crafting table) even when that kind of block is protected.
+// own crafting table) even when that kind of block is protected. Filler (rock she put back where
+// she dug ore out of a tunnel wall) is marked: digging treats it as terrain.
 export class PlacedLog {
   constructor(path = 'placed.json') {
     this.path = path;
-    this.blocks = new Map(existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : []);
+    const list = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : [];
+    this.blocks = new Map(list);
+    this.fill = new Set(list.filter((e) => e[2] === 'fill').map((e) => e[0]));
     this.timer = null;
   }
 
@@ -19,8 +22,13 @@ export class PlacedLog {
   add(name, pos) {
     const key = this.key(pos);
     this.blocks.delete(key);
+    this.fill.delete(key);
     this.blocks.set(key, name);
-    if (this.blocks.size > MAX_ENTRIES) this.blocks.delete(this.blocks.keys().next().value);
+    if (this.blocks.size > MAX_ENTRIES) {
+      const oldest = this.blocks.keys().next().value;
+      this.blocks.delete(oldest);
+      this.fill.delete(oldest);
+    }
     this.saveSoon();
   }
 
@@ -29,7 +37,19 @@ export class PlacedLog {
     return this.blocks.get(this.key(pos)) === name;
   }
 
+  markFill(pos) {
+    const key = this.key(pos);
+    if (!this.blocks.has(key)) return;
+    this.fill.add(key);
+    this.saveSoon();
+  }
+
+  isFill(pos, name) {
+    return this.has(pos, name) && this.fill.has(this.key(pos));
+  }
+
   remove(pos) {
+    this.fill.delete(this.key(pos));
     if (this.blocks.delete(this.key(pos))) this.saveSoon();
   }
 
@@ -38,7 +58,7 @@ export class PlacedLog {
     this.timer = setTimeout(() => {
       this.timer = null;
       // Written beside the file and then swapped in, so a crash mid-write can't leave half a file.
-      writeFileSync(`${this.path}.tmp`, JSON.stringify([...this.blocks]));
+      writeFileSync(`${this.path}.tmp`, JSON.stringify([...this.blocks].map(([k, n]) => (this.fill.has(k) ? [k, n, 'fill'] : [k, n]))));
       renameSync(`${this.path}.tmp`, this.path);
     }, 2000);
     this.timer.unref?.();

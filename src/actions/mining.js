@@ -152,11 +152,17 @@ export function looksBuilt(name, boundingBox) {
 // Logs as trees grow them. Stripped logs only come from a player's axe.
 const isNaturalLog = (name) => isLogName(name) && !name.startsWith('stripped_');
 
-// True when pos or any block touching it (corners included) looks like part of a build: a solid
-// block that isn't terrain, a natural log or a wild plant, or a crafted thin block like a torch
-// or rail. Cobblestone and cobbled deepslate count unless own(pos, name) says the bot put them
-// there. Natural cobblestone only shows up in structures and where lava met water, so the most
-// that costs is a block of stone around it.
+// A block that looks like part of a build: a solid block that isn't terrain, a natural log or a
+// wild plant, or a crafted thin block like a torch or rail.
+export function isBuiltBlock(b) {
+  return CRAFTED_THIN.test(b.name) ||
+    (b.boundingBox === 'block' && !isNaturalBlock(b.name) && !isNaturalLog(b.name) && !BUILD_TERRAIN.has(b.name) && !isWild(b.name));
+}
+
+// True when pos or any block touching it (corners included) looks like part of a build (see
+// isBuiltBlock). Cobblestone and cobbled deepslate count unless own(pos, name) says the bot put
+// them there. Natural cobblestone only shows up in structures and where lava met water, so the
+// most that costs is a block of stone around it.
 export function nextToBuild(getBlock, pos, own = () => false) {
   for (let dx = -1; dx <= 1; dx++) {
     for (let dy = -1; dy <= 1; dy++) {
@@ -164,9 +170,7 @@ export function nextToBuild(getBlock, pos, own = () => false) {
         const p = pos.offset(dx, dy, dz);
         const b = getBlock(p);
         if (!b) continue;
-        const built = CRAFTED_THIN.test(b.name) ||
-          (b.boundingBox === 'block' && !isNaturalBlock(b.name) && !isNaturalLog(b.name) && !BUILD_TERRAIN.has(b.name) && !isWild(b.name));
-        if (built && !own(p, b.name)) return true;
+        if (isBuiltBlock(b) && !own(p, b.name)) return true;
       }
     }
   }
