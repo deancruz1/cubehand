@@ -2,9 +2,12 @@ import { Vec3 } from 'vec3';
 import { ok, fail, posText } from './util.js';
 import { isNaturalBlock } from './movement.js';
 import { digBlock, takeDownScaffold, isReplaceable, isProtected } from './blocks.js';
-import { placeAll, inventoryCounts, expandParts, watchBuildScaffold, groundUnder, buildZone, groupBlocks, leftText, missingHelp } from './build.js';
+import { placeAll, inventoryCounts, expandParts, expandPlan, surveySite, buildStructure, watchBuildScaffold, groundUnder, buildZone, groupBlocks, leftText, missingHelp } from './build.js';
 import { collectDrops } from './items.js';
-import { parseBlock, dirVector, opposite, matchesState } from './states.js';
+import { parseBlock, dirVector, opposite, matchesState, itemFor } from './states.js';
+import { HOUSE_DESIGNS, DESIGN_LIMITS, HOUSE_PALETTES, designHousePlan, paletteStepsFor, pickDesignName, resolveDesignName } from './housedesigns.js';
+
+export { HOUSE_DESIGNS, DESIGN_LIMITS, HOUSE_PALETTES, designHousePlan };
 
 const SIDES = { north: [0, -1], south: [0, 1], east: [1, 0], west: [-1, 0] };
 const BUILDING_BLOCKS = new Set([
@@ -33,14 +36,45 @@ export function isClearable(name) {
 const keyOf = (x, y, z) => `${x},${y},${z}`;
 export const HOUSE_MEMORY = 'house build';
 
-// The layout of a simple survival house, as a list of blocks. x y z is the middle of the floor
-// at foot level: the floor goes in at y - 1, in place of the ground, and the walls start at y.
-// Each floor is height blocks tall inside. Floors are joined by a ladder in a back corner.
-// The roof is flat, or a stepped gable along the longer side. A basement is one more storey
-// dug out below the ground floor, and an attic is a floor laid over the top storey, under a
-// gable roof. Missing materials (floor, windows, door, torch) are left out: no floor keeps the
-// ground, no door leaves a doorway.
-export function planHouse({ x, y, z, width = 7, depth = 7, floors = 1, height = 3, door = 'south', roof = 'gable', basement = false, attic = false, materials }) {
+// The layout of a simple survival house, as a list of blocks. Kept for callers and tests that
+// pass an explicit materials table. When called without materials.walls, expands the designed
+// house plan from housedesigns.js into the same shape.
+export function planHouse(opts = {}) {
+  if (!opts.materials?.walls || opts.design || opts.palette) {
+    const plan = designHousePlan(opts);
+    const rel = expandParts(plan.parts, plan.blocks, { palette: plan.palette });
+    const all = rel.map((b) => {
+      const { name, props } = parseBlock(b.block);
+      return {
+        x: plan.origin.x + b.dx,
+        y: plan.origin.y + b.dy,
+        z: plan.origin.z + b.dz,
+        block: name,
+        props: Object.keys(props).length ? props : undefined
+      };
+    });
+    const counts = new Map();
+    for (const b of all) counts.set(b.block, (counts.get(b.block) ?? 0) + 1);
+    const xs = all.map((b) => b.x);
+    const ys = all.map((b) => b.y);
+    const zs = all.map((b) => b.z);
+    const wb = plan.wallsBox;
+    return {
+      plan,
+      blocks: all,
+      counts,
+      min: new Vec3(Math.min(...xs), Math.min(...ys), Math.min(...zs)),
+      max: new Vec3(Math.max(...xs), Math.max(...ys), Math.max(...zs)),
+      walls: {
+        min: new Vec3(plan.origin.x + wb.x0, plan.origin.y + wb.y0, plan.origin.z + wb.z0),
+        max: new Vec3(plan.origin.x + wb.x1, plan.origin.y + wb.y1, plan.origin.z + wb.z1)
+      },
+      door: new Vec3(plan.origin.x + plan.doorSpot.dx, plan.origin.y + plan.doorSpot.dy, plan.origin.z + plan.doorSpot.dz),
+      outside: new Vec3(plan.origin.x + plan.outsideSpot.dx, plan.origin.y + plan.outsideSpot.dy, plan.origin.z + plan.outsideSpot.dz)
+    };
+  }
+
+  const { x, y, z, width = 7, depth = 7, floors = 1, height = 3, door = 'south', roof = 'gable', basement = false, attic = false, materials } = opts;
   const m = materials;
   const x0 = x - Math.floor(width / 2);
   const z0 = z - Math.floor(depth / 2);
@@ -67,7 +101,6 @@ export function planHouse({ x, y, z, width = 7, depth = 7, floors = 1, height = 
   const doorX = ddx === 0 ? x0 + Math.floor(width / 2) : ddx > 0 ? x1 : x0;
   const doorZ = ddz === 0 ? z0 + Math.floor(depth / 2) : ddz > 0 ? z1 : z0;
 
-  // The ladder goes in a corner against the back wall, the one across from the door.
   let ladderX;
   let ladderZ;
   let attach;
@@ -84,8 +117,6 @@ export function planHouse({ x, y, z, width = 7, depth = 7, floors = 1, height = 
     .filter(([tx, tz]) => !(tx === ladderX && tz === ladderZ))
     .slice(0, 2);
 
-  // The attic ladder goes halfway along a gable end, away from the door, where the roof is
-  // high enough to climb out.
   const alongX = width >= depth;
   let atticLadder = null;
   if (attic && alongX) {
@@ -98,8 +129,6 @@ export function planHouse({ x, y, z, width = 7, depth = 7, floors = 1, height = 
   const behindAtticLadder = (f, bx, bz) =>
     atticLadder && f === floors - 1 && bx === atticLadder.x + atticLadder.attach.x && bz === atticLadder.z + atticLadder.attach.z;
 
-  // The chimney stands against the middle of a gable end, the one away from the door (the same
-  // end as the attic ladder), with no window behind it.
   let chimneySpot = null;
   if (m.chimney && alongX) chimneySpot = { x: door === 'west' ? x1 + 1 : x0 - 1, z: z0 + Math.floor(depth / 2) };
   else if (m.chimney) chimneySpot = { x: x0 + Math.floor(width / 2), z: door === 'north' ? z1 + 1 : z0 - 1 };
@@ -151,7 +180,6 @@ export function planHouse({ x, y, z, width = 7, depth = 7, floors = 1, height = 
       }
     }
     for (let ly = top - storey + 1; ly <= top; ly++) put(atticLadder.x, ly, atticLadder.z, 'ladder', atticLadder.attach);
-    // A torch at the far end, so nothing spawns up there.
     if (alongX) put(x0 + x1 - atticLadder.x, top + 1, atticLadder.z, m.torch);
     else put(atticLadder.x, top + 1, z0 + z1 - atticLadder.z, m.torch);
   }
@@ -159,8 +187,6 @@ export function planHouse({ x, y, z, width = 7, depth = 7, floors = 1, height = 
   let roofTop = top;
   const roofMaterial = m.roof ?? m.walls;
   if (roof !== 'flat' && roofMaterial.endsWith('_stairs')) {
-    // Stairs stepping up to the ridge, hanging one block over the walls all round, with the
-    // gable ends and the wall tops under the eaves closed off.
     const parts = [{ shape: 'roof', from: { dx: x0, dy: top, dz: z0 }, to: { dx: x1, dy: top, dz: z1 }, block: roofMaterial, fill: m.walls }];
     for (const b of expandParts(parts, [], { slabFor: () => m.ridge ?? null })) {
       const { name, props } = parseBlock(b.block);
@@ -197,9 +223,6 @@ export function planHouse({ x, y, z, width = 7, depth = 7, floors = 1, height = 
     }
   }
 
-  // Accents: a foundation course along the bottom of the walls (and the basement walls), and
-  // trim at each floor line and along the top of the walls. Corner posts run straight through
-  // the trim, and trim logs lie along their wall.
   const inWalls = (bx, bz) => bx >= x0 && bx <= x1 && bz >= z0 && bz <= z1;
   const trimLine = (by) => by === top || (by > base && by < top && (by - base) % storey === 0);
   for (const b of blocks.values()) {
@@ -212,8 +235,6 @@ export function planHouse({ x, y, z, width = 7, depth = 7, floors = 1, height = 
     }
   }
 
-  // Details on the outside of the walls: sills under the windows, open shutters beside them,
-  // a porch roof over the door, and a chimney up one gable end.
   const outward = (bx, bz) => (bz === z0 ? 'north' : bz === z1 ? 'south' : bx === x0 ? 'west' : 'east');
   const isDoorway = (bx, by, bz) => bx === doorX && bz === doorZ && by <= base + 2;
   const windows = m.windows ? [...blocks.values()].filter((b) => b.block === m.windows && inWalls(b.x, b.z) && onEdge(b.x, b.z)) : [];
@@ -301,8 +322,6 @@ export function pickMaterials(inventory, given = {}) {
   };
 }
 
-// The order to place a layer in: walls and floor edges first, going around the house, then
-// the middle, then things that hang on the walls or stand on the floor.
 function placeOrder(plan) {
   const { min, max } = plan.walls;
   const cx = (min.x + max.x) / 2;
@@ -316,7 +335,82 @@ function placeOrder(plan) {
   return (a, b) => a.y - b.y || rank(a) - rank(b) || Math.atan2(a.z - cz, a.x - cx) - Math.atan2(b.z - cz, b.x - cx);
 }
 
-export async function buildHouse(ctx, input) {
+// Evaluates a designed house plan against what is already in place at the site and what the bot
+// carries, returning { plan, expanded, needed, missing, skipped }.
+function evaluateHousePlan(bot, plan, inventory) {
+  const expanded = expandParts(plan.parts, plan.blocks, { palette: plan.palette });
+  const needed = new Map();
+  let skipped = 0;
+  for (const b of expanded) {
+    const { name, props } = parseBlock(b.block);
+    const here = bot.blockAt?.(new Vec3(plan.origin.x + b.dx, plan.origin.y + b.dy, plan.origin.z + b.dz), false);
+    if (here && matchesState(here, name, Object.keys(props).length ? props : undefined)) {
+      skipped++;
+      continue;
+    }
+    const item = itemFor(name, bot.registry);
+    const uses = name.endsWith('_slab') && props.type === 'double' ? 2 : 1;
+    needed.set(item, (needed.get(item) ?? 0) + uses);
+  }
+  const missing = [];
+  let missingBlocks = 0;
+  for (const [item, need] of needed) {
+    const have = inventory.get(item) ?? 0;
+    if (have < need) {
+      missing.push({ block: item, need, have });
+      missingBlocks += need - have;
+    }
+  }
+  return { plan, expanded, needed, missing, missingBlocks, skipped };
+}
+
+// Chooses the house design and palette step (or resumes an active unfinished house at the same
+// spot when called again with matching settings).
+export function chooseHousePlan(ctx, input) {
+  const { bot } = ctx;
+  const inventory = inventoryCounts(bot.inventory?.items?.() ?? []);
+  const saved = bot._activeHouse;
+  if (
+    saved &&
+    saved.x === input.x && saved.y === input.y && saved.z === input.z &&
+    (input.design === undefined || resolveDesignName(input.design) === saved.design) &&
+    (input.width === undefined || input.width === saved.reqWidth) &&
+    (input.depth === undefined || input.depth === saved.reqDepth) &&
+    (input.floors === undefined || input.floors === saved.reqFloors) &&
+    (input.door === undefined || input.door === saved.door) &&
+    (input.interior === undefined || Boolean(input.interior) === saved.interior) &&
+    (input.surroundings === undefined || Boolean(input.surroundings) === saved.surroundings)
+  ) {
+    return evaluateHousePlan(bot, saved.plan, inventory);
+  }
+
+  const groundName = bot.blockAt?.(new Vec3(input.x, input.y - 1, input.z), false)?.name ?? '';
+  const desert = /sand/.test(groundName) || ((inventory.get('sandstone') ?? 0) + (inventory.get('smooth_sandstone') ?? 0) >= 64 && !input.design);
+  const design = pickDesignName({ ...input, desert });
+
+  if (input.palette) {
+    const plan = designHousePlan({ ...input, design, desert });
+    return evaluateHousePlan(bot, plan, inventory);
+  }
+
+  const steps = paletteStepsFor(inventory, { design, desert });
+  const evals = steps.map((step) => {
+    const plan = designHousePlan({ ...input, design, desert, palette: step.roles, tier: step.tier, look: step.look });
+    return evaluateHousePlan(bot, plan, inventory);
+  });
+
+  // First step that inventory + already-placed blocks cover completely.
+  const covered = evals.find((e) => e.missing.length === 0);
+  if (covered) return covered;
+
+  // If the bot has no building blocks at all, report the primary look; else pick the step with
+  // the fewest missing items.
+  const hasAny = [...inventory.keys()].some(isBuildingBlock);
+  if (!hasAny) return evals[0];
+  return evals.reduce((best, cur) => (cur.missingBlocks < best.missingBlocks ? cur : best), evals[0]);
+}
+
+async function buildLegacyHouse(ctx, input) {
   const { bot, signal } = ctx;
   const clamp = (v, lo, hi, d) => Math.min(Math.max(Math.round(v ?? d), lo), hi);
   const width = clamp(input.width, 5, 15, 7);
@@ -336,7 +430,7 @@ export async function buildHouse(ctx, input) {
   if (unknown.length) return fail(`unknown block: ${unknown.join(', ')}`);
   if (materials.roof?.endsWith('_stairs')) {
     if (roof === 'flat') return fail('a roof of stairs needs a gable roof, or give a full block for a flat roof');
-    const slab = materials.roof.replace(/_stairs$/, '_slab');
+    const slab = materials.roof.replace(/_stairs$/, '_stairs').replace(/_stairs$/, '_slab');
     materials.ridge = bot.registry.blocksByName[slab] ? slab : null;
   }
   if (materials.shutters && !materials.shutters.endsWith('_trapdoor')) return fail('shutters have to be a trapdoor, like spruce_trapdoor');
@@ -345,18 +439,13 @@ export async function buildHouse(ctx, input) {
   const plan = planHouse({ x: input.x, y: input.y, z: input.z, width, depth, floors, height, door, roof, basement, attic, materials });
   const planned = new Map(plan.blocks.map((b) => [keyOf(b.x, b.y, b.z), b]));
 
-  // Blocks the bot placed itself may come down when they don't fit the plan, so its own house
-  // can be changed in place, but never its chests, beds or other protected blocks. The top half
-  // of its own door counts too.
   const ownBlock = (pos, name) => {
     if (isProtected(name, ctx.config.protectedBlocks)) return false;
     if (ctx.placed?.has(pos, name)) return true;
-    // A torch put against a wall turns into a wall_torch.
     if (name === 'wall_torch' && ctx.placed?.has(pos, 'torch')) return true;
     return name.endsWith('_door') && Boolean(ctx.placed?.has(pos.offset(0, -1, 0), name));
   };
 
-  // Look over the site: what is already done, what natural stuff has to go, and what's in the way.
   const todo = [];
   const toDig = [];
   const blocked = [];
@@ -374,13 +463,10 @@ export async function buildHouse(ctx, input) {
     else if (ownBlock(pos, block.name)) {
       toDig.push(pos);
       own++;
-      // What comes down goes back into the house. Glass breaks into nothing.
       if (!block.name.includes('glass') && !block.name.endsWith('_door')) recovered.set(block.name, (recovered.get(block.name) ?? 0) + 1);
     } else blocked.push(`${block.name} at ${posText(pos)}`);
     return null;
   };
-  // Everything inside the walls gets cleared. Outside them (eaves, porch, chimney) only the
-  // planned blocks do, so the ground around the house stays as it is.
   const { min, max } = plan.walls;
   const inside = (p) => p.x >= min.x && p.x <= max.x && p.z >= min.z && p.z <= max.z && p.y >= min.y && p.y <= max.y;
   for (let px = min.x; px <= max.x; px++) {
@@ -427,8 +513,6 @@ export async function buildHouse(ctx, input) {
     return fail(`missing items: ${missing.join(', ')}. Nothing was built. ${missingHelp(bot, short.map(([n]) => n), 'build_house with the same settings')} Plan: ${summary}`);
   }
 
-  // The exact settings of a real build go into memory, so carrying on later never depends on
-  // the bot remembering to save them.
   const used = Object.fromEntries(Object.entries(materials).filter(([k]) => k !== 'torch' && k !== 'ridge').map(([k, v]) => [k, v ?? 'none']));
   if (materials.torch && materials.torch !== 'torch') used.lights = materials.torch;
   const settings = { x: input.x, y: input.y, z: input.z, width, depth, floors, height, door, roof, basement, attic, materials: used };
@@ -443,8 +527,6 @@ export async function buildHouse(ctx, input) {
     });
   record(`started ${clock()}`);
 
-  // While building, the bot may stand on scaffolding near its own walls, but never use the
-  // building materials for it.
   const ground = groundUnder(bot, plan.min, plan.max);
   bot.buildZone = buildZone(plan, ground);
   bot.buildKeep = new Set(Object.values(materials).filter(Boolean).map((n) => bot.registry.itemsByName[n]?.id).filter((id) => id !== undefined));
@@ -452,7 +534,6 @@ export async function buildHouse(ctx, input) {
   let result = { placed: 0, failures: [], wrong: [], stoppedReason: null };
   let digProblem = null;
   try {
-    // Clear the site from the top down so nothing falls on the bot.
     let digFailures = 0;
     for (const [i, pos] of toDig.sort((a, b) => b.y - a.y).entries()) {
       if (signal?.aborted) break;
@@ -488,6 +569,91 @@ export async function buildHouse(ctx, input) {
   if (stopped) message += `. Stopped early: ${stopped}`;
   if (left.length) message += '. build_house with the same settings again keeps what is done and goes on with the rest';
   record(left.length ? `stopped at ${clock()} with ${placed} of ${todo.length} blocks placed${stopped ? `, ${stopped}` : ''}` : `finished at ${clock()}`);
-  // Anything placed is progress; only a run that placed nothing of what was left fails.
   return placed > 0 || left.length === 0 ? ok(message) : fail(message);
+}
+
+export async function buildHouse(ctx, input) {
+  if (input.materials?.walls && !input.design && !input.palette) {
+    return buildLegacyHouse(ctx, input);
+  }
+  const { bot } = ctx;
+  if (input.design && !resolveDesignName(input.design)) {
+    return fail(`unknown house design "${input.design}", choose one of: ${HOUSE_DESIGNS.join(', ')}`);
+  }
+
+  const chosen = chooseHousePlan(ctx, input);
+  const { plan, needed, missing } = chosen;
+  const all = expandPlan(bot, plan);
+
+  // Check that the site is loaded and nothing built by others or protected is in the way.
+  for (const b of [...all, ...(all.air ?? [])]) {
+    const pos = new Vec3(plan.origin.x + b.dx, plan.origin.y + b.dy, plan.origin.z + b.dz);
+    if (!bot.blockAt(pos, false)) return fail('part of that area is not loaded');
+  }
+  const survey = surveySite(ctx, { origin: plan.origin, blocks: all, air: all.air, clear: true });
+  const obstacles = [
+    ...survey.blocked.map((b) => `${b.name} at ${posText(b.pos)}`),
+    ...survey.held.map((b) => `${b.name} at ${posText(b.pos)}`),
+    ...survey.dig.filter((d) => d.kind === 'foreign').map((d) => `${d.name} at ${posText(d.pos)}`)
+  ];
+  const where = `centered on ${input.x} ${input.y} ${input.z}`;
+  if (obstacles.length) {
+    const more = obstacles.length > 5 ? ` and ${obstacles.length - 5} more` : '';
+    const trees = obstacles.some((b) => /_log |_stem /.test(b)) ? ' Trees can be chopped first with chop_tree.' : '';
+    return fail(`can't build a ${plan.width}x${plan.depth} ${plan.design} ${where}, these are in the way: ${obstacles.slice(0, 5).join('; ')}${more}. Pick a clearer spot.${trees}`);
+  }
+
+  const doorPos = new Vec3(plan.origin.x + plan.doorSpot.dx, plan.origin.y + plan.doorSpot.dy, plan.origin.z + plan.doorSpot.dz);
+  const needText = [...needed].map(([n, c]) => `${c} ${n}`).join(', ');
+  const natCount = survey.dig.filter((d) => d.kind === 'natural').length;
+  const ownCount = survey.dig.filter((d) => d.kind === 'own').length;
+  const clearing = [natCount && `${natCount} natural blocks`, ownCount && `${ownCount} of my own blocks that don't fit the plan`].filter(Boolean);
+  const summary = `${plan.width}x${plan.depth} ${plan.design} (${plan.look} look) ${where}, ${plan.floors} floor${plan.floors > 1 ? 's' : ''}, door on the ${plan.door} side at ${posText(doorPos)}. Needs ${needText || 'nothing more'}${clearing.length ? `, and ${clearing.join(' and ')} cleared first` : ''}.`;
+  const missingText = missing.map((m) => `${m.block} (need ${m.need}, have ${m.have}, ${m.need - m.have} more)`);
+
+  if (input.dry_run) {
+    return ok(`Plan: ${summary}${missingText.length ? ` Missing: ${missingText.join(', ')}.` : ' I have everything.'}`);
+  }
+  if (missingText.length) {
+    return fail(`missing items: ${missingText.join(', ')}. Nothing was built. ${missingHelp(bot, missing.map((m) => m.block), 'build_house with the same settings')} Plan: ${summary}`);
+  }
+
+  const settings = {
+    x: input.x, y: input.y, z: input.z,
+    design: plan.design, look: plan.look, tier: plan.tier,
+    width: plan.width, depth: plan.depth, floors: plan.floors,
+    door: plan.door, interior: plan.interior, surroundings: plan.surroundings,
+    palette: plan.palette
+  };
+  bot._activeHouse = {
+    x: input.x, y: input.y, z: input.z,
+    design: plan.design,
+    reqWidth: input.width, reqDepth: input.depth, reqFloors: input.floors,
+    door: plan.door, interior: plan.interior, surroundings: plan.surroundings,
+    plan
+  };
+  const clock = () => new Date().toLocaleTimeString();
+  const record = (outcome) =>
+    ctx.memory?.remember({
+      name: HOUSE_MEMORY,
+      note: `Exact settings of my last real build_house run (${outcome}). To carry on with this house, call build_house with exactly these: ${JSON.stringify(settings)}`,
+      x: input.x,
+      y: input.y,
+      z: input.z
+    });
+  record(`started ${clock()}`);
+
+  const builtCtx = { ...ctx, config: { ...ctx.config, limits: { maxBuildBlocks: 2500, moveTimeoutSeconds: 90, ...(ctx.config?.limits ?? {}) } } };
+  const built = await buildStructure(builtCtx, {
+    origin: plan.origin,
+    parts: plan.parts,
+    blocks: plan.blocks,
+    palette: plan.palette,
+    clear: true
+  });
+
+  const finished = built.ok && !/Left to do|Stopped early|Left out/.test(built.message);
+  if (finished) bot._activeHouse = null;
+  record(finished ? `finished at ${clock()}` : `stopped at ${clock()}`);
+  return { ...built, message: `${summary} ${built.message}` };
 }

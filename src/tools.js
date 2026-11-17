@@ -1,4 +1,5 @@
 import { SKILL_TOOL } from './skills.js';
+import { KIT_KINDS, kitSummary } from './actions/kits.js';
 
 const int = { type: 'integer' };
 const str = { type: 'string' };
@@ -9,6 +10,75 @@ const itemList = {
     properties: { item: str, count: int },
     required: ['item'],
     additionalProperties: false
+  }
+};
+
+const offset = { type: 'object', properties: { dx: int, dy: int, dz: int }, required: ['dx', 'dy', 'dz'], additionalProperties: false };
+const mirror = { type: 'object', properties: { x: int, z: int }, required: [], additionalProperties: false };
+const side = { type: 'string', enum: ['north', 'south', 'east', 'west'] };
+const roles = ['wall', 'frame', 'trim', 'roof', 'foundation', 'floor', 'glass', 'light', 'accent', 'accent2'];
+
+const viewList = { type: 'array', items: { type: 'string', enum: ['south-east', 'south-west', 'north-east', 'north-west', 'top', 'south', 'north', 'east', 'west'] } };
+
+// A build_structure plan, shared with the tools that take the same plan.
+const buildPlan = {
+  origin: {
+    type: 'object',
+    properties: { x: int, y: int, z: int },
+    required: ['x', 'y', 'z'],
+    additionalProperties: false
+  },
+  palette: {
+    type: 'object',
+    properties: Object.fromEntries(roles.map((r) => [r, str])),
+    required: [],
+    additionalProperties: false
+  },
+  mirror,
+  clear: { type: 'boolean' },
+  foundation: str,
+  replace: { type: 'boolean', description: 'set only when a player said to build over what stands there; lifts the limit' },
+  parts: {
+    type: 'array',
+    items: {
+      type: 'object',
+      properties: {
+        shape: { type: 'string', enum: ['fill', 'hollow', 'walls', 'frame', 'line', 'roof', 'circle', 'sphere', 'dome', 'cone', 'pyramid', 'arch', 'staircase', 'posts', 'windows', 'band', 'kit'] },
+        from: offset,
+        to: offset,
+        block: str,
+        fill: str,
+        overhang: int,
+        style: { type: 'string', enum: ['gable', 'hip', 'pyramid', 'shed', 'flat'] },
+        pitch: { type: 'number', enum: [0.5, 1, 2] },
+        facing: side,
+        axis: { type: 'string', enum: ['x', 'y', 'z'] },
+        hollow: { type: 'boolean' },
+        rise: int,
+        every: int,
+        width: int,
+        proud: { type: 'boolean' },
+        edge: str,
+        stepped: { type: 'boolean' },
+        once: { type: 'boolean' },
+        kind: { type: 'string', enum: KIT_KINDS },
+        variant: { type: 'integer', enum: [1, 2, 3] },
+        extra: { type: 'boolean' },
+        repeat: { type: 'object', properties: { count: int, dx: int, dy: int, dz: int }, required: ['count'], additionalProperties: false },
+        mirror
+      },
+      required: ['shape', 'from', 'to', 'block'],
+      additionalProperties: false
+    }
+  },
+  blocks: {
+    type: 'array',
+    items: {
+      type: 'object',
+      properties: { dx: int, dy: int, dz: int, block: str, once: { type: 'boolean' } },
+      required: ['dx', 'dy', 'dz', 'block'],
+      additionalProperties: false
+    }
   }
 };
 
@@ -110,42 +180,27 @@ export const TOOLS = [
   ),
   tool(
     'build_structure',
-    'Build a structure relative to origin (dx, dy, dz offsets), from parts (shapes) and single blocks. Use this for anything bigger than a few blocks. Parts are boxes from one corner to the other: fill (solid), hollow (a closed shell), walls (four walls, no floor or top), frame (only the edges, for beams and posts), line (a straight or diagonal line), and roof (a gable roof of stairs over the walls from..to: from.dy is the layer just above the wall tops; the ridge runs along the longer side, slabs go on an odd ridge, overhang is 0 to 2, default 1, and fill closes the gable ends and the wall tops under the eaves). Later parts and single blocks win where they overlap, and "air" takes out what came before (doorways, windows). A block can carry a state, like the game writes it: spruce_stairs[facing=east,half=top], oak_slab[type=top], oak_slab[type=double] (two slabs in one spot), stripped_oak_log[axis=x], spruce_trapdoor[facing=south,half=top,open=true], lantern[hanging=true], oak_door[facing=north]. Stairs face the way they climb (the tall side); half=top is upside down. Trapdoors and wall torches face away from the block they hang on. Logs take axis x, y or z. Builds one cluster at a time, nearest first, finishing each before walking to the next; inside a cluster bottom up, each block after what holds it up. A block with nothing to place against gets a dirt or cobblestone block beside it that comes out again. Then every block is checked and fixed once. Placing anything counts as done: what is left is listed by cluster with the reason, and the same call again skips what is in place. Short of items, it first takes them from chests you remember, then builds what the items cover (bottom up) and says how many of what it is still short of. Set dry_run to get the exact items needed without building.',
-    {
-      origin: {
-        type: 'object',
-        properties: { x: int, y: int, z: int },
-        required: ['x', 'y', 'z'],
-        additionalProperties: false
-      },
-      parts: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            shape: { type: 'string', enum: ['fill', 'hollow', 'walls', 'frame', 'line', 'roof'] },
-            from: { type: 'object', properties: { dx: int, dy: int, dz: int }, required: ['dx', 'dy', 'dz'], additionalProperties: false },
-            to: { type: 'object', properties: { dx: int, dy: int, dz: int }, required: ['dx', 'dy', 'dz'], additionalProperties: false },
-            block: str,
-            fill: str,
-            overhang: int
-          },
-          required: ['shape', 'from', 'to', 'block'],
-          additionalProperties: false
-        }
-      },
-      blocks: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: { dx: int, dy: int, dz: int, block: str },
-          required: ['dx', 'dy', 'dz', 'block'],
-          additionalProperties: false
-        }
-      },
-      dry_run: { type: 'boolean' }
-    },
+    'Build a structure relative to origin (dx, dy, dz offsets) from parts (shapes filling a box from..to) and single blocks; use it for anything bigger than a few blocks. Shapes: fill, hollow (a closed shell), walls (no floor or top), frame (edges only), line (straight or diagonal). roof: stairs over the walls from..to, its eave row at from.dy (the layer over the wall tops), overhang 0-2 (default 1) blocks out at that height; style gable (default; ridge along the longer side, or along axis x or z), hip, pyramid (square box), shed (climbs toward facing from its low eave row at from.dy on the other side; row k is k up, so its top row is from.dy+rows-1, rows counting overhang: put that one under a main eave) or flat (a deck, upside-down stairs round it, a parapet of fill); pitch 1, 2 (row k is 2k up) or 0.5 (slabs, bottom then top: k/2 up); fill closes the walls up to it; edge (a block, mix or role) frames it in a second block: the eaves, gable ends (upside-down stairs under an overhang), hips and ridge, a flat roof\'s rim. circle (across axis, default y; a tall box makes a cylinder), sphere, dome (from.dy its base), cone, pyramid (stepped), each solid or with hollow a shell. arch: an opening seen along axis (default through the wall round it, else the thin side), curving over its top rise blocks (default half the span); air cuts it, hollow is only its outline (two legs and the curve, one block thick); each step of the curve becomes an upside-down stair of the wall (stepped true keeps square steps). staircase: foot at from, top at to, one up per block across; fill fills under it. posts: both ends of each wall and evenly between, (length-1)/every gaps rounded (default 4); a post touching an earlier posts part\'s post is left out. windows: width wide (default 1), the box\'s height, as many as fit every apart start to start (default width+2, or every+1 if that fits more), mirrored about each wall\'s middle, 2+ from the corners; one is left out where a door or earlier air is in its columns up to 3 below it, or behind an earlier post. band: trim round the walls; logs lie along, stairs face the wall upside down ([half=bottom]: an upright cap). proud true stands posts or band a block out; a box one block thick is one wall (proud then needs facing). A field a shape does not use is refused. repeat {"count":4,"dx":3}: 4 in all, each 3 further. mirror {"x":8} adds the image at 8-dx (z likewise), facings turned; on the plan it mirrors every part and block but those with once true, so write half. Later parts win; "air" takes out what came before. A mix like 85%stone_bricks,15%cobblestone goes in small patches, the same every time; scatter:70%gravel,30%coarse_dirt picks each block alone. palette roles (wall, frame, trim, roof, foundation, floor, glass, light, accent, accent2) go in as @wall, @roof[facing=north], or a form on any role: .stairs, .slab, .wall, .fence, .fence_gate, .door, .trapdoor, .button, .pressure_plate, .pane, .planks, .log, .block (full). Example: {"palette":{"wall":"spruce_planks","roof":"dark_oak_stairs","trim":"spruce_planks"},"parts":[{"shape":"walls","from":{"dx":0,"dy":0,"dz":0},"to":{"dx":8,"dy":3,"dz":6},"block":"@wall"},{"shape":"roof","from":{"dx":0,"dy":4,"dz":0},"to":{"dx":8,"dy":4,"dz":6},"block":"@roof","fill":"@wall","edge":"@trim"}]}. States as the game writes them: spruce_stairs[facing=east,half=top], oak_slab[type=top] (double: two in a spot), oak_log[axis=x], spruce_trapdoor[facing=south,half=top,open=true], lantern[hanging=true]. Stairs face the way they climb; half=top is upside down; trapdoors and wall torches face away from their block. A door is one block, oak_door[facing=north], and both halves come; two chests side by side facing the same way join as a double chest. Whatever stands in planned and air spots is dug out first, others\' blocks too, up to 32 a call (more: all left and listed); chests, signs, protected blocks and blocks a build leans on stay and are listed. Elsewhere in the box only plants and snow go; clear true digs all natural blocks there (for a slope). foundation (a block or mix) fills down from the bottom layer to the ground, 6 deep at most. Builds the nearest cluster first, bottom up, propping on dirt or cobblestone that comes out again; then up to three checks put back what got knocked out and sweep snow and plants off. Anything placed counts: what is left is listed with the reason, and the same call again skips what is in place. Short of items it takes them from chests you remember, then builds what they cover and says what is short. dry_run gives the items needed and the site work without building. Kits: shape kit, kind picks one, variant (default 1) its look, extra its option; from..to boxes what each names; facing is where its front looks (out of the wall, or into the room); block and fill are its materials (forms come from them; roles work). ' + kitSummary() + '.',
+    { ...buildPlan, dry_run: { type: 'boolean' } },
     ['origin']
+  ),
+  tool(
+    'design_guide',
+    'Get the design guide before you design anything bigger than a few blocks with build_structure: how to work (plan in layers, preview, check, revise), what makes that kind of build look good, palettes for the style with the cheap ones first, and the checklist to judge previews by. structure is what you are building (house, cabin, tower, wall, bridge, barn, farm, shop, monument, interior, garden or other; words like watchtower, storehouse, gatehouse or stall work too) and style the look (rustic, medieval, modern, fantasy, japanese, desert, nordic or other); leave either out for the general guide.',
+    { structure: str, style: str },
+    []
+  ),
+  tool(
+    'preview_structure',
+    'Draw a build_structure plan as pictures without placing anything or walking, from wherever you are. Takes the same plan as build_structure and checks it the same way. views picks the pictures, at most 4: south-east, south-west, north-east and north-west look down at a corner from above, top looks straight down, and south, north, east and west look straight at one side; left out, it draws two opposite corners, and the top too when the plan is at most 32 blocks wide and deep. cut_above leaves out every block above that dy, to look inside. Returns the pictures with the size, the block count, the items needed and what you are short of. Look the pictures over before building: fix what looks plain or wrong and preview again, then build_structure the same plan.',
+    { ...buildPlan, views: viewList, cut_above: int },
+    ['origin']
+  ),
+  tool(
+    'view_area',
+    'Draw what stands in the box between x1 y1 z1 and x2 y2 z2 as pictures, terrain and all, to check a build you finished or look at one before changing it. At most 48 blocks on each side, and all of it has to be loaded. views works as in preview_structure; cut_above leaves out every block more than that many blocks above the bottom of the box. Returns the pictures and what the box holds: how many of each main kind of block.',
+    { x1: int, y1: int, z1: int, x2: int, y2: int, z2: int, views: viewList, cut_above: int },
+    ['x1', 'y1', 'z1', 'x2', 'y2', 'z2']
   ),
   tool(
     'copy_structure',
@@ -166,19 +221,29 @@ export const TOOLS = [
   ),
   tool(
     'build_house',
-    'Build a simple survival house: floor, walls, windows, a door, torches, and a flat or stepped gable roof, with ladders between floors. x y z is the middle of the floor at foot level (a standing player\'s position); the floor replaces the ground under it. Clears grass, dirt and other natural blocks out of the way first, and also blocks you placed yourself that don\'t fit the plan, so calling it again over your own house changes that house in place (bigger, more floors, a basement, another door side) and keeps what already fits. Refuses if anything else built or a tree is in the way. Materials default to what you carry most of; give materials to choose (use "none" to leave out the floor, windows or door). Set dry_run to only check the site and get the exact blocks needed. Width and depth are 5 to 15 (default 7), floors 1 to 3, height is the wall height inside each floor, 3 to 5 (default 3). door is the side the door faces (default south). basement digs out one more storey under the ground floor, joined by the ladder. attic lays a floor over the top storey under a gable roof, with a ladder up (needs width and depth of 7 or more). Accent materials: corners for the corner posts (like logs), foundation for the bottom row of the walls and the basement walls (like cobblestone), trim for a band at each floor line and along the top of the walls (logs lie along the wall). Details: a stairs block as roof (like spruce_stairs) makes a stair roof that hangs over the walls, with a slab ridge; sills puts a trapdoor, stairs or slab under each window outside; shutters puts open trapdoors beside each window; porch puts a roof (a slab is best) over the door, held up by posts (like a fence) if given; chimney runs a column (like cobblestone or bricks) up the gable end away from the door; lights picks torch or lantern for inside. Placing anything counts as done: what is left is listed by group with the reason.',
+    'Build a furnished survival house centered on x y z (foot level). Designs: cottage (one box, framed gable roof, chimney), cabin (with a front porch), l_house (medium L-plan with a cross gable), two_storey (two floors with a ladder), desert (flat-roofed sandstone with a parapet). Leave design out to pick one that suits the size, floors, roof and site, with small variations by position; calling again at the same spot continues the same house. Odd widths and depths (7 to 15) so the door and gable centre. Picks a palette from what you carry and where you are (light walls with a contrasting roof frame), falling back in steps to one wood and cobblestone with a framed roof when items are short, and reports which look was built. Includes a furnished interior (bed nook, storage, kitchen with furnace and crafting table, table, ceiling light, distinct floor) and surroundings (path, light, bushes, barrel); set interior or surroundings to false to leave either out. Clears natural blocks and your own blocks that don\'t fit; refuses if someone else\'s build, a protected block or a tree is in the way. Set dry_run to check the site and get the exact items needed.',
     {
       x: int,
       y: int,
       z: int,
+      design: { type: 'string', enum: ['cottage', 'cabin', 'l_house', 'two_storey', 'desert'] },
       width: int,
       depth: int,
       floors: int,
       height: int,
       door: { type: 'string', enum: ['north', 'south', 'east', 'west'] },
       roof: { type: 'string', enum: ['gable', 'flat'] },
+      interior: { type: 'boolean' },
+      surroundings: { type: 'boolean' },
       basement: { type: 'boolean' },
       attic: { type: 'boolean' },
+      palette: {
+        type: 'object',
+        properties: {
+          wall: str, frame: str, trim: str, roof: str, foundation: str, floor: str, glass: str, light: str, accent: str, accent2: str
+        },
+        additionalProperties: false
+      },
       materials: {
         type: 'object',
         properties: {

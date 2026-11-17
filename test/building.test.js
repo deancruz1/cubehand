@@ -5,7 +5,7 @@ import { parseBlock, blockText, stateProblem, matchesState, placementOptions, it
 import { EventEmitter } from 'node:events';
 import { expandParts, planBuild, nearestFirst, buildSite, buildStructure, watchBuildScaffold, groupBlocks, fromHere, groundUnder, buildZone, withinStock, breakBlocks } from '../src/actions/build.js';
 import { setPauseScale } from '../src/actions/util.js';
-import { planHouse, buildHouse } from '../src/actions/house.js';
+import { planHouse, buildHouse, HOUSE_DESIGNS, DESIGN_LIMITS, designHousePlan, chooseHousePlan } from '../src/actions/house.js';
 import { placeOne, placeBlock, findReference, inSight } from '../src/actions/blocks.js';
 import { markPathfinderPlace } from '../src/actions/movement.js';
 import { createRequire } from 'node:module';
@@ -1193,4 +1193,206 @@ test('build_house stopped while taking down its scaffolding says so', async () =
   assert.equal(result.ok, true, result.message);
   assert.match(result.message, /Stopped early: stopped taking down my scaffolding after 0, 1 still up/);
   assert.equal(world.get(`${step.x},${step.y},${step.z}`).name, 'dirt');
+});
+
+const PASSABLE_BLOCK = /^air$|_door$|_fence_gate$|_carpet$|_pressure_plate$|torch$|_sign$|_banner$|_button$|^ladder$|^dandelion$|^poppy$|^azure_bluet$|^cornflower$|^oxeye_daisy$|^allium$|^lily_of_the_valley$/;
+
+function floodReachable(plan, expanded) {
+  const cells = new Map();
+  for (const b of expanded) cells.set(`${b.dx},${b.dy},${b.dz}`, parseBlock(b.block));
+  const nameAt = (x, y, z) => cells.get(`${x},${y},${z}`)?.name ?? (y === -1 ? 'grass_block' : 'air');
+  const isPassable = (x, y, z) => PASSABLE_BLOCK.test(nameAt(x, y, z));
+  const isLadder = (x, y, z) => nameAt(x, y, z) === 'ladder';
+  const isSupport = (x, y, z) => !isPassable(x, y, z) || isLadder(x, y, z);
+  const canStand = (x, y, z) => (isPassable(x, y, z) && isPassable(x, y + 1, z) && isSupport(x, y - 1, z)) || (isLadder(x, y, z) && (isPassable(x, y + 1, z) || isLadder(x, y + 1, z)));
+
+  const start = plan.outsideSpot;
+  const queue = [];
+  const seen = new Set();
+  const push = (x, y, z) => {
+    if (x < -6 || x > 24 || z < -6 || z > 24 || y < -1 || y > 16) return;
+    const k = `${x},${y},${z}`;
+    if (seen.has(k) || !canStand(x, y, z)) return;
+    seen.add(k);
+    queue.push([x, y, z]);
+  };
+  push(start.dx, start.dy, start.dz);
+  push(start.dx, 0, start.dz);
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    push(start.dx + dx, 0, start.dz + dz);
+    push(start.dx + dx, 1, start.dz + dz);
+  }
+  while (queue.length > 0) {
+    const [x, y, z] = queue.shift();
+    if (isLadder(x, y, z) || isLadder(x, y + 1, z)) push(x, y + 1, z);
+    if (isLadder(x, y, z) || isLadder(x, y - 1, z)) push(x, y - 1, z);
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx;
+      const nz = z + dz;
+      push(nx, y, nz);
+      if (isPassable(x, y + 2, z)) push(nx, y + 1, nz);
+      if (isPassable(nx, y + 1, nz)) push(nx, y - 1, nz);
+    }
+  }
+  const findTargets = (re) => expanded.filter((b) => re.test(parseBlock(b.block).name));
+  const nearStand = (t) => {
+    if (seen.has(`${t.dx},${t.dy},${t.dz}`)) return true;
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      for (const dy of [-1, 0, 1]) if (seen.has(`${t.dx + dx},${t.dy + dy},${t.dz + dz}`)) return true;
+    }
+    return false;
+  };
+  const doors = findTargets(/_door$/);
+  const beds = findTargets(/_bed$/);
+  const chests = findTargets(/^chest$/);
+  const furnaces = findTargets(/^furnace$/);
+  return {
+    doors: doors.length > 0 && doors.every((d) => seen.has(`${d.dx},${d.dy},${d.dz}`)),
+    beds: beds.length > 0 && beds.every(nearStand),
+    chests: chests.length > 0 && chests.every(nearStand),
+    furnaces: furnaces.length > 0 && furnaces.every(nearStand)
+  };
+}
+
+test('every house design expands at its limits with real blocks and reaches door, bed, chests and furnace by flood fill', () => {
+  for (const design of HOUSE_DESIGNS) {
+    const lim = DESIGN_LIMITS[design];
+    for (const [width, depth] of [[lim.minW, lim.minD], [lim.defW, lim.defD], [lim.maxW, lim.maxD]]) {
+      for (const door of ['south', 'west', 'north', 'east']) {
+        const plan = designHousePlan({ design, width, depth, door });
+        assert.equal(plan.width % 2, 1, `${design} width is odd`);
+        assert.equal(plan.depth % 2, 1, `${design} depth is odd`);
+        const expanded = expandParts(plan.parts, plan.blocks, { palette: plan.palette });
+        assert.ok(expanded.length > 150, `${design} ${width}x${depth}`);
+        for (const b of expanded) {
+          const { name, props } = parseBlock(b.block);
+          assert.ok(realRegistry.blocksByName[name], `${design}: unknown block ${name}`);
+          assert.ok(realRegistry.itemsByName[itemFor(name, realRegistry)], `${design}: no item places ${name}`);
+          assert.equal(stateProblem(realRegistry, name, props), null, `${design}: ${b.block}`);
+          assert.ok(!(name === 'torch' && b.dy === 1), `${design}: no floor torch`);
+        }
+        const reach = floodReachable(plan, expanded);
+        assert.deepEqual(reach, { doors: true, beds: true, chests: true, furnaces: true }, `${design} ${width}x${depth} ${door}`);
+      }
+    }
+    // Leaving out interior or surroundings drops those parts cleanly.
+    const bare = designHousePlan({ design, interior: false, surroundings: false });
+    const bareBlocks = expandParts(bare.parts, bare.blocks, { palette: bare.palette });
+    assert.ok(!bareBlocks.some((b) => /_bed$|^furnace$|^chest$/.test(parseBlock(b.block).name)));
+    assert.ok(!bareBlocks.some((b) => b.dy === -1));
+  }
+});
+
+test('same call at the same place gives the same plan, while different positions vary details', () => {
+  const a = designHousePlan({ x: 10, y: 64, z: 20 });
+  const b = designHousePlan({ x: 10, y: 64, z: 20 });
+  assert.deepEqual(expandParts(a.parts, a.blocks, { palette: a.palette }), expandParts(b.parts, b.blocks, { palette: b.palette }));
+  const others = [1, 2, 3, 4, 5].map((i) => designHousePlan({ x: i * 17, y: 64, z: i * 31 }));
+  assert.ok(new Set(others.map((p) => p.design)).size >= 2);
+});
+
+test('build_house dry-run item counts match the expanded plan, fallback steps trigger when items are short, and a stopped build resumes the same plan', async () => {
+  const world = new Map();
+  const make = (name, pos, props = {}) => ({ name, position: pos, boundingBox: name === 'air' ? 'empty' : 'block', shapes: name === 'air' ? [] : [[0, 0, 0, 1, 1, 1]], getProperties: () => props });
+  for (let x = -20; x <= 20; x++) for (let z = -20; z <= 25; z++) world.set(`${x},63,${z}`, make('grass_block', new Vec3(x, 63, z)));
+
+  let items = [];
+  const makeBot = () => {
+    const bot = Object.assign(new EventEmitter(), {
+      entity: { position: new Vec3(0.5, 64, 12.5), height: 1.62 },
+      entities: {},
+      registry: realRegistry,
+      inventory: { items: () => items },
+      blockAt: (p) => world.get(`${p.x},${p.y},${p.z}`) ?? make('air', p),
+      equip: async (item) => { bot.heldItem = item; },
+      look: async () => {},
+      placeBlock: async (ref, face) => {
+        const pos = ref.position.plus(face);
+        world.set(`${pos.x},${pos.y},${pos.z}`, make(bot.heldItem.name, pos));
+      },
+      _placeBlockWithOptions: async (ref, face) => {
+        const pos = ref.position.plus(face);
+        world.set(`${pos.x},${pos.y},${pos.z}`, make(bot.heldItem.name, pos));
+      },
+      dig: async (block) => { world.delete(`${block.position.x},${block.position.y},${block.position.z}`); },
+      canDigBlock: () => true,
+      pathfinder: {
+        goto: async (goal) => { if (goal?.pos) bot.entity.position = new Vec3(goal.pos.x + 0.5, 64, goal.pos.z + 1.5); },
+        setGoal: () => {},
+        isMining: () => false,
+        isBuilding: () => false,
+        bestHarvestTool: () => null
+      }
+    });
+    bot.world = { getBlock: (p) => bot.blockAt(p), raycast: () => null };
+    return bot;
+  };
+
+  const bot = makeBot();
+  const ctx = { bot, config: { protectedBlocks: ['chest', 'bed'], limits: { maxBuildBlocks: 2500, moveTimeoutSeconds: 90 } } };
+
+  // Dry run with empty inventory reports exact item counts matching the expanded plan.
+  const dry = await buildHouse(ctx, { x: 0, y: 64, z: 0, design: 'cottage', width: 7, depth: 7, dry_run: true });
+  assert.equal(dry.ok, true, dry.message);
+  assert.match(dry.message, /7x7 cottage \(oak, spruce and stone bricks look\)/);
+  const chosen1 = chooseHousePlan(ctx, { x: 0, y: 64, z: 0, design: 'cottage', width: 7, depth: 7 });
+  for (const [item, count] of chosen1.needed) {
+    assert.match(dry.message, new RegExp(`(^|[, ])${count} ${item}(,|\\.| )`));
+  }
+
+  // Fallback step 2: give all items for the one-wood-and-stone-bricks look ("oak and stone bricks"),
+  // leaving out spruce and bricks so step 1 cannot be met.
+  const step2Plan = designHousePlan({
+    x: 0, y: 64, z: 0, design: 'cottage', width: 7, depth: 7, tier: 2, look: 'oak and stone bricks',
+    palette: { foundation: 'stone_bricks', frame: 'oak_log', wall: 'oak_planks', roof: 'stone_brick_stairs', trim: 'oak_stairs', floor: 'oak_planks', glass: 'glass_pane', light: 'lantern', accent: 'stone_bricks', accent2: 'oak_trapdoor' }
+  });
+  const countItems = (p) => {
+    const map = new Map();
+    for (const b of expandParts(p.parts, p.blocks, { palette: p.palette })) {
+      const { name, props } = parseBlock(b.block);
+      const item = itemFor(name, realRegistry);
+      map.set(item, (map.get(item) ?? 0) + (name.endsWith('_slab') && props.type === 'double' ? 2 : 1));
+    }
+    return [...map].map(([name, count]) => ({ name, count }));
+  };
+  items = countItems(step2Plan);
+  const dry2 = await buildHouse(ctx, { x: 0, y: 64, z: 0, design: 'cottage', width: 7, depth: 7, dry_run: true });
+  assert.match(dry2.message, /7x7 cottage \(oak and stone bricks look\)/);
+  assert.match(dry2.message, /I have everything\./);
+
+  // Fallback step 3: give only one wood (oak) and cobblestone; it still has a framed roof and
+  // selects the oak and cobblestone look.
+  const step3Plan = designHousePlan({
+    x: 0, y: 64, z: 0, design: 'cottage', width: 7, depth: 7, tier: 3, look: 'oak and cobblestone',
+    palette: { foundation: 'cobblestone', frame: 'oak_planks', wall: 'oak_planks', roof: 'cobblestone_stairs', trim: 'oak_stairs', floor: 'oak_planks', glass: 'glass_pane', light: 'torch', accent: 'cobblestone', accent2: 'oak_trapdoor' }
+  });
+  items = countItems(step3Plan);
+  const dry3 = await buildHouse(ctx, { x: 0, y: 64, z: 0, design: 'cottage', width: 7, depth: 7, dry_run: true });
+  assert.match(dry3.message, /7x7 cottage \(oak and cobblestone look\)/);
+  assert.match(dry3.message, /I have everything\./);
+  assert.match(dry3.message, /cobblestone_stairs/);
+  assert.match(dry3.message, /oak_stairs/);
+
+  // A stopped build called again resumes the exact same plan and look even if inventory changes.
+  items = countItems(step2Plan);
+  const controller = new AbortController();
+  let placed = 0;
+  bot._placeBlockWithOptions = async (ref, face) => {
+    const pos = ref.position.plus(face);
+    const { name, props } = parseBlock(step2Plan.blocks?.[0]?.block ?? bot.heldItem.name);
+    world.set(`${pos.x},${pos.y},${pos.z}`, make(bot.heldItem.name, pos, props));
+    if (++placed === 12) controller.abort();
+  };
+  bot.placeBlock = bot._placeBlockWithOptions;
+  setPauseScale(0);
+  const first = await buildHouse({ ...ctx, signal: controller.signal }, { x: 0, y: 64, z: 0, design: 'cottage', width: 7, depth: 7 });
+  setPauseScale(1);
+  assert.equal(first.ok, true, first.message);
+  assert.match(first.message, /7x7 cottage \(oak and stone bricks look\)/);
+  assert.match(first.message, /Stopped early/);
+  assert.ok(bot._activeHouse, 'active house saved for resume');
+
+  // Calling dry_run at the same spot continues the same oak and stone bricks plan.
+  const resumed = await buildHouse(ctx, { x: 0, y: 64, z: 0, design: 'cottage', width: 7, depth: 7, dry_run: true });
+  assert.match(resumed.message, /7x7 cottage \(oak and stone bricks look\)/);
 });

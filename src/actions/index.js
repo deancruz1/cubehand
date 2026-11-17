@@ -3,6 +3,8 @@ import { moveTo, goToPlayer, followPlayer, stopMoving, lookAt, giveItem } from '
 import { eat, inspectBlocks, placeBlock, breakBlock, findBlock, useBlock } from './blocks.js';
 import { buildStructure, breakBlocks, copyStructure } from './build.js';
 import { buildHouse } from './house.js';
+import { previewStructure, viewArea } from './preview.js';
+import { designGuide } from './design.js';
 import { openContainer, storeItems, takeItems, stash } from './containers.js';
 import { mine, chopTree } from './mining.js';
 import { digArea } from './dig.js';
@@ -45,6 +47,9 @@ export const ACTIONS = {
   harvest,
   build_structure: buildStructure,
   copy_structure: copyStructure,
+  design_guide: designGuide,
+  preview_structure: previewStructure,
+  view_area: viewArea,
   build_house: buildHouse,
   open_container: openContainer,
   store_items: storeItems,

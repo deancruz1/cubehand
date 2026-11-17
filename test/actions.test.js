@@ -105,6 +105,14 @@ test('every tool has an action and every action has a tool', () => {
   assert.deepEqual(toolNames, actionNames);
 });
 
+test('design_guide dispatches and returns the guide as text', async () => {
+  const result = await ACTIONS.design_guide({}, { structure: 'cabin', style: 'rustic' });
+  assert.equal(result.ok, true);
+  assert.equal(typeof result.message, 'string');
+  assert.match(result.message, /Checklist/);
+  assert.ok(TOOLS.some((t) => t.name === 'design_guide'));
+});
+
 test('every tool schema is strict and closed', () => {
   for (const t of TOOLS) {
     assert.equal(t.strict, true, t.name);
