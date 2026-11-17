@@ -1,13 +1,19 @@
 import { say, whisper } from './chat.js';
 import { moveTo, goToPlayer, followPlayer, stopMoving, lookAt, giveItem } from './movement.js';
 import { eat, inspectBlocks, placeBlock, breakBlock, findBlock, useBlock } from './blocks.js';
-import { buildStructure } from './build.js';
+import { buildStructure, breakBlocks, copyStructure } from './build.js';
 import { buildHouse } from './house.js';
 import { openContainer, storeItems, takeItems, stash } from './containers.js';
 import { mine, chopTree } from './mining.js';
 import { digArea } from './dig.js';
 import { useItem } from './use.js';
 import { collectItems } from './items.js';
+import { fish } from './fishing.js';
+import { harvest } from './farm.js';
+import { tendAnimals } from './husbandry.js';
+import { trade } from './trade.js';
+import { enchant, repair } from './enchant.js';
+import { brew } from './brew.js';
 import { attack } from './combat.js';
 import { survey } from './survey.js';
 import { remember, forget, recordArea } from './memory.js';
@@ -33,9 +39,12 @@ export const ACTIONS = {
   inspect_blocks: inspectBlocks,
   place_block: placeBlock,
   break_block: breakBlock,
+  break_blocks: breakBlocks,
   use_block: useBlock,
   use_item: useItem,
+  harvest,
   build_structure: buildStructure,
+  copy_structure: copyStructure,
   build_house: buildHouse,
   open_container: openContainer,
   store_items: storeItems,
@@ -47,13 +56,19 @@ export const ACTIONS = {
   dig_area: digArea,
   chop_tree: chopTree,
   collect_items: collectItems,
+  fish,
   attack,
+  tend_animals: tendAnimals,
   remember,
   forget,
   record_area: recordArea,
   craft,
   obtain,
+  trade,
   smelt,
+  brew,
+  enchant,
+  repair,
   sleep,
   equip,
   unequip,

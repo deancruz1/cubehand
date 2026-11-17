@@ -8,6 +8,8 @@ scaffold.json
 scaffold.json.tmp
 chests.json
 chests.json.tmp
+tended.json
+tended.json.tmp
 requests.json
 jobs.jsonl
 lessons.json

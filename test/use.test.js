@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Vec3 } from 'vec3';
-import { useItem, useKind, plantFor, findItem, fireSafe, dangerProblem, pickMobs, isMount, growable } from '../src/actions/use.js';
+import { useItem, useOnEntity, useKind, plantFor, findItem, fireSafe, dangerProblem, pickMobs, isMount, growable } from '../src/actions/use.js';
+import { Tended } from '../src/tended.js';
 import { setPauseScale } from '../src/actions/util.js';
 
 setPauseScale(0);
@@ -193,6 +194,40 @@ test('shearing skips a sheep that is already sheared and reports the wool', asyn
   assert.equal(result.ok, true, result.message);
   assert.match(result.message, /used shears on 1 sheep, got 2 white_wool. 1 didn't change/);
   assert.match(result.message, /no more sheep/);
+});
+
+test('an item can go to one given mob, not the nearest, and never to a player', async () => {
+  const near = mob(1, 'sheep', 1.5);
+  const chosen = mob(2, 'sheep', 2.5);
+  const steve = mob(3, 'player', 1);
+  const items = [{ name: 'shears', count: 1 }, { name: 'tnt', count: 1 }];
+  const bot = fakeBot({}, items, { entities: { 1: near, 2: chosen, 3: steve } });
+  const result = await useOnEntity(fakeCtx(bot), 'shears', chosen);
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /used shears on the sheep at 2 64 0/);
+  assert.equal(chosen.sheared, true);
+  assert.equal(near.sheared, undefined);
+  assert.equal((await useOnEntity(fakeCtx(bot), 'shears', steve)).ok, false);
+  assert.match((await useOnEntity(fakeCtx(bot), 'tnt', near)).message, /never use tnt/);
+  assert.match((await useOnEntity(fakeCtx(bot), 'wheat', near)).message, /missing item: wheat/);
+  delete bot.entities[1];
+  assert.match((await useOnEntity(fakeCtx(bot), 'shears', near)).message, /gone/);
+});
+
+test('a player\'s tilled box is kept as a field to tend, a single block or her own job is not', async () => {
+  const blocks = { '1,63,0': 'grass_block', '2,63,0': 'grass_block', '3,63,0': 'grass_block', '1,63,2': 'grass_block' };
+  const bot = fakeBot(blocks, [{ name: 'iron_hoe', count: 1 }]);
+  bot.game = { dimension: 'overworld' };
+  const tended = new Tended();
+  const ctx = { ...fakeCtx(bot), tended };
+  const tilled = await useItem(ctx, { item: 'hoe', x: 1, y: 63, z: 0, x2: 2, z2: 0 });
+  assert.match(tilled.message, /I will tend this field from now on$/);
+  assert.deepEqual(tended.list('fields', 'overworld'), [{ x: 1, y: 63, z: 0, x2: 2, y2: 63, z2: 0, dimension: 'overworld' }]);
+  await useItem(ctx, { item: 'hoe', x: 3, y: 63, z: 0 });
+  assert.equal(tended.list('fields', 'overworld').length, 1);
+  const own = await useItem({ ...ctx, requester: null }, { item: 'hoe', x: 1, y: 63, z: 2, x2: 1, z2: 2 });
+  assert.equal(own.ok, true, own.message);
+  assert.equal(tended.list('fields', 'overworld').length, 1);
 });
 
 test('use_item never works on players, and fire needs an admin away from netherrack', async () => {

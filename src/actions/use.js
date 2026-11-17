@@ -9,6 +9,7 @@ import { collectDrops, dropsNear, gainedText } from './items.js';
 import { nearestFirst } from './build.js';
 import { stateText } from './states.js';
 import { isAdmin } from '../guard.js';
+import { fieldRecord } from '../tended.js';
 
 const { GoalLookAtBlock, GoalNear, GoalFollow } = pathfinderPkg.goals;
 
@@ -16,7 +17,7 @@ const AIR = new Set(['air', 'cave_air', 'void_air']);
 const UP = new Vec3(0, 1, 0);
 const TOP = new Vec3(0.5, 1, 0.5);
 const SEARCH_RANGE = 32;
-const MAX_AREA = 512;
+export const MAX_AREA = 512;
 const MOB_REACH = 3;
 
 const BANNED = new Set(['tnt', 'tnt_minecart', 'end_crystal']);
@@ -31,6 +32,8 @@ const CROPS = {
   wheat_seeds: 'wheat', beetroot_seeds: 'beetroots', carrot: 'carrots', potato: 'potatoes', pumpkin_seeds: 'pumpkin_stem',
   melon_seeds: 'melon_stem', torchflower_seeds: 'torchflower_crop', pitcher_pod: 'pitcher_crop'
 };
+// Seeds whose plants the harvest chore can take, unlike saplings.
+const FIELD_SEEDS = new Set([...Object.keys(CROPS), 'nether_wart', 'sweet_berries']);
 const BERRY_GROUND = new Set(['grass_block', 'dirt', 'coarse_dirt', 'podzol', 'rooted_dirt', 'moss_block', 'mud', 'muddy_mangrove_roots', 'farmland']);
 const GROWS = new Set([...Object.values(CROPS), 'sweet_berry_bush', 'cocoa']);
 // Clicking these opens a trade window instead of using the item.
@@ -158,7 +161,7 @@ function usedText(before, after) {
   return used.map(([n, c]) => `${c} ${n}`).join(', ');
 }
 
-async function waitFor(test, ms = 1200) {
+export async function waitFor(test, ms = 1200) {
   const end = Date.now() + ms;
   for (;;) {
     if (test()) return true;
@@ -206,14 +209,14 @@ async function getInReach(ctx, pos, { minY, goal } = {}) {
   return `could not get close enough to ${posText(pos)}: ${walked.message}`;
 }
 
-async function hold(bot, name) {
+export async function hold(bot, name) {
   const item = bot.inventory.items().find((i) => i.name === name);
   if (!item) return false;
   if (bot.heldItem?.name !== name) await bot.equip(item, 'hand');
   return true;
 }
 
-function ageOf(bot, block) {
+export function ageOf(bot, block) {
   const age = block.getProperties?.().age;
   const state = bot.registry.blocksByName?.[block.name]?.states?.find((s) => s.name === 'age');
   return { age: age === undefined ? undefined : Number(age), maxAge: state?.num_values ? state.num_values - 1 : undefined };
@@ -296,9 +299,11 @@ async function useOnBlocks(ctx, item, kind, pos, corner) {
   const single = !corner;
   const job = blockJob(ctx, item, kind, single);
   let targets = [pos];
+  let min = pos;
+  let max = pos;
   if (corner) {
-    const min = new Vec3(Math.min(pos.x, corner.x), Math.min(pos.y, corner.y), Math.min(pos.z, corner.z));
-    const max = new Vec3(Math.max(pos.x, corner.x), Math.max(pos.y, corner.y), Math.max(pos.z, corner.z));
+    min = new Vec3(Math.min(pos.x, corner.x), Math.min(pos.y, corner.y), Math.min(pos.z, corner.z));
+    max = new Vec3(Math.max(pos.x, corner.x), Math.max(pos.y, corner.y), Math.max(pos.z, corner.z));
     const volume = (max.x - min.x + 1) * (max.y - min.y + 1) * (max.z - min.z + 1);
     if (volume > MAX_AREA) return fail(`box is ${volume} blocks, the limit is ${MAX_AREA}`);
     targets = [];
@@ -350,7 +355,13 @@ async function useOnBlocks(ctx, item, kind, pos, corner) {
   if (kind === 'grow' && notes.length) message += ` (last: ${notes.at(-1)})`;
   if (failures.length) message += `. ${failures.length} failed, first: ${failures.slice(0, 3).join('; ')}`;
   if (stopReason) message += `. Stopped early: ${stopReason}`;
-  return done ? ok(message) : fail(message);
+  if (!done) return fail(message);
+  // A box a player had her till or sow is a field for the tending chore.
+  const sown = kind === 'till' || (kind === 'plant' && FIELD_SEEDS.has(item));
+  if (sown && ctx.tended && ctx.requester && ctx.tended.add('fields', fieldRecord(min, max, bot.game?.dimension)) === 'added') {
+    message += '. I will tend this field from now on';
+  }
+  return ok(message);
 }
 
 // Picks up water, lava or powder snow at pos with an empty bucket.
@@ -459,6 +470,40 @@ async function useOther(ctx, item, pos) {
   return ok(`used ${item} on ${block.name} at ${posText(pos)}, it is now ${now()}`);
 }
 
+// Walks up to mob and uses item on it once: 'used' when something changed (an item went or came,
+// the tool wore, something dropped), else 'unchanged', 'out of reach' or 'stopped'.
+async function useOnMob(ctx, item, mob) {
+  const { bot, signal } = ctx;
+  if (mob.position.distanceTo(bot.entity.position) > MOB_REACH) {
+    await walkTo(ctx, new GoalFollow(mob, 1.5), { place: false });
+    if (signal?.aborted) return 'stopped';
+    if (!bot.entities[mob.id] || mob.position.distanceTo(bot.entity.position) > MOB_REACH + 0.5) return 'out of reach';
+  }
+  await hold(bot, item);
+  await bot.lookAt(mob.position.offset(0, (mob.height ?? 1) * 0.6, 0), true);
+  const items = inventoryKey(bot);
+  const wear = bot.heldItem?.durabilityUsed;
+  const drops = dropsNear(bot, mob.position, 3).length;
+  bot.useOn(mob);
+  const changed = await waitFor(() => inventoryKey(bot) !== items || bot.heldItem?.durabilityUsed !== wear || dropsNear(bot, mob.position, 3).length > drops);
+  return changed ? 'used' : 'unchanged';
+}
+
+// Uses item on that one mob, the way use_item does on mobs: never on players or traders, and
+// never fire, lava or TNT.
+export async function useOnEntity(ctx, item, mob) {
+  const { bot } = ctx;
+  if (!mob || !bot.entities[mob.id]) return fail('it is gone');
+  if (mob.type === 'player' || NO_USE.has(mob.name)) return fail(`I don't use items on a ${mob.type === 'player' ? 'player' : mob.name}`);
+  if (DANGER.has(item)) return fail(`I never use ${item} on mobs`);
+  if (!count(bot, item)) return fail(`missing item: ${item}`);
+  const got = await useOnMob(ctx, item, mob);
+  if (got === 'used') return ok(`used ${item} on the ${mob.name} at ${posText(mob.position)}`);
+  if (got === 'stopped') return fail('stopped');
+  if (got === 'out of reach') return fail(`could not get to the ${mob.name}`);
+  return fail(`using ${item} on the ${mob.name} changed nothing`);
+}
+
 // Uses the item on the count nearest matching mobs, skipping ones it does nothing to (a sheep
 // that's already sheared, an animal that isn't hungry).
 async function useOnMobs(ctx, item, target, wantCount) {
@@ -486,22 +531,13 @@ async function useOnMobs(ctx, item, target, wantCount) {
       break;
     }
     skip.add(mob.id);
-    if (mob.position.distanceTo(bot.entity.position) > MOB_REACH) {
-      await walkTo(ctx, new GoalFollow(mob, 1.5), { place: false });
-      if (signal?.aborted) {
-        stopReason = 'stopped';
-        break;
-      }
-      if (!bot.entities[mob.id] || mob.position.distanceTo(bot.entity.position) > MOB_REACH + 0.5) continue;
+    const got = await useOnMob(ctx, item, mob);
+    if (got === 'stopped') {
+      stopReason = 'stopped';
+      break;
     }
-    await hold(bot, item);
-    await bot.lookAt(mob.position.offset(0, (mob.height ?? 1) * 0.6, 0), true);
-    const items = inventoryKey(bot);
-    const wear = bot.heldItem?.durabilityUsed;
-    const drops = dropsNear(bot, mob.position, 3).length;
-    bot.useOn(mob);
-    const changed = await waitFor(() => inventoryKey(bot) !== items || bot.heldItem?.durabilityUsed !== wear || dropsNear(bot, mob.position, 3).length > drops);
-    if (changed) {
+    if (got === 'out of reach') continue;
+    if (got === 'used') {
       done++;
       ctx.status?.progress(`used ${item} on ${done} of ${wanted} ${target}`);
     } else unchanged++;
