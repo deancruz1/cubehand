@@ -36,6 +36,18 @@ test('moving, digging, items changing or progress keep a tool alive', () => {
   watch.stop();
 });
 
+test('the watch says when the progress line last changed, and the same line again is no change', () => {
+  const { status, watch, t0 } = setup();
+  assert.equal(watch.progressAt(), null);
+  status.progress('placed 10 of 700 blocks', t0 + 5000);
+  assert.equal(watch.progressAt(), t0 + 5000);
+  status.progress('placed 10 of 700 blocks', t0 + 9000);
+  assert.equal(watch.progressAt(), t0 + 5000);
+  status.progress('placed 11 of 700 blocks', t0 + 12000);
+  assert.equal(watch.progressAt(), t0 + 12000);
+  watch.stop();
+});
+
 test('a status line goes to chat when she has been quiet for a minute during a job', () => {
   const { status, said, watch, t0 } = setup();
   status.spoke(t0);

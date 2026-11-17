@@ -296,6 +296,32 @@ test('handovers count escalations, the first step and how escalated requests beg
   assert.deepEqual(handovers.words, [{ words: 'fix the', count: 2 }]);
 });
 
+test('the reasons the quick model gave are grouped by count, and old records without one still report', () => {
+  const [quick, roof, door] = routed();
+  const handed = (request, to, reason) =>
+    job({
+      request,
+      tier: to,
+      steps: [step(HAIKU, [tool('escalate', true, 0, { to, reason })], { ms: 900 }), step(to === 'normal' ? SONNET : OPUS, [tool('mine', true, 500)])]
+    });
+  const jobs = [quick, roof, door, handed('patch the wall', 'complex', 'Fixing a build.'), handed('fill the holes', 'complex', 'fixing a build'), handed('dig it out', 'normal', 'tunnel work')];
+  const report = buildReport(parseLog(log(...jobs)).jobs, { botName: 'Bot' });
+  assert.deepEqual(report.handovers.reasons, [
+    { reason: 'fixing a build', count: 2 },
+    { reason: 'tunnel work', count: 1 }
+  ]);
+  assert.equal(report.handovers.noReason, 2);
+  const text = formatReport(report);
+  assert.match(text, /Quick model jobs +6, 5 escalated .*\n +Reasons given for escalating:\n/);
+  assert.match(text, /\n +fixing a build +2\n/);
+  assert.match(text, /\n +\(none given\) +2\n/);
+
+  const old = buildReport(parseLog(log(quick, roof, door)).jobs, { botName: 'Bot' });
+  assert.deepEqual(old.handovers.reasons, []);
+  assert.equal(old.handovers.escalated, 2);
+  assert.doesNotMatch(formatReport(old), /Reasons given/);
+});
+
 test('first words leave out the bot name and punctuation', () => {
   assert.equal(firstWords('Clodine, build me a house', 'Clodine'), 'build me');
   assert.equal(firstWords('do that then clodine', 'Clodine'), 'do that');
@@ -361,11 +387,32 @@ test('calls stopped from outside are counted apart and left out of failure rates
   assert.match(text, /\n {2}dig_area +4 +2 +50% /);
   assert.match(text, /\n {2}skill +2 +1 +- /);
 
-  // Lines from before the mark load as they did.
+  // Lines from before the mark go by what the tool said.
   const old = tools.map(({ interrupted, ...rest }) => rest);
   const before = buildReport(parseLog(log(job({ steps: [step(OPUS, old)] }))).jobs).tools.find((r) => r.name === 'dig_area');
-  assert.deepEqual([before.interrupted, before.failed, before.failRate], [0, 3, 0.75]);
-  assert.match(formatReport(buildReport(parseLog(log(job({ steps: [step(OPUS, old)] }))).jobs)), /\n {2}dig_area +4 +- +75% /);
+  assert.deepEqual([before.interrupted, before.failed, before.failRate], [2, 1, 0.5]);
+  assert.match(formatReport(buildReport(parseLog(log(job({ steps: [step(OPUS, old)] }))).jobs)), /\n {2}dig_area +4 +2 +50% /);
+
+  // Since the mark, a call stopped for being stuck or too slow says the same and is a failure.
+  const after = buildReport(parseLog(log(job({ start: '2026-11-16T09:00:00.000Z', steps: [step(OPUS, old)] }))).jobs).tools.find((r) => r.name === 'dig_area');
+  assert.deepEqual([after.interrupted, after.failed, after.failRate], [0, 3, 0.75]);
+});
+
+test('older lines count a call as stopped from outside by the brain note or the tool saying it was stopped', () => {
+  const tools = [
+    tool('dig_area', false, 100, { error: 'dug 3 blocks. Stopped early: stopped\nNow at 1 2 3. (Stopped because a player just changed the instructions, see below.)' }),
+    tool('dig_area', false, 100, { error: 'dug 3 blocks. Stopped early: stopped\nNow at 1 2 3. Inventory +3 cobbled_deepslate, +1 tuff. (Stoppe' }),
+    tool('move_to', false, 100, { error: 'stopped (Stopped because the connection to the server dropped, see below.)' }),
+    tool('break_block', false, 100, { error: 'stopped before breaking stone' }),
+    tool('dig_area', false, 100, { error: 'dug 3 blocks. Stopped early: stopped (I stopped this myself: nothing was changing. Work out what\'s in the way before trying the same thing again.)' }),
+    tool('dig_area', false, 100, { error: 'dug 3 blocks. Stopped early: stopped (Stopped because one call can run for at most 5 minutes.)' }),
+    tool('break_block', false, 100, { error: 'stopped breaking stone: Digging aborted' }),
+    tool('dig_area', false, 100, { error: 'dug 0 blocks. Stopped early: kept failing to reach or dig blocks' })
+  ];
+  const [line] = parseLog(log(job({ start: '2026-11-15T09:00:00.000Z', steps: [step(OPUS, tools)] }))).jobs;
+  assert.deepEqual(line.tools.map((t) => t.interrupted), [true, true, true, true, false, false, false, false]);
+  const later = parseLog(log(job({ start: '2026-11-15T12:00:00.000Z', steps: [step(OPUS, tools)] }))).jobs[0];
+  assert.deepEqual(later.tools.map((t) => t.interrupted), [true, false, true, false, false, false, false, false]);
 });
 
 test('trouble lists jobs that ended badly, were nudged, held or warned, and the dearest and slowest', () => {

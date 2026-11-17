@@ -113,6 +113,11 @@ test('a good skill passes and bad ones are turned down with the reason', () => {
   assert.match(validateSkill(step('craft', { item: 'x'.repeat(201) }), s), /over 200/);
   assert.match(validateSkill(step('break_block', { x: 1, y: 2, z: 3, confirmed: true }), s), /can't set confirmed/);
   assert.match(validateSkill(step('obtain', { item: 'torch', plan_only: true }), s), /can't set plan_only/);
+  assert.match(validateSkill(step('trade', { list: true }), s), /can't set list, it only looks/);
+  assert.equal(validateSkill(step('trade', { item: 'emerald', count: 2 }), s), null);
+  assert.match(validateSkill(step('harvest', { x: 1, y: 64, z: 1, tend: false }), s), /can't set tend false/);
+  assert.match(validateSkill(step('tend_animals', { x: 1, y: 64, z: 1, tend: false }), s), /can't set tend false/);
+  assert.equal(validateSkill(step('harvest', { x: 1, y: 64, z: 1, tend: true }), s), null);
   assert.match(validateSkill({ ...restock, name: 'Bad Name' }, s), /name must be/);
   assert.match(validateSkill({ ...restock, steps: [] }, s), /1 to 20 steps/);
   assert.match(validateSkill({ ...restock, steps: Array(21).fill(restock.steps[0]) }, s), /1 to 20 steps/);
@@ -122,6 +127,8 @@ test('a good skill passes and bad ones are turned down with the reason', () => {
 test('every tool left out of skills is a real tool or a brain tool', () => {
   const names = new Set(ALL.map((t) => t.name));
   for (const name of NOT_IN_SKILLS) assert.ok(names.has(name) || name === 'escalate', name);
+  for (const name of ['build_house', 'build_structure', 'copy_structure', 'break_blocks', 'enchant']) assert.ok(NOT_IN_SKILLS.has(name), name);
+  for (const name of ['fish', 'repair', 'brew', 'trade', 'harvest', 'tend_animals']) assert.ok(names.has(name) && !NOT_IN_SKILLS.has(name), name);
 });
 
 test('placeholders keep the type of the argument, or go into text', () => {

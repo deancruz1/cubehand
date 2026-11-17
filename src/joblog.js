@@ -59,13 +59,36 @@ function addTokens(total, tokens) {
   return total;
 }
 
+// The brain's note on a tool it stopped from outside: a change, a hold or a lost connection.
+const STOPPED_FROM_OUTSIDE = /Stopped because (?:a player just changed the instructions|you had to look after yourself|you had to get out of water, lava or fire|the connection to the server dropped)/;
+// A tool's own word that it was stopped, and the brain's notes on the two stops that are failures.
+const SAID_STOPPED = /Stopped early: stopped\b|^stopped(?: before\b|$|\n)/;
+const STUCK_OR_SLOW = /Work out what's in the way before trying the same thing again|Stopped because one call can run for at most/;
+// Tool entries carry interrupted: true from this time on.
+export const FLAGGED_SINCE = Date.parse('2026-11-15T11:25:00Z');
+
+// Whether a tool entry of a job record was stopped from outside (a change, a hold, a stop, a lost
+// connection) rather than failing on its own. Older records only have the text, and their error
+// is cut at 300 characters, which often drops the brain's note, so the tool's own "stopped" counts
+// there too. start is the record's start; without it the record is taken as a newer one, where a
+// stop for being stuck or too slow reads the same and is a failure.
+export function wasInterrupted(tool, start) {
+  if (tool?.interrupted === true) return true;
+  const error = String(tool?.error ?? '');
+  if (STOPPED_FROM_OUTSIDE.test(error)) return true;
+  const at = typeof start === 'number' ? start : Date.parse(start);
+  return at < FLAGGED_SINCE && SAID_STOPPED.test(error) && !STUCK_OR_SLOW.test(error);
+}
+
 // One job from start to end: every model call (steps, mid-job replies) and every tool.
 export class JobRecord {
-  constructor({ player = null, text = null, self = false, reflex = null, standing = false } = {}) {
+  constructor({ player = null, text = null, self = false, reflex = null, standing = false, recovery = false } = {}) {
     this.startedAt = Date.now();
     this.player = player;
     this.text = text;
     this.self = self;
+    // Free time spent going back for her things after a death.
+    this.recovery = recovery;
     // A round of the standing job (see standing.js), whose text is that job's task.
     this.standing = standing;
     // 'come', 'follow' or 'stay' when the body acted on the order before the model was asked.
@@ -137,6 +160,7 @@ export class JobRecord {
       ...(this.nudges ? { nudges: this.nudges } : {}),
       ...(this.reflex ? { reflex: this.reflex } : {}),
       ...(this.standing ? { standing: true } : {}),
+      ...(this.recovery ? { recovery: true } : {}),
       ...(this.refusals.length ? { refusals: { count: this.refusals.length, by: this.refusals, ...(this.leanCured ? { leanCured: true } : {}) } } : {}),
       ms: Date.now() - this.startedAt,
       calls: this.calls,

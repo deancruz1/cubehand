@@ -4,7 +4,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Brain, chatPart } from '../src/brain.js';
+import { Brain, chatPart, deathText } from '../src/brain.js';
 import { RefusalLog } from '../src/joblog.js';
 import { Lessons, worthLesson } from '../src/lessons.js';
 
@@ -125,7 +125,7 @@ function fakeClient(responses) {
   };
 }
 
-function makeBrain({ client, config = baseConfig, runTool, jobLog, onThinking, lessons, skills, snapshot = () => 'SNAPSHOT', forgetRequests, forgetChat, log = () => {} }) {
+function makeBrain({ client, config = baseConfig, runTool, jobLog, onThinking, lessons, skills, snapshot = () => 'SNAPSHOT', forgetRequests, forgetChat, watchTool, log = () => {} }) {
   const said = [];
   const heard = [];
   const toolCalls = [];
@@ -150,6 +150,7 @@ function makeBrain({ client, config = baseConfig, runTool, jobLog, onThinking, l
     },
     onStop: () => stops++,
     onThinking: onThinking ?? ((active) => thinks.push(active)),
+    watchTool,
     log
   });
   return { brain, said, heard, toolCalls, thinks, stops: () => stops };
@@ -352,7 +353,7 @@ test('stop cancels the current request, clears the queue and confirms', async ()
 test('requests queue while busy, up to the limit', async () => {
   let release;
   const gate = new Promise((r) => (release = r));
-  const client = fakeClient([reply('tool_use', [toolUse('a', 'build_structure')]), reply('end_turn', []), reply('end_turn', []), reply('end_turn', [])]);
+  const client = fakeClient([reply('tool_use', [toolUse('a', 'build_structure')]), reply('end_turn', []), reply('end_turn', [{ type: 'text', text: 'Okay.' }]), reply('end_turn', [])]);
   const config = { ...baseConfig, limits: { ...baseConfig.limits, queueSize: 1 } };
   const ran = [];
   const { brain, said } = makeBrain({
@@ -845,7 +846,7 @@ test('a job handed up carries on in the same conversation when the tools match, 
     reply('end_turn', [{ type: 'text', text: 'Done.' }])
   ]);
   const { brain, said, toolCalls } = makeBrain({ client, config: unstrict });
-  await brain.start({ player: 'Steve', text: 'Clodine sort out the storage room' });
+  await brain.start({ player: 'Steve', text: 'Clodine tidy up the storage room' });
   assert.deepEqual(client.calls.map((c) => c.params.model), ['claude-haiku-5-5', 'claude-opus-5-5', 'claude-opus-5-5']);
   assert.deepEqual(client.calls[1].params.tools, client.calls[0].params.tools);
   assert.deepEqual(client.calls[1].params.system, client.calls[0].params.system);
@@ -877,6 +878,72 @@ test('a model that is not sorting a job gets an answer to escalate, not a lost j
     assert.match(results[0].content, /^Not done: this job is yours/);
     assert.deepEqual(toolCalls.map((t) => t.name), ['mine']);
   }
+});
+
+test('the quick model gives a few words on why it hands a job up, and they go in the job log and the brain log', async () => {
+  const lines = [];
+  const logs = [];
+  const client = fakeClient([
+    reply('tool_use', [toolUse('a', 'escalate', { to: 'normal', reason: ' needs mining and smelting ' })]),
+    reply('end_turn', [{ type: 'text', text: 'Done.' }])
+  ]);
+  const { brain } = makeBrain({ client, config: routed, jobLog: { write: (line) => lines.push(line) }, log: (line) => logs.push(line) });
+  await brain.start({ player: 'Steve', text: 'Clodine I need the raw iron smelted and put away' });
+  assert.deepEqual(lines[0].steps[0].tools, [{ name: 'escalate', ok: true, ms: 0, to: 'normal', reason: 'needs mining and smelting' }]);
+  assert.ok(logs.some((l) => /this is a normal job \(needs mining and smelting\)/.test(l)));
+  const escalate = client.calls[0].params.tools.find((t) => t.name === 'escalate');
+  assert.deepEqual(escalate.input_schema.required, ['to']);
+  assert.equal(escalate.input_schema.properties.reason.type, 'string');
+});
+
+test("a player's job that says and does nothing in its first step goes back once, on the everyday model if it was on the quick one", async () => {
+  const lines = [];
+  const client = fakeClient([reply('end_turn', []), reply('end_turn', [{ type: 'text', text: 'There are 12 cows in the pen.' }])]);
+  const { brain, said } = makeBrain({ client, config: unstrict, jobLog: { write: (line) => lines.push(line) } });
+  await brain.start({ player: 'Steve', text: 'Clodine the cows in the pen' });
+  assert.deepEqual(client.calls.map((c) => c.params.model), ['claude-haiku-5-5', 'claude-sonnet-5-5']);
+  // The empty turn is gone, and the first turn says what went wrong.
+  const second = client.calls[1].params.messages;
+  assert.equal(second.length, 1);
+  assert.match(textOf(second[0].content), /heard nothing/);
+  assert.deepEqual(said, ['There are 12 cows in the pen.']);
+  assert.equal(lines[0].end, 'done');
+
+  // On a bigger model it goes back to the same one.
+  const same = fakeClient([reply('end_turn', []), reply('end_turn', [{ type: 'text', text: 'Mined.' }])]);
+  const other = makeBrain({ client: same });
+  await other.brain.start({ player: 'Steve', text: 'mine stone' });
+  assert.deepEqual(same.calls.map((c) => c.params.model), ['claude-opus-5-5', 'claude-opus-5-5']);
+  assert.equal(same.calls[1].params.messages.length, 1);
+  assert.deepEqual(other.said, ['Mined.']);
+});
+
+test('a job that stays silent on its second try tells the player she did not understand and ends as not understood', async () => {
+  for (const config of [baseConfig, routed]) {
+    const lines = [];
+    const client = fakeClient([reply('end_turn', []), reply('end_turn', [])]);
+    const { brain, said } = makeBrain({ client, config, jobLog: { write: (line) => lines.push(line) } });
+    await brain.start({ player: 'Steve', text: 'Clodine the thing by the place' });
+    assert.equal(client.calls.length, 2);
+    assert.deepEqual(said, ["Sorry, I didn't understand that. Could you say it another way?"]);
+    assert.equal(lines[0].end, 'not_understood');
+  }
+});
+
+test('a silent end after a tool call, in free time or after a reflex move ends as before', async () => {
+  const afterTool = fakeClient([reply('tool_use', [toolUse('a', 'mine')]), reply('end_turn', [])]);
+  const one = makeBrain({ client: afterTool });
+  await one.brain.start({ player: 'Steve', text: 'mine stone' });
+  assert.equal(afterTool.calls.length, 2);
+  assert.deepEqual(one.said, []);
+
+  const free = fakeClient([reply('end_turn', [])]);
+  await makeBrain({ client: free, config: routedIdle }).brain.start({ player: null, text: null, self: true });
+  assert.equal(free.calls.length, 1);
+
+  const reflex = fakeClient([reply('end_turn', [])]);
+  await makeBrain({ client: reflex, config: routed }).brain.start({ player: 'Steve', text: 'come here', reflex: 'come' });
+  assert.equal(reflex.calls.length, 1);
 });
 
 test('with routing off everything runs on the main model, and free time on the everyday model with routing on', async () => {
@@ -957,7 +1024,7 @@ test('an everyday job that turns into a build carries on in the same conversatio
     reply('end_turn', [{ type: 'text', text: 'Fixed.' }])
   ]);
   const { brain, toolCalls, said } = makeBrain({ client, config: routed, jobLog: { write: (line) => lines.push(line) } });
-  await brain.start({ player: 'Steve', text: 'Clodine fix the west wall' });
+  await brain.start({ player: 'Steve', text: 'Clodine the west wall looks wrong' });
   assert.deepEqual(client.calls.map((c) => c.params.model), ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-opus-5-5']);
   // The everyday model's build call never ran or got said; the main model saw everything before it.
   assert.deepEqual(toolCalls.map((t) => t.name), ['inspect_blocks', 'build_structure']);
@@ -977,7 +1044,7 @@ test('a quick job that turns into a build starts over when the main model gets d
     reply('end_turn', [{ type: 'text', text: 'Fixed.' }])
   ]);
   const { brain, toolCalls } = makeBrain({ client, config: routed });
-  await brain.start({ player: 'Steve', text: 'Clodine fix the west wall' });
+  await brain.start({ player: 'Steve', text: 'Clodine the west wall looks wrong' });
   assert.deepEqual(client.calls.map((c) => c.params.model), ['claude-haiku-5-5', 'claude-opus-5-5', 'claude-opus-5-5']);
   // Strict tools for the main model only, so it starts from the request again.
   assert.equal(toolCalls.length, 1);
@@ -1316,6 +1383,23 @@ function holdingTool() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('a hazard hold stops the tool with its own note, marks it interrupted and keeps the rest of the batch from running', async () => {
+  const lines = [];
+  const client = fakeClient([reply('tool_use', [toolUse('a', 'mine'), toolUse('b', 'craft')]), reply('end_turn', [{ type: 'text', text: 'Back to mining.' }])]);
+  const tool = holdingTool();
+  const { brain } = makeBrain({ client, runTool: tool.run, jobLog: { write: (line) => lines.push(line) } });
+  const job = brain.start({ player: 'Steve', text: 'mine stone' });
+  await tool.ready;
+  await brain.pause('hazard');
+  brain.resume('hazard', 'You got out of the lava.');
+  await job;
+  const results = client.calls[1].params.messages[2].content;
+  assert.equal(results[0].content, 'mined 3 (Stopped because you had to get out of water, lava or fire, see below.)');
+  assert.equal(results[1].content, 'Not done, because you had to get out of water, lava or fire (see below).');
+  assert.deepEqual(tool.ran, ['mine']);
+  assert.equal(lines[0].steps[0].tools[0].interrupted, true);
+});
 
 test('a job held for safety keeps its conversation and hears what happened', async () => {
   const lines = [];
@@ -2430,6 +2514,39 @@ test('a reflex job is told what the body already did, and the system prompt stay
   }
 });
 
+test('the rest of a stop message is told the stop is done, keeps its own tier, and an unknown kind adds nothing', async () => {
+  const STOP_DONE = /You already stopped what you were doing and said so, so don't call stop_moving or say you stopped again\. Just do the rest of what they asked\./;
+  const client = fakeClient([reply('end_turn', [{ type: 'text', text: 'Coming.' }])]);
+  await makeBrain({ client }).brain.start({ player: 'Steve', text: 'come here', reflex: 'stop' });
+  assert.match(textOf(client.calls[0].params.messages[0].content), STOP_DONE);
+  const { brain } = makeBrain({ client: fakeClient([]), config: routed });
+  assert.equal(brain.firstTier({ player: 'Steve', text: 'dig out the next tunnel', reflex: 'stop' }), brain.firstTier({ player: 'Steve', text: 'dig out the next tunnel' }));
+
+  const odd = fakeClient([reply('end_turn', [{ type: 'text', text: 'Hi!' }])]);
+  const lines = [];
+  await makeBrain({ client: odd, jobLog: { write: (line) => lines.push(line) } }).brain.start({ player: 'Steve', text: 'hello', reflex: 'wave' });
+  assert.doesNotMatch(textOf(odd.calls[0].params.messages[0].content), /already/);
+  assert.equal(lines[0].end, 'done');
+
+  // Queued behind a job the stop is still ending, it carries the kind too.
+  const queued = fakeClient([reply('tool_use', [toolUse('a', 'mine')]), reply('end_turn', [{ type: 'text', text: 'Coming.' }])]);
+  let started;
+  const ready = new Promise((r) => (started = r));
+  const run = (name, input, signal) =>
+    new Promise((resolve) => {
+      started();
+      signal.addEventListener('abort', () => resolve({ ok: false, message: 'stopped' }));
+    });
+  const b = makeBrain({ client: queued, runTool: run });
+  const first = b.brain.start({ player: 'Steve', text: 'mine stone' });
+  await ready;
+  b.brain.stop(null, 'Steve');
+  b.brain.queue.push({ player: 'Steve', text: 'come here', whisper: false, reflex: 'stop' });
+  await first;
+  while (b.brain.busy) await tick();
+  assert.match(textOf(queued.calls[1].params.messages[0].content), STOP_DONE);
+});
+
 test('a reflex order is marked in the job log, also when it ends free time', async () => {
   const lines = [];
   const client = fakeClient([reply('end_turn', [{ type: 'text', text: 'Coming!' }])]);
@@ -2960,8 +3077,9 @@ test('a plain reply goes to the log as well as to chat, so a question never look
   assert.ok(logged.includes('[brain] reply: My walking hops up onto loose blocks in the tunnel.'));
 });
 
-// The first dig_area runs until finish() or until it's stopped; any other call answers at once.
-function digTool() {
+// The first dig_area runs until finish() or until it's stopped, and then answers onStop; any other
+// call answers at once.
+function digTool(onStop = { ok: false, message: 'dug 30 blocks. Stopped early: stopped' }) {
   const ran = [];
   let started;
   let finish = () => {};
@@ -2975,7 +3093,7 @@ function digTool() {
       finish = () => resolve({ ok: true, message: 'dug 74 blocks' });
       signal.addEventListener('abort', () => {
         stopped = true;
-        resolve({ ok: false, message: 'dug 30 blocks. Stopped early: stopped' });
+        resolve(onStop);
       });
     });
   };
@@ -3085,6 +3203,115 @@ test('a waiting note goes in the old way once the tool runs 90 seconds past it, 
   assert.ok(logged.includes('[brain] the tool ran 90s past a waiting note, stopping it'));
 });
 
+test('a waiting note lets a tool run on while its progress line keeps changing, and stops it once that stalls for 90 seconds', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000000 });
+  const lines = [];
+  const logged = [];
+  const tool = digTool();
+  let at = null;
+  const watchTool = () => ({ stop: () => {}, report: () => '', progressAt: () => at });
+  const client = fakeClient([reply('tool_use', [dig('a')]), reply('end_turn', [{ type: 'text', text: 'ADD' }]), reply('end_turn', [{ type: 'text', text: 'Okay.' }])]);
+  const { brain, said } = makeBrain({ client, config: busyPlain, runTool: tool.run, watchTool, jobLog: { write: (line) => lines.push(line) }, log: (line) => logged.push(line) });
+  const job = brain.start({ player: 'Steve', text: 'dig the next tunnel' });
+  await tool.ready;
+  brain.enqueue('Alex', 'light the tunnel after');
+  await until(() => said.length === 1);
+  assert.equal(said[0], LATER);
+  t.mock.timers.tick(30000);
+  at = Date.now();
+  t.mock.timers.tick(60000);
+  await tick();
+  assert.equal(tool.stopped(), false);
+  assert.ok(logged.includes('[brain] the tool is still making progress, so the note waits on'));
+  t.mock.timers.tick(10000);
+  at = Date.now();
+  t.mock.timers.tick(20000);
+  await tick();
+  assert.equal(tool.stopped(), false);
+  t.mock.timers.tick(69999);
+  await tick();
+  assert.equal(tool.stopped(), false);
+  t.mock.timers.tick(1);
+  await job;
+  assert.equal(tool.stopped(), true);
+  assert.ok(logged.includes('[brain] the tool ran 90s past a waiting note without progress, stopping it'));
+  assert.match(lastTurn(client.calls[2])[0].content, /Stopped early: stopped \(Stopped because a player just changed the instructions, see below\.\)$/);
+  assert.equal(lines[0].steps[0].tools[0].interrupted, true);
+});
+
+test('a tool that keeps making progress past a waiting note runs to its own ceiling, and the note goes in then', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000000 });
+  const tool = digTool();
+  const watchTool = () => ({ stop: () => {}, report: () => '', progressAt: () => Date.now() });
+  const client = fakeClient([reply('tool_use', [dig('a')]), reply('end_turn', [{ type: 'text', text: 'ADD' }]), reply('end_turn', [{ type: 'text', text: 'Okay.' }])]);
+  const { brain, said } = makeBrain({ client, config: busyPlain, runTool: tool.run, watchTool });
+  const job = brain.start({ player: 'Steve', text: 'dig the next tunnel' });
+  await tool.ready;
+  brain.enqueue('Alex', 'light the tunnel after');
+  await until(() => said.length === 1);
+  for (let s = 0; s < 1799; s += 90) {
+    t.mock.timers.tick(Math.min(90000, 1799000 - s * 1000));
+    await tick();
+  }
+  assert.equal(tool.stopped(), false);
+  t.mock.timers.tick(1000);
+  await job;
+  assert.equal(tool.stopped(), true);
+  const turn = lastTurn(client.calls[2]);
+  assert.match(turn[0].content, /\(Stopped because one call can run for at most 30 minutes\.\)$/);
+  assert.match(turn[1].text, /^While you were working, Alex said: light the tunnel after\n/);
+});
+
+test('a change that cannot wait still stops a tool that is making progress at once', async () => {
+  const tool = digTool();
+  const watchTool = () => ({ stop: () => {}, report: () => '', progressAt: () => Date.now() });
+  const client = fakeClient([reply('tool_use', [dig('a')]), reply('end_turn', [{ type: 'text', text: 'UPDATE' }]), reply('end_turn', [{ type: 'text', text: 'Okay.' }])]);
+  const { brain, said } = makeBrain({ client, config: busyPlain, runTool: tool.run, watchTool });
+  const job = brain.start({ player: 'Steve', text: 'dig the next tunnel' });
+  await tool.ready;
+  brain.enqueue('Alex', 'stop at the lava instead');
+  await job;
+  assert.equal(tool.stopped(), true);
+  assert.equal(said[0], "Okay Alex, I'll work that in.");
+});
+
+test('a tool that finished as the 90 second stop landed keeps its result, and one cut short does not', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const [result, finished] of [
+    [{ ok: true, message: 'placed 199, skipped 0, failed 0, took down 7 scaffolding blocks' }, true],
+    [{ ok: true, message: 'placed 120, skipped 0, failed 0. Stopped early: stopped' }, false],
+    [{ ok: false, message: 'placed 0, skipped 0, failed 3' }, false]
+  ]) {
+    const lines = [];
+    const logged = [];
+    const tool = digTool(result);
+    const client = fakeClient([
+      reply('tool_use', [dig('a'), toolUse('b', 'move_to', { x: 5, y: -59, z: 3 })]),
+      reply('end_turn', [{ type: 'text', text: 'ADD' }]),
+      reply('end_turn', [{ type: 'text', text: 'Okay.' }])
+    ]);
+    const { brain, said } = makeBrain({ client, config: busyPlain, runTool: tool.run, jobLog: { write: (line) => lines.push(line) }, log: (line) => logged.push(line) });
+    const job = brain.start({ player: 'Steve', text: 'dig the next tunnel' });
+    await tool.ready;
+    brain.enqueue('Alex', 'light the tunnel after');
+    await until(() => said.length === 1);
+    t.mock.timers.tick(90000);
+    await job;
+    const name = result.message;
+    assert.equal(tool.stopped(), true, name);
+    const turn = lastTurn(client.calls[2]);
+    assert.equal(turn[0].content, finished ? result.message : `${result.message} (Stopped because a player just changed the instructions, see below.)`, name);
+    assert.equal(turn[0].is_error, result.ok ? undefined : true, name);
+    assert.match(turn[1].content, /^Not done, because a player just changed the instructions/, name);
+    assert.match(turn[2].text, /^While you were working, Alex said: light the tunnel after\n/, name);
+    assert.deepEqual(tool.ran.map((r) => r.name), ['dig_area'], name);
+    const entry = lines[0].steps[0].tools[0];
+    assert.equal(entry.ok, finished, name);
+    assert.equal(entry.interrupted, finished ? undefined : true, name);
+    assert.equal(logged.includes('[brain] the tool had finished its work when the change stopped it'), finished, name);
+  }
+});
+
 test('a hold keeps a waiting note for the step after it', async () => {
   const lines = [];
   const tool = digTool();
@@ -3192,7 +3419,8 @@ test('a small build_structure patch runs on the model that asked for it, and a b
   const cases = [
     ['six blocks', 'build_structure', { origin, blocks: holes }, false],
     ['sixty blocks', 'build_structure', { origin, parts: [{ shape: 'fill', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 4, dy: 2, dz: 3 }, block: 'cobbled_deepslate' }] }, true],
-    ['a house', 'build_house', { x: 0, y: 64, z: 0 }, true]
+    ['a house', 'build_house', { x: 0, y: 64, z: 0 }, true],
+    ['a copy', 'copy_structure', { name: 'hut', x: 10, y: 64, z: 0 }, true]
   ];
   for (const [what, name, input, handed] of cases) {
     const lines = [];
@@ -3282,14 +3510,15 @@ test('an obvious work order starts on the everyday model and goes on like a hand
   assert.deepEqual(refused.calls.map((c) => c.params.model), ['claude-sonnet-5-5', 'claude-opus-5-5']);
 });
 
-test('requests like the live ones start on the everyday model only when they are plain work, or a bare continue after work', () => {
+test('requests like the live ones start on the everyday model only when they are plain work, or a go-ahead after work', () => {
   const { brain } = makeBrain({ client: fakeClient([]), config: routed });
   const work = { player: 'Steve', text: 'Clodine strip mine', self: false, end: 'done', at: Date.now(), tier: 'normal' };
   const chat = { ...work, text: 'Clodine how are you', tier: 'simple' };
   const free = { ...work, player: null, text: null, self: true };
   for (const [text, last, tier] of [
     ["clodine why do you keep saying you can't help with that one", work, 'simple'],
-    ['clodine start now', work, 'simple'],
+    ['clodine start now', work, 'normal'],
+    ['clodine start now', chat, 'simple'],
     ['clodine the next strip mine tunnel should go east starting at Z-100. stay at Y-59, dig only Y-58 Y-59 unless you find ores along the way. execute.', chat, 'normal'],
     ['clodine the limits of the tunnels are X10 and X50, dig east-west only within those X parameters. continue the next tunnel.', work, 'normal'],
     ['clodine i gave you three pickaxes, resume strip mine.', null, 'normal'],
@@ -3312,6 +3541,33 @@ test('requests like the live ones start on the everyday model only when they are
   assert.equal(brain.firstTier({ self: true }), 'normal');
   const off = makeBrain({ client: fakeClient([]), config: plain });
   assert.equal(off.brain.firstTier({ player: 'Steve', text: 'Clodine strip mine' }), 'complex');
+});
+
+test('fixing a build, tunnel work, sorting into chests and a go-ahead after a bigger job skip the quick model, and chat and body orders do not', () => {
+  const { brain } = makeBrain({ client: fakeClient([]), config: routed });
+  const build = { player: 'Steve', text: 'Clodine build a gate house', self: false, end: 'done', at: Date.now(), tier: 'complex' };
+  const chat = { ...build, text: 'Clodine hi', tier: 'simple' };
+  for (const [text, last, tier] of [
+    ['clodine there are also gaping holes in your original building, can you check and patch those holes', chat, 'complex'],
+    ['clodine nice work on the attic. add some windows to the attic as well', chat, 'complex'],
+    ['clodine the top cobble stones missing from this gatehouse.', chat, 'complex'],
+    ['clodine resume', build, 'complex'],
+    ['clodine i apologise. resume', build, 'complex'],
+    ['clodine yes', build, 'complex'],
+    ['clodine go ahead', chat, 'simple'],
+    ['clodine continue the tunnel south until you reach Z-5312', chat, 'normal'],
+    ['clodine there are still tunnels missing between Z-5420 and Z-5402 dig those out', chat, 'normal'],
+    ['clodine the chest by the house is still full of stuff, please sort them into the storage room', chat, 'normal'],
+    ['clodine follow me into the tunnel', chat, 'simple'],
+    ['clodine come here and put your things in the chest', chat, 'simple'],
+    ['clodine can you see the holes in the wall?', chat, 'simple'],
+    ['clodine this is perfect. i loved the furniture you put in the first floor. good job.', chat, 'simple'],
+    ['clodine from now on, always fill the holes you leave in the wall', chat, 'simple'],
+    ['clodine good job', build, 'simple']
+  ]) {
+    brain.lastJob = last;
+    assert.equal(brain.firstTier({ player: 'Steve', text }), tier, text);
+  }
 });
 
 test('a job remembers the tier it ended on, so a bare continue can follow work', async () => {
@@ -3431,4 +3687,135 @@ test('a routine done in three earlier jobs is pointed out once, in the next job 
   assert.match(client.calls[3].params.messages[0].content, hint);
   await brain.start({ player: 'Steve', text: 'Clodine dig one more tunnel' });
   assert.doesNotMatch(client.calls[4].params.messages[0].content, /skill save can make it/);
+});
+
+const idleConfig = { ...plain, idle: { freeTimeSeconds: 60, freeTimeSteps: 4 } };
+const okay = () => reply('end_turn', [{ type: 'text', text: 'Okay.' }]);
+const settled = async (brain) => {
+  while (brain.busy) await tick();
+};
+// The first call runs until it's stopped; any other call answers at once.
+function blockingTool() {
+  const ran = [];
+  let started;
+  const ready = new Promise((r) => (started = r));
+  const run = (name, input, signal) => {
+    ran.push(name);
+    if (ran.length > 1) return Promise.resolve({ ok: true, message: `${name} done` });
+    started();
+    return new Promise((resolve) => signal.addEventListener('abort', () => resolve({ ok: false, message: 'stopped' })));
+  };
+  return { ran, ready, run };
+}
+
+test('after a death a trip back goes first on its own, and the request she died doing comes back after it', async () => {
+  const lines = [];
+  const tool = blockingTool();
+  const client = fakeClient([reply('tool_use', [toolUse('a', 'dig_area', { x1: 0, y1: -40, z1: 0, x2: 20, y2: -39, z2: 0 })]), reply('end_turn', [{ type: 'text', text: 'Got my things back.' }]), reply('end_turn', [{ type: 'text', text: 'Tunnel done.' }])]);
+  const { brain, heard } = makeBrain({ client, config: idleConfig, runTool: tool.run, jobLog: { write: (line) => lines.push(line) } });
+  const job = brain.start({ player: 'Steve', text: 'dig the next tunnel', whisper: true });
+  await tool.ready;
+  brain.died({ pos: { x: 10.5, y: -40, z: 3.2 }, dimension: 'minecraft:overworld', at: Date.now() });
+  brain.abortCurrent('death');
+  brain.respawned({ cause: 'Clodine tried to swim in lava' }, 'minecraft:overworld');
+  await job;
+  await settled(brain);
+
+  assert.equal(client.calls.length, 3);
+  const trip = textOf(client.calls[1].params.messages[0].content);
+  assert.match(trip, /You died \d+ seconds? ago at 10 -40 3 in the overworld\. The death message said: "Clodine tried to swim in lava"\./);
+  assert.match(trip, /vanishes 5 minutes after you died, so you have about \d+ (seconds|minutes) left to get it\./);
+  assert.match(trip, /You were doing Steve's request "dig the next tunnel" when you died\. It comes back as a job of its own once this one ends/);
+  assert.match(trip, /don't walk back into it/);
+  assert.doesNotMatch(trip, /respawned in/);
+  const again = textOf(client.calls[2].params.messages[0].content);
+  assert.match(again, /Request from Steve \(whispered\): dig the next tunnel\n\nYou died partway through this request \("Clodine tried to swim in lava"\) and have respawned since/);
+  assert.deepEqual(lines.map((l) => [l.end, l.freeTime, l.recovery ?? false, l.player]), [['death', false, false, 'Steve'], ['done', true, true, null], ['done', false, false, 'Steve']]);
+  assert.deepEqual(heard.at(-1), { text: 'Tunnel done.', to: 'Steve' });
+});
+
+test('the trip back runs on the everyday model, and says when her things are gone or she is in another dimension', async () => {
+  const client = fakeClient([okay()]);
+  const { brain } = makeBrain({ client, config: routedIdle });
+  brain.died({ pos: { x: 0, y: 64, z: 0 }, dimension: 'minecraft:the_nether', at: Date.now() });
+  brain.respawned({}, 'minecraft:overworld');
+  await settled(brain);
+  assert.equal(client.calls[0].params.model, 'claude-sonnet-5-5');
+  const trip = textOf(client.calls[0].params.messages[0].content);
+  assert.match(trip, /in the nether\. You respawned in the overworld\./);
+  assert.match(trip, /You were not doing a job for a player when you died\./);
+  assert.doesNotMatch(trip, /death message/);
+  assert.match(deathText({ pos: { x: 1, y: 2, z: 3 }, at: 0 }, 6 * 60000), /^You died 6 minutes ago at 1 2 3\. .*so it is most likely gone\.$/);
+});
+
+test('dying again near the same spot within a minute of a trip back leaves the things, and a later or far death does not', async () => {
+  const client = fakeClient(() => okay());
+  const { brain, said } = makeBrain({ client, config: idleConfig });
+  const t0 = Date.now();
+  const die = async (x, at) => {
+    brain.died({ pos: { x, y: 64, z: 0 }, dimension: 'overworld', at });
+    brain.respawned({}, 'overworld', at + 1000);
+    await settled(brain);
+  };
+  await die(0, t0);
+  assert.equal(client.calls.length, 1);
+  await die(10, t0 + 30000);
+  assert.equal(client.calls.length, 1);
+  assert.equal(said.at(-1), "I died in the same spot again, so I'm leaving my things there.");
+  await die(200, t0 + 40000);
+  assert.equal(client.calls.length, 2);
+  await die(205, t0 + 40000 + 61000);
+  assert.equal(client.calls.length, 3);
+});
+
+test('a player request already waiting goes first and hears about the death, with no trip of its own', async () => {
+  const client = fakeClient([okay()]);
+  const { brain } = makeBrain({ client, config: idleConfig });
+  brain.pause('offline');
+  brain.enqueue('Alex', 'come here');
+  brain.died({ pos: { x: 4, y: 70, z: -8 }, at: Date.now() });
+  brain.respawned({ cause: 'Clodine was slain by Zombie' });
+  assert.equal(brain.queue.length, 1);
+  brain.resume('offline');
+  await settled(brain);
+  assert.equal(client.calls.length, 1);
+  const first = textOf(client.calls[0].params.messages[0].content);
+  assert.match(first, /Request from Alex: come here\n\nYou died \d+ seconds? ago at 4 70 -8\. The death message said: "Clodine was slain by Zombie"\..* Do what was asked first\./);
+});
+
+test('a player cutting in on the trip back hears about the death, and only one trip waits at a time', async () => {
+  const tool = blockingTool();
+  const client = fakeClient([reply('tool_use', [toolUse('a', 'move_to', { x: 4, y: 70, z: -8 })]), okay()]);
+  const { brain } = makeBrain({ client, config: idleConfig, runTool: tool.run });
+  brain.died({ pos: { x: 4, y: 70, z: -8 }, at: Date.now() });
+  brain.respawned({});
+  await tool.ready;
+  brain.enqueue('Alex', 'come here');
+  await settled(brain);
+  assert.equal(client.calls.length, 2);
+  assert.match(textOf(client.calls[1].params.messages[0].content), /Request from Alex: come here\n\nYou died .* Do what was asked first\./);
+
+  const held = makeBrain({ client: fakeClient([]), config: idleConfig }).brain;
+  held.pause('offline');
+  held.died({ pos: { x: 0, y: 64, z: 0 }, at: Date.now() });
+  held.respawned({});
+  held.died({ pos: { x: 300, y: 64, z: 0 }, at: Date.now() });
+  held.respawned({});
+  assert.deepEqual(held.queue.map((r) => r.recovery?.pos.x), [300]);
+});
+
+test('a request she dies doing a second time is not picked up again', async () => {
+  const tool = blockingTool();
+  const client = fakeClient([reply('tool_use', [toolUse('a', 'mine')]), okay()]);
+  const { brain } = makeBrain({ client, config: idleConfig, runTool: tool.run });
+  const job = brain.start({ player: 'Steve', text: 'mine by the lava', resumed: true });
+  await tool.ready;
+  brain.died({ pos: { x: 0, y: 12, z: 0 }, at: Date.now() });
+  brain.abortCurrent('death');
+  brain.respawned({});
+  await job;
+  await settled(brain);
+  assert.equal(client.calls.length, 2);
+  assert.match(textOf(client.calls[1].params.messages[0].content), /You were doing Steve's request "mine by the lava" when you died, and you had died doing it once before, so it won't be picked up again/);
+  assert.equal(brain.queue.length, 0);
 });

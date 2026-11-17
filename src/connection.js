@@ -146,6 +146,13 @@ export function safeDigTime(bot) {
   bot.digTime = (block) => digTimeFor(bot, block, names);
 }
 
+// The death line's text when it came within DEATH_LINE_MS of the death, or null. Servers can turn
+// death messages off, and then there is none.
+const DEATH_LINE_MS = 5000;
+export function deathCause(line, diedAt) {
+  return line && Math.abs(line.at - diedAt) <= DEATH_LINE_MS ? line.text : null;
+}
+
 export function startBot(config, hooks = {}) {
   const log = hooks.log ?? console.log;
   let bot = null;
@@ -172,8 +179,14 @@ export function startBot(config, hooks = {}) {
       bot.on('physicsTick', () => bot._client.write('tick_end', {}));
     }
 
-    let deathPos = null;
+    let death = null;
     let firstSpawn = true;
+    // The server's death line ("Clodine tried to swim in lava") is a system line that starts with
+    // her name, sent around the time she dies.
+    let deathLine = null;
+    bot.on('messagestr', (message, position) => {
+      if (position === 'system' && message.startsWith(`${bot.username} `)) deathLine = { text: message, at: Date.now() };
+    });
 
     bot.once('spawn', () => setupMovements(bot));
 
@@ -184,16 +197,22 @@ export function startBot(config, hooks = {}) {
         attempt = 0;
         log(`Spawned as ${bot.username} at ${pos.x} ${pos.y} ${pos.z}`);
         hooks.onSpawn?.(bot);
-      } else if (deathPos) {
-        bot.chat(`I died at ${deathPos.x} ${deathPos.y} ${deathPos.z}.`);
-        deathPos = null;
+      } else if (death) {
+        const { x, y, z } = death.pos;
+        bot.chat(`I died at ${x} ${y} ${z}.`);
+        const cause = deathCause(deathLine, death.at);
+        if (cause) log(`Death message: ${cause}`);
+        hooks.onRespawn?.(bot, { ...death, cause });
+        death = null;
+        deathLine = null;
       }
     });
 
     bot.on('death', () => {
-      deathPos = bot.entity.position.floored();
-      log(`Died at ${deathPos.x} ${deathPos.y} ${deathPos.z}`);
-      hooks.onDeath?.(bot, deathPos);
+      const pos = bot.entity.position.floored();
+      death = { pos, dimension: bot.game?.dimension ?? null, at: Date.now() };
+      log(`Died at ${pos.x} ${pos.y} ${pos.z}`);
+      hooks.onDeath?.(bot, death);
     });
 
     bot.on('kicked', (reason) => {

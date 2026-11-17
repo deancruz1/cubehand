@@ -2,7 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
-import { nextDelay, reasonText, isPermanentKick, isWhisperLine, whisperBody, readChat, enchantList, digTimeFor, safeDigTime } from '../src/connection.js';
+import { nextDelay, reasonText, isPermanentKick, isWhisperLine, whisperBody, readChat, enchantList, digTimeFor, safeDigTime, deathCause } from '../src/connection.js';
+
+test('the death message is the system line with her name that came around the time she died', () => {
+  const line = { text: 'Clodine tried to swim in lava', at: 10000 };
+  assert.equal(deathCause(line, 12000), 'Clodine tried to swim in lava');
+  assert.equal(deathCause(line, 7000), 'Clodine tried to swim in lava');
+  assert.equal(deathCause(line, 16000), null);
+  assert.equal(deathCause(null, 10000), null);
+});
 
 const require = createRequire(createRequire(import.meta.url).resolve('mineflayer'));
 const registry = require('prismarine-registry')('26.1');

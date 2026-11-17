@@ -1,11 +1,12 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { wasInterrupted } from './joblog.js';
 
 // A report over jobs.jsonl: what jobs cost, how long they took, where they went wrong.
 // Run with `npm run report -- [path] [--since DATE] [--days N] [--player NAME] [--json]`.
 
-const TROUBLE_ENDS = ['steps', 'time', 'api_error', 'crash', 'refusal', 'max_tokens'];
+const TROUBLE_ENDS = ['steps', 'time', 'api_error', 'crash', 'refusal', 'max_tokens', 'not_understood'];
 const TIER_ORDER = ['simple', 'normal', 'complex'];
 // Tools that steer the job rather than act in the world, left out of sequences.
 const CONTROL_TOOLS = new Set(['escalate', 'finish', 'standing_job']);
@@ -60,7 +61,7 @@ export function asJob(raw) {
     firstMs: typeof s.firstMs === 'number' ? s.firstMs : null,
     tokens: isObject(s.tokens) ? s.tokens : {},
     cost: typeof s.cost === 'number' ? s.cost : null,
-    tools: (Array.isArray(s.tools) ? s.tools : []).filter(isObject).map((t) => ({ ...t, ok: t.ok !== false, interrupted: t.interrupted === true, ms: num(t.ms) }))
+    tools: (Array.isArray(s.tools) ? s.tools : []).filter(isObject).map((t) => ({ ...t, ok: t.ok !== false, interrupted: wasInterrupted(t, startMs), ms: num(t.ms) }))
   }));
   const calls = (Array.isArray(raw.calls) ? raw.calls : []).filter(isObject);
   const tools = steps.flatMap((s) => s.tools);
@@ -275,8 +276,18 @@ function handoverOf(job) {
   const first = job.steps[0].model;
   const next = job.steps.find((s) => s.model !== first) ?? null;
   if (!escalate && !next) return null;
-  return { escalated: Boolean(escalate), to: escalate?.to ?? job.tier, first: job.steps[0], next };
+  return { escalated: Boolean(escalate), to: escalate?.to ?? job.tier, reason: reasonOf(escalate), first: job.steps[0], next };
 }
+
+// The quick model's few words on why it handed a job up, the same however they're cased or
+// ended. Records from before it gave one have none.
+const reasonOf = (escalate) =>
+  typeof escalate?.reason === 'string'
+    ? escalate.reason
+        .toLowerCase()
+        .replace(/[.!\s]+$/, '')
+        .trim() || null
+    : null;
 
 // The record keeps the tier a job ended on, so the tier it started on comes from its first model.
 function startTiers(jobs) {
@@ -312,6 +323,10 @@ function handovers(jobs, tiers, botName) {
     escalated: escalated.length,
     rate: quick.length ? escalated.length / quick.length : null,
     to: Object.fromEntries(countBy(escalated.map((e) => e.handover.to))),
+    reasons: countBy(escalated.map((e) => e.handover.reason).filter(Boolean))
+      .slice(0, 10)
+      .map(([reason, count]) => ({ reason, count })),
+    noReason: escalated.filter((e) => e.handover.escalated && !e.handover.reason).length,
     pairs: countBy(all.map((e) => `${e.from ?? 'unknown'} > ${e.handover.to ?? 'unknown'}`)).map(([pair, count]) => {
       const [from, to] = pair.split(' > ');
       return { from, to, count };
@@ -652,6 +667,13 @@ export function formatReport(report, path = 'jobs.jsonl') {
       `  Quick model jobs   ${h.quickJobs}, ${h.escalated} escalated (${pct(h.rate)})` +
         (h.escalated ? `: ${Object.entries(h.to).map(([to, n]) => `${n} to ${to}`).join(', ')}` : '')
     ];
+    // Older records give no reason, so the table only shows once some job has one.
+    if (h.reasons.length) {
+      const rows = h.reasons.map((r) => [r.reason.slice(0, 40), r.count]);
+      if (h.noReason) rows.push(['(none given)', h.noReason]);
+      lines.push('  Reasons given for escalating:');
+      lines.push(...table(['reason', 'jobs'], rows).map((l) => `  ${l}`));
+    }
     if (h.escalated) {
       lines.push(`  First step         median ${secs(h.firstStepMsMedian)}s, ${secs(h.firstStepMsTotal)}s and ${money(h.firstStepCost)} in all`);
       if (h.nextStepMsMedian !== null) lines.push(`  Next step          median ${secs(h.nextStepMsMedian)}s and ${money(h.nextStepCostMedian)} on the new model`);

@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { wasInterrupted } from './joblog.js';
 
 const MAX_LESSONS = 200;
 const MAX_TEXT = 200;
@@ -279,10 +280,8 @@ export function asText(lessons) {
 // Ends that say nothing about how the bot went about the job.
 const NO_LESSON_ENDS = new Set(['shutdown', 'death', 'replaced', 'api_error', 'crash', 'refusal', 'max_tokens', 'busy_reply', 'danger', 'offline', 'player']);
 const TROUBLE_ENDS = new Set(['steps', 'time', 'stop']);
-// A tool stopped by a change, a hold, a stop or a lost connection didn't fail on its own. The brain
-// marks those it stopped; older records only have the text.
-const INTERRUPTED = /Stopped because (?:a player just changed the instructions|you had to look after yourself|the connection to the server dropped)/;
-const interrupted = (t) => t.interrupted === true || INTERRUPTED.test(t.error ?? '');
+// A tool stopped by a change, a hold, a stop or a lost connection didn't fail on its own.
+const interrupted = (t) => wasInterrupted(t);
 
 // A skill call that only saves, lists or forgets routines says nothing about the job itself, and
 // neither does saving or pausing the standing job.

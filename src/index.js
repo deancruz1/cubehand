@@ -9,6 +9,7 @@ import { Standing } from './standing.js';
 import { Memory } from './memory.js';
 import { PlacedLog, ScaffoldLog } from './placed.js';
 import { ChestIndex } from './chests.js';
+import { Tended } from './tended.js';
 import { runAction } from './actions/index.js';
 import { chatLines } from './actions/chat.js';
 import { findPlayer } from './actions/movement.js';
@@ -51,6 +52,7 @@ const memory = new Memory();
 const placed = new PlacedLog();
 const scaffold = new ScaffoldLog();
 const chests = new ChestIndex();
+const tended = new Tended('tended.json');
 const standing = new Standing('standing.json');
 const areas = new AreaRecorder();
 const travel = new TravelLog();
@@ -94,7 +96,7 @@ const status = new Status({
   quietSeconds: config.limits.quietSeconds
 });
 // requester is the player whose job is running, or null for the bot's own chores.
-const makeCtx = (signal) => ({ bot: currentBot(), config, signal, memory, placed, areas, smeltJobs, status, skills, log, requester: brain.current?.self ? null : brain.current?.player ?? null });
+const makeCtx = (signal) => ({ bot: currentBot(), config, signal, memory, placed, tended, areas, smeltJobs, status, skills, log, requester: brain.current?.self ? null : brain.current?.player ?? null });
 
 function snapshot() {
   const bot = currentBot();
@@ -129,6 +131,8 @@ const brain = new Brain({
   snapshot,
   runTool: (name, input, signal, requester) => {
     reflex.toolStarting(brain.current);
+    // A player's job told to stand still stays still afterwards too, not back to chores.
+    if (name === 'stop_moving' && brain.current && !brain.current.self && !brain.current.standing) idle.hold();
     const ctx = makeCtx(signal);
     return runAction(requester ? { ...ctx, requester } : ctx, name, input);
   },
@@ -155,7 +159,7 @@ const survival = new Survival({
     return idle.interrupt();
   }
 });
-const idle = new Idle({ getBot: currentBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold, memory, reflexWalking: () => reflex.walking });
+const idle = new Idle({ getBot: currentBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold, memory, tended, reflexWalking: () => reflex.walking });
 const reflex = new Reflex({ getBot: currentBot, brain, idle, config, makeCtx, log, say });
 const gestures = new Gestures({ getBot: currentBot, brain, survival, idle, config, toolRunning: () => Boolean(status.run || brain.current?.tool || reflex.walking) });
 survival.start();
@@ -184,18 +188,30 @@ function onMessage(username, message, whisper) {
   if (allowed && result.type !== 'stop' && isCorrection(message, [config.bot.username])) brain.correct(username, message);
   gestures.notice(username);
   if (result.type === 'stop') {
-    // Stand still for a bit instead of going straight back to chores.
-    idle.hold(60000);
+    // Stand still until they ask for something, instead of going straight back to chores.
+    idle.hold();
     reflex.cancel();
     brain.stop(whisper ? username : null, username);
+    // "stop and come here": the rest goes to the model as a new job. One the stop ended is still
+    // winding down and starts it from the queue, so it isn't taken for a message mid-job.
+    if (result.text) {
+      noteRequest(username, result.text);
+      if (brain.busy) brain.queue.push({ player: username, text: result.text, whisper, reflex: 'stop' });
+      else brain.enqueue(username, result.text, whisper, 'stop');
+    }
   } else if (result.type === 'request') {
-    // Where they stood, so "here" or "this hill" still means something later.
-    const bot = currentBot();
-    requests.add(username, result.text, bot?.entity ? findPlayer(bot, username)?.position : null);
+    idle.release();
+    noteRequest(username, result.text);
     // A plain come, follow or stay starts moving now, before the model has answered.
     const kind = reflex.fire(username, result, whisper);
     brain.enqueue(username, result.text, whisper, kind);
   }
+}
+
+// Where they stood, so "here" or "this hill" still means something later.
+function noteRequest(username, text) {
+  const bot = currentBot();
+  requests.add(username, text, bot?.entity ? findPlayer(bot, username)?.position : null);
 }
 
 let stopping = false;
@@ -213,6 +229,7 @@ connection = startBot(config, {
     bot.placedLog = placed;
     bot.walkScaffold = scaffold;
     bot.chestIndex = chests;
+    bot.tended = tended;
     // Find the sender by UUID instead of parsing the name, so team prefixes don't break it. Whispers
     // are read here too: Mineflayer's whisper event takes the name from the text, which public
     // chat, a "/me" or a server line can fake, so it is not used.
@@ -251,12 +268,14 @@ connection = startBot(config, {
     }, 3000);
     bot.once('end', () => clearInterval(glance));
   },
-  onDeath: () => {
+  // The job she died doing is noted before it's stopped, so it can come back after the respawn.
+  onDeath: (bot, death) => {
+    brain.died(death);
     brain.abortCurrent('death');
-    brain.died();
     reflex.cancel();
     idle.interrupt();
   },
+  onRespawn: (bot, death) => brain.respawned(death, bot.game?.dimension ?? null),
   onEnd: ({ reconnecting }) => {
     auth.reset();
     reflex.cancel();

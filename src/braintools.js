@@ -24,8 +24,8 @@ export const BRAIN_TOOLS = [
   ),
   tool(
     'escalate',
-    'Hand this job to a model that thinks more: normal for everyday jobs, complex for building or anything that needs a plan. Only when the request asks you to sort the job first, and then as the only call in your response. Never otherwise.',
-    { to: { type: 'string', enum: ['normal', 'complex'] } },
+    'Hand this job to a model that thinks more: normal for everyday jobs, complex for building or anything that needs a plan. Only when the request asks you to sort the job first, and then as the only call in your response. Never otherwise. reason says in a few words why you hand it on, like "fixing a build" or "needs a plan".',
+    { to: { type: 'string', enum: ['normal', 'complex'] }, reason: { type: 'string' } },
     ['to']
   ),
   tool(

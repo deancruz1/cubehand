@@ -43,11 +43,16 @@ const BANNED = {
   remember: 'memories are yours to keep, not something to repeat',
   forget: 'memories are yours to keep, not something to repeat',
   build_house: 'a build is one call already and needs you to check it',
-  build_structure: 'a build is one call already and needs you to check it'
+  build_structure: 'a build is one call already and needs you to check it',
+  copy_structure: 'a build is one call already and needs you to check it',
+  break_blocks: 'it breaks built blocks, which needs a player to say so each time',
+  enchant: 'the offers change every time, and you need to read them to choose'
 };
 export const NOT_IN_SKILLS = new Set(Object.keys(BANNED));
 // Flags that a player has to give for the job at hand, or that only look, so a skill never sets them.
-const ONLY_FALSE = ['confirmed', 'dry_run', 'plan_only'];
+const ONLY_FALSE = ['confirmed', 'dry_run', 'plan_only', 'list'];
+// Flags a skill may not turn off: tend false stops her looking after a field or pen for good.
+const NEVER_FALSE = ['tend'];
 // Stops by the brain's own watchers count against the skill; a player stopping it doesn't.
 const FAILED_ABORTS = new Set(['stuck', 'too_long']);
 
@@ -152,6 +157,9 @@ function stepProblem(tool, input, schemas, at, open) {
   if (bad) return bad;
   for (const flag of ONLY_FALSE) {
     if (flag in input && input[flag] !== false) return `${at}: a skill can't set ${flag}, ${flag === 'confirmed' ? 'a player has to confirm that each time' : 'it only looks'}`;
+  }
+  for (const flag of NEVER_FALSE) {
+    if (input[flag] === false) return `${at}: a skill can't set ${flag} false, that stops you looking after the place for good`;
   }
   return checkSchema(input, schema, `${at} ${tool}`, open);
 }

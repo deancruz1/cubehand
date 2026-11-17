@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { meters, costOf, JobRecord, JobLog, LogFile, RefusalLog, summaryLine } from '../src/joblog.js';
+import { meters, costOf, JobRecord, JobLog, LogFile, RefusalLog, summaryLine, wasInterrupted, FLAGGED_SINCE } from '../src/joblog.js';
 
 test('meters keep the cache write split when the API gives one', () => {
   assert.deepEqual(meters({ input_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 3, output_tokens: 4 }), {
@@ -71,6 +71,19 @@ test('a tool call stopped from outside keeps its interrupted mark in the line, a
   const [stopped, failed] = JSON.parse(JSON.stringify(record.finish('done'))).steps[0].tools;
   assert.equal(stopped.interrupted, true);
   assert.equal('interrupted' in failed, false);
+});
+
+test('a call counts as stopped from outside by its mark, the brain note, or on an older line its own word', () => {
+  const said = { name: 'dig_area', ok: false, error: 'dug 30 blocks. Stopped early: stopped\nNow at 1 2 3.' };
+  const noted = { name: 'move_to', ok: false, error: 'stopped (Stopped because you had to look after yourself, see below.)' };
+  assert.equal(wasInterrupted({ ...said, interrupted: true }), true);
+  assert.equal(wasInterrupted(noted), true);
+  assert.equal(wasInterrupted(said), false);
+  assert.equal(wasInterrupted(said, FLAGGED_SINCE), false);
+  assert.equal(wasInterrupted(said, FLAGGED_SINCE - 1), true);
+  assert.equal(wasInterrupted(said, '2026-11-15T08:00:00.000Z'), true);
+  assert.equal(wasInterrupted({ name: 'dig_area', ok: false, error: 'dug 0 blocks' }, '2026-11-15T08:00:00.000Z'), false);
+  assert.equal(wasInterrupted({ name: 'mine', ok: false, error: 'mined 3 (Stopped because you had to get out of water, lava or fire, see below.)' }), true);
 });
 
 test('a held job records its holds, and the summary says how long it was held', () => {

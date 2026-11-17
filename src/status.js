@@ -72,10 +72,11 @@ export class Status {
   }
 
   // Called by tools as they go, like "placed 80 of 700 blocks".
-  progress(text) {
+  progress(text, now = Date.now()) {
     if (!this.run) return;
+    if (text !== this.run.progress) this.run.progressAt = now;
     this.run.progress = text;
-    this.run.active = Date.now();
+    this.run.active = now;
   }
 
   // A walking problem from the movement code, kept for the next stuck report.
@@ -84,10 +85,11 @@ export class Status {
   }
 
   // Watches a tool while it runs. controller is aborted with 'stuck' if nothing happens for too long.
+  // progressAt() is when its progress line last changed, or null while it has reported none.
   watch(name, controller) {
     const bot = this.getBot();
     const now = Date.now();
-    const run = { name, controller, started: now, active: now, pos: bot?.entity?.position.clone(), items: itemKey(bot), progress: null };
+    const run = { name, controller, started: now, active: now, pos: bot?.entity?.position.clone(), items: itemKey(bot), progress: null, progressAt: null };
     this.run = run;
     const timer = setInterval(() => this.check(run), 1000);
     timer.unref?.();
@@ -97,7 +99,8 @@ export class Status {
         this.lastTool = name;
         if (this.run === run) this.run = null;
       },
-      report: () => this.stuckReport(run)
+      report: () => this.stuckReport(run),
+      progressAt: () => run.progressAt
     };
   }
 
