@@ -8,7 +8,7 @@ import { outlineFrom, inArea, areaBounds, AreaRecorder, TravelLog } from '../src
 import { Memory } from '../src/memory.js';
 import { recordArea } from '../src/actions/memory.js';
 import { smeltOutput, inputFor, pickFuel, smelt } from '../src/actions/furnace.js';
-import { pickFood, needsFood, preyNear, recoveryReport, Survival, isThreat, threatsNear, getFood } from '../src/survival.js';
+import { pickFood, needsFood, preyNear, recoveryReport, Survival, isThreat, threatsNear, getFood, flee } from '../src/survival.js';
 import { canSleepNow } from '../src/actions/bed.js';
 import { craft } from '../src/actions/crafting.js';
 import { Brain } from '../src/brain.js';
@@ -152,6 +152,46 @@ test('hunting skips penned and named animals, and the last two of a kind', () =>
     blockAt: (p) => ({ name: p.equals(fence) ? 'oak_fence' : 'grass_block' })
   };
   assert.deepEqual(preyNear(bot, 40).map((e) => e.position.x), [5, 6, 7]);
+});
+
+test('hunting spares babies, and they do not count toward the two left to breed', () => {
+  const keys = [...Array(16).fill('other'), 'baby'];
+  const animal = (x, baby = false) => {
+    const metadata = [];
+    metadata[16] = baby;
+    return { name: 'pig', position: new Vec3(x, 64, 0), metadata };
+  };
+  const bot = {
+    entity: { position: new Vec3(0, 64, 0) },
+    registry: { entitiesByName: { pig: { metadataKeys: keys } } },
+    entities: { 1: animal(3, true), 2: animal(4), 3: animal(5), 4: animal(6), 5: animal(2, true) },
+    blockAt: () => ({ name: 'grass_block' })
+  };
+  assert.deepEqual(preyNear(bot).map((e) => e.position.x), [4, 5, 6]);
+  delete bot.entities[4];
+  assert.deepEqual(preyNear(bot), []);
+});
+
+test('fleeing puts a shield in the off hand, leaves it down, and puts back what was there', async () => {
+  const torch = { name: 'torch', count: 2 };
+  const items = [{ name: 'shield', count: 1 }];
+  const calls = [];
+  const bot = {
+    entity: { position: new Vec3(0, 64, 0) },
+    inventory: { items: () => items, slots: { 45: torch } },
+    pathfinder: { goto: async () => calls.push('goto'), setGoal: () => {} },
+    equip: async (item, where) => {
+      calls.push(`${item.name} ${where}`);
+      items.splice(items.indexOf(item), 1);
+      items.push(bot.inventory.slots[45]);
+      bot.inventory.slots[45] = item;
+    },
+    activateItem: () => calls.push('raise'),
+    deactivateItem: () => calls.push('lower')
+  };
+  await flee({ bot }, [{ position: new Vec3(3, 64, 0) }]);
+  assert.deepEqual(calls, ['shield off-hand', 'goto', 'torch off-hand']);
+  assert.equal(bot.inventory.slots[45], torch);
 });
 
 test('beds work at night or in a thunderstorm', () => {

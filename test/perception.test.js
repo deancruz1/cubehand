@@ -158,6 +158,18 @@ test('status shows whole-number position and labels', () => {
   assert.match(text, /Time: night/);
 });
 
+test('status shows air only when it is not full, and says when she is in water, lava or on fire', () => {
+  const base = { position: new Vec3(0, 61, 0), yaw: 0, health: 7, food: 20, dimension: 'overworld', gameMode: 'survival', timeOfDay: 14000 };
+  const dry = statusSummary({ ...base, air: 20 });
+  assert.match(dry, /Health: 7\/20, Food: 20\/20\n/);
+  assert.doesNotMatch(dry, /Air|water|lava|fire/i);
+  const under = statusSummary({ ...base, air: 6, inWater: true, headUnder: true });
+  assert.match(under, /Health: 7\/20, Food: 20\/20, Air: 6\/20\nIn water, head under water\n/);
+  assert.match(statusSummary({ ...base, inWater: true }), /\nIn water\n/);
+  assert.match(statusSummary({ ...base, inLava: true, burning: true }), /\nIn lava, on fire\n/);
+  assert.match(statusSummary({ ...base, burning: true }), /\nOn fire\n/);
+});
+
 test('walk scaffolding left standing gets a line, and none when there is none', () => {
   const here = new Vec3(0.5, 64, 0.5);
   assert.equal(scaffoldSummary([], here), null);

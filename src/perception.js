@@ -2,7 +2,8 @@ import { Vec3 } from 'vec3';
 import { reasonText } from './connection.js';
 import { customName } from './actions/util.js';
 import { isNaturalBlock } from './actions/movement.js';
-import { droppedItem } from './actions/items.js';
+import { droppedItem, isWater } from './actions/items.js';
+import { headBlock, onFire } from './survival.js';
 import { contentsText } from './chests.js';
 
 const AIR = new Set(['air', 'cave_air', 'void_air']);
@@ -178,15 +179,25 @@ export function droppedItemsSummary(items, origin, radius) {
   return `Dropped items on the ground within ${radius}: ${lines.join('; ')}`;
 }
 
-export function statusSummary({ position, yaw, health, food, dimension, gameMode, timeOfDay }) {
+// air is 0 to 20 and only shown when it isn't full. inWater, headUnder, inLava and burning add a
+// line saying so.
+export function statusSummary({ position, yaw, health, food, air = 20, inWater, headUnder, inLava, burning, dimension, gameMode, timeOfDay }) {
   const p = position.floored();
+  const body = [];
+  if (inLava) body.push('In lava');
+  else if (headUnder) body.push('In water, head under water');
+  else if (inWater) body.push('In water');
+  if (burning) body.push(body.length ? 'on fire' : 'On fire');
   return [
     `Position: ${p.x} ${p.y} ${p.z}`,
     `Facing: ${facingFromYaw(yaw)}`,
-    `Health: ${Math.round(health)}/20, Food: ${food}/20`,
+    `Health: ${Math.round(health)}/20, Food: ${food}/20${air < 20 ? `, Air: ${air}/20` : ''}`,
+    body.length ? body.join(', ') : null,
     `Dimension: ${dimension}, Game mode: ${gameMode}`,
     `Time: ${timeLabel(timeOfDay)} (${timeOfDay})`
-  ].join('\n');
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 // Lines from players who aren't on the allowlist are marked, since they can't give the bot jobs
@@ -474,12 +485,18 @@ export function buildSnapshot(bot, config, chatMessages, memories) {
     for (const c of storage) c.seen = chests.find(c.parts[0], dim);
   }
 
+  const head = headBlock(bot);
   return [
     statusSummary({
       position: bot.entity.position,
       yaw: bot.entity.yaw,
       health: bot.health,
       food: bot.food,
+      air: bot.oxygenLevel ?? 20,
+      inWater: Boolean(bot.entity.isInWater) || isWater(bot.blockAt(origin, false)),
+      headUnder: isWater(head),
+      inLava: Boolean(bot.entity.isInLava),
+      burning: onFire(bot.entity),
       dimension: bot.game.dimension,
       gameMode: bot.game.gameMode,
       timeOfDay: bot.time.timeOfDay
