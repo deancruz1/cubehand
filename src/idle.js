@@ -3,13 +3,15 @@ import pathfinderPkg from 'mineflayer-pathfinder';
 import { pause, delay, posText } from './actions/util.js';
 import { walkTo, useMoveMode, scaffoldRemovable, underBot } from './actions/movement.js';
 import { attackEntity } from './actions/combat.js';
-import { collectDrops, dropsNear, leftThere } from './actions/items.js';
+import { collectDrops, dropsNear, leftThere, wetDrop } from './actions/items.js';
 import { findNearest, digBlock, inReach } from './actions/blocks.js';
 import { DigSpot } from './actions/mining.js';
 import { sleep, canSleepNow, ownBed } from './actions/bed.js';
 import { smelt, readyJob, rawFoodToCook } from './actions/furnace.js';
 import { needsFood, hasFood, eatBest, isThreat, isDeadly, threatsNear, flee, getFood } from './survival.js';
 import { tidyDue, tidyNotes } from './memory.js';
+import { ripeNear, tendFields } from './actions/farm.js';
+import { pensDue, tendPens } from './actions/husbandry.js';
 import { JobRecord } from './joblog.js';
 
 const { GoalNear, GoalFollow } = pathfinderPkg.goals;
@@ -21,14 +23,20 @@ const TIDY_GROUP = 6;
 // Where the notes from before a tidy go, and how long between looks at whether one is due.
 const NOTE_BACKUPS = 'logs/memory-backups';
 const NOTES_CHECK_MS = 10 * 60000;
+// The longest a stop keeps chores off when no player asks for anything after it.
+const HOLD_MS = 10 * 60000;
+// How often at most she tends the fields and pens she was asked to, and looks for ripe crops.
+const TEND_MS = 10 * 60000;
+const RIPE_CHECK_MS = 60000;
 
 // What the bot does on its own between jobs, one chore at a time, most urgent first. A player's
 // request stops the chore right away.
 export class Idle {
   // reflexWalking() is true while a walk started on a player's "come here" is still going.
   // scaffold is the ScaffoldLog of blocks her walks left standing, and memory the notes, which
-  // she tidies once in a while (see tidyNotes in memory.js) into noteBackups.
-  constructor({ getBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold = null, memory = null, noteBackups = NOTE_BACKUPS, reflexWalking = () => false }) {
+  // she tidies once in a while (see tidyNotes in memory.js) into noteBackups. tended is the
+  // Tended store of fields and pens she looks after.
+  constructor({ getBot, brain, survival, config, makeCtx, log, smeltJobs, placed, scaffold = null, memory = null, tended = null, noteBackups = NOTE_BACKUPS, reflexWalking = () => false }) {
     this.getBot = getBot;
     this.brain = brain;
     this.survival = survival;
@@ -40,6 +48,7 @@ export class Idle {
     this.placed = placed;
     this.scaffold = scaffold;
     this.memory = memory;
+    this.tended = tended;
     this.noteBackups = noteBackups;
     this.running = null;
     this.until = new Map();
@@ -68,21 +77,32 @@ export class Idle {
     await Promise.race([run.done, delay(5000)]);
   }
 
-  // No chores for a while, like after a player says stop.
-  hold(ms) {
+  // After a player says stop or stay: only the chores that keep her alive, until release() or
+  // ms from now. One of those already going carries on.
+  hold(ms = HOLD_MS) {
     this.holdUntil = Date.now() + ms;
-    if (this.running) this.running.follow = null;
-    this.interrupt();
+    if (!this.running) return;
+    this.running.follow = null;
+    if (!this.running.survival) this.interrupt();
+  }
+
+  // A player asked for something, so the stop that held chores is over.
+  release() {
+    this.holdUntil = 0;
+  }
+
+  get held() {
+    return Date.now() < this.holdUntil;
   }
 
   tick() {
     const bot = this.getBot();
     if (this.brain.busy) this.anchor = null;
     if (!bot?.entity || this.running || this.brain.busy || this.brain.paused) return;
-    if (this.survival.recovering || bot.isSleeping || bot.health <= 0 || Date.now() < this.holdUntil || this.reflexWalking()) return;
+    if (this.survival.recovering || bot.isSleeping || bot.health <= 0 || this.reflexWalking()) return;
     // With chores off, a standing job still gets its rounds.
     if (!this.config.idle.enabled) {
-      if (this.brain.standingActive && !bot.pathfinder?.goal) this.brain.standingRound();
+      if (this.brain.standingActive && !bot.pathfinder?.goal && !this.held) this.brain.standingRound();
       return;
     }
     this.anchor ??= bot.entity.position.clone();
@@ -91,7 +111,7 @@ export class Idle {
     this.log(`[idle] ${chore.name}`);
     // A chore that walks replaces a follow goal, so it is put back afterwards.
     const goal = bot.pathfinder.goal;
-    const run = { controller: new AbortController(), done: null, follow: goal instanceof GoalFollow ? goal : null };
+    const run = { controller: new AbortController(), done: null, follow: goal instanceof GoalFollow ? goal : null, survival: Boolean(chore.survival) };
     run.done = chore
       .run(this.makeCtx(run.controller.signal))
       .catch((err) => this.log(`[idle] ${chore.name} failed: ${err.message}`))
@@ -112,13 +132,14 @@ export class Idle {
     const here = bot.entity.position;
 
     if (needsFood(bot, survival.eatAtFood) && hasFood(bot) && this.ready('eat')) {
-      return { name: 'eat', run: () => eatBest(bot).then(() => this.later('eat', 10000)) };
+      return { name: 'eat', survival: true, run: () => eatBest(bot).then(() => this.later('eat', 10000)) };
     }
     const defend = this.threat(bot);
-    if (defend) return defend;
+    if (defend) return { ...defend, survival: true };
     if (bot.food <= 12 && !hasFood(bot) && this.ready('food')) {
       return {
         name: 'find food',
+        survival: true,
         run: async (ctx) => {
           const got = await getFood(ctx);
           if (got) {
@@ -132,7 +153,7 @@ export class Idle {
     }
 
     // Following someone: stay with them.
-    if (bot.pathfinder.goal) return null;
+    if (bot.pathfinder.goal || this.held) return null;
 
     // Only her own bed, so she never takes a player's.
     const bed = canSleepNow(bot) && this.ready('sleep') && threatsNear(bot, 12).length === 0 ? ownBed(bot, this.placed) : null;
@@ -170,7 +191,7 @@ export class Idle {
         }
       };
     }
-    const leave = (e) => leftThere(bot, e) || Math.abs(e.position.y - here.y) >= 3;
+    const leave = (e) => leftThere(bot, e) || Math.abs(e.position.y - here.y) >= 3 || wetDrop(bot, e);
     if (this.ready('pickup') && dropsNear(bot, here, 6).some((e) => !leave(e))) {
       return {
         name: 'pick up items',
@@ -183,6 +204,17 @@ export class Idle {
     const tops = this.ready('tidy') ? this.scaffoldTops(bot) : [];
     if (tops.length && threatsNear(bot, 12).length === 0) {
       return { name: 'take down scaffolding I left', run: (ctx) => this.tidy(ctx, tops) };
+    }
+    // The fields and pens she was asked to look after, not while a standing job has her time.
+    const dimension = bot.game?.dimension ?? null;
+    if (this.tended && !this.brain.standingActive && this.ready('fields')) {
+      const fields = this.tended.list('fields', dimension);
+      if (fields.length && ripeNear(bot, fields)) return { name: 'tend the fields', run: (ctx) => this.tendFields(ctx, fields) };
+      this.later('fields', RIPE_CHECK_MS);
+    }
+    if (this.tended && !this.brain.standingActive && this.ready('pens')) {
+      const pens = this.tended.list('pens', dimension);
+      if (pensDue(bot, pens, Date.now()).length) return { name: 'tend the pens', run: (ctx) => this.tendPens(ctx, pens) };
     }
     if (this.memory && !this.brain.standingActive && this.ready('notes')) {
       this.later('notes', NOTES_CHECK_MS);
@@ -310,6 +342,23 @@ export class Idle {
       if (below) queue.push(below);
     }
     if (removed) this.log(`[idle] took down ${removed} blocks of scaffolding`);
+  }
+
+  async tendFields(ctx, fields) {
+    this.later('fields', TEND_MS);
+    const r = await tendFields(ctx, fields);
+    this.log(`[idle] tend the fields: ${r.message.replace(/\n/g, ' | ')}`);
+  }
+
+  // tendPens sets when each pen is due again on the pens themselves, so the store is saved after.
+  async tendPens(ctx, pens) {
+    this.later('pens', TEND_MS);
+    try {
+      const r = await tendPens(ctx, pens);
+      this.log(`[idle] tend the pens: ${r.message.replace(/\n/g, ' | ')}`);
+    } finally {
+      this.tended.save();
+    }
   }
 
   // One call to the everyday model that merges notes about the same place or task. The call goes

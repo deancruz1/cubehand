@@ -95,16 +95,56 @@ test('pause, halt and cancel stop too, with a short tail and the name on either 
   assert.equal(classifyMessage({ username: 'Alex', message: 'pause please', whisper: true }, opts).type, 'stop');
 });
 
-test('a stop word that asks for something else is still a request', () => {
+test('a stop word about a place or a later time is still a request', () => {
   for (const message of [
-    'clodine stop mining and come here',
     'clodine stop by the farm',
+    'Clodine stop at the river and build a bridge',
     'clodine pause for a minute then carry on',
+    'clodine pause when able',
+    'clodine stop once the tunnel is done',
+    'clodine stop after this tunnel and come back',
+    'clodine stop if you see lava',
+    'clodine i think we can stop moving deepslate now',
+    'clodine its ok dont stop strip mining',
+    'clodine proceed with strip mining until we say stop'
+  ]) {
+    assert.deepEqual(classifyMessage({ username: 'Steve', message }, opts), { type: 'request', text: message }, message);
+  }
+});
+
+test('a stop that goes on to ask for something else stops now and keeps the whole message for the model', () => {
+  for (const message of [
+    'clodine stop and come here',
+    'CLODINE STOP WHAT YOU ARE DOING AND COME HERE',
+    'clodine stop strip mining and follow me. i will show you the dimensions of the strip mine so you stick into them',
+    'clodine stop mining and come here',
     'clodine cancel the tower and build a hut',
     'clodine stop here and build a hut',
-    'clodine cancel that and come here'
+    'clodine cancel that and come here',
+    'clodine stop, come here',
+    'no clodine stop it and come back',
+    'clodine stop digging under the house from now on',
+    'clodine stop following me and wait by the door'
   ]) {
-    assert.equal(classifyMessage({ username: 'Steve', message }, opts).type, 'request', message);
+    assert.deepEqual(classifyMessage({ username: 'Steve', message }, opts), { type: 'stop', text: message }, message);
+  }
+});
+
+test('a stop with only what to stop doing, a lead-in or repeats is a plain stop', () => {
+  for (const message of [
+    'clodine. stop breaking',
+    'clodine stop strip mining',
+    'clodine stop breaking blocks please',
+    'clodine stop digging',
+    'clodine stop moving',
+    'Clodine STOP STOP STOP',
+    'no clodine stop!!',
+    'hey clodine, just stop',
+    'clodine stop right now',
+    'clodine stop at once',
+    'clodine pause mining'
+  ]) {
+    assert.deepEqual(classifyMessage({ username: 'Steve', message }, opts), { type: 'stop' }, message);
   }
 });
 
@@ -201,6 +241,36 @@ test('a rule meant to last is told apart from questions, complaints and one-off 
     'Clodine'
   ]) {
     assert.equal(isStandingOrder(message, 'Clodine'), false, message);
+  }
+});
+
+test('any time, anytime, when ever and from now onwards set lasting rules too', () => {
+  for (const message of [
+    // Seen live, lost as a one-off order.
+    'clodine any time the population reaches 50, cull it back down to 10',
+    'anytime you see a creeper, warn us',
+    'when ever the chest is full, use the next one',
+    'from now onwards store ores in the ore chest',
+    'Clodine whenever it rains, go inside',
+    'each time you finish a row, replant it'
+  ]) {
+    assert.equal(isStandingOrder(message, 'Clodine'), true, message);
+  }
+  assert.equal(isStandingOrder('clodine come here any time?', 'Clodine'), false);
+});
+
+test('a message that opens with come, follow or stay is not a work order, wherever the work words come after', () => {
+  for (const message of [
+    // Seen live, sent to the everyday model as a work order.
+    'clodine follow me into the strip mine',
+    'come to the strip mine',
+    'Clodine, stay here while I go mining',
+    'please follow me, then strip mine where I stop'
+  ]) {
+    assert.equal(workOrder(message, 'Clodine'), null, message);
+  }
+  for (const message of ['clodine strip mine here and stay below y 20', 'dig the cellar, then come back', 'mine the iron and follow the vein']) {
+    assert.equal(workOrder(message, 'Clodine'), 'work', message);
   }
 });
 

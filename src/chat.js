@@ -17,11 +17,36 @@ export function classifyMessage({ username, message, whisper = false }, { botNam
   const allowed = allowlist.some((p) => p.toLowerCase() === username.toLowerCase());
   if (!mentioned || !allowed) return { type: 'history' };
 
-  if (isStop(message, name)) return { type: 'stop' };
+  const stop = stopKind(message, botName);
+  if (stop === 'stop') return { type: 'stop' };
+  // The body stops at once, and the whole message then goes to Claude for the rest of it.
+  if (stop === 'more') return { type: 'stop', text: message };
   return { type: 'request', text: message };
 }
 
-const STOP = /^(?:please )?(?:stop|pause|halt|cancel)(?: (?:here|now|that|it|please|everything|what you(?:'|’)?re doing|what you are doing)){0,3}$/;
+const STOP_LEAD = String.raw`^(?:(?:please|no|hey|ok|okay|oh|oi|just|now|wait)\s+)*`;
+const STOP_WORD = String.raw`(?:stop|pause|halt|cancel)`;
+const STOP = new RegExp(`${STOP_LEAD}${STOP_WORD}(?: (?:${STOP_WORD}|here|now|right|there|at once|that|this|it|please|all|everything|moving|what you(?:'|’)?re doing|what you are doing)){0,4}$`);
+// What comes after a stop word at the start, unless it's about a place or a later time ("stop by
+// the farm", "stop at the river", "pause when able", "stop once the tunnel is done").
+const STOP_THEN = new RegExp(`${STOP_LEAD}${STOP_WORD} (?!(?:by|at(?! once)|in|on|over|to|for|when|whenever|once|after|before|if|unless|until|till|as soon as)\\b)(.+)$`);
+// Only what to stop doing: "breaking", "strip mining the wall".
+const DOING = /^(?:\S+ )?(?!(?:bring|thing|nothing|something|anything|everything)\b)\S+ing\b/;
+const GOES_ON = /\b(?:and|then|but|instead|so|come|follow|go|get|bring|stay|wait)\b/;
+
+// 'stop' for a plain stop ("pause.", "Clodine, stop here", "stop it now please", "cancel that
+// Clodine", "stop breaking"), 'more' for a stop that goes on to ask for something else ("stop and
+// come here", "stop what you are doing and come here"), and null for anything else.
+function stopKind(message, botName) {
+  const name = escapeRegex(botName);
+  const words = plainWords(message, name);
+  if (STOP.test(words)) return 'stop';
+  const rest = words.match(STOP_THEN)?.[1];
+  // "stop following me" is the stay reflex.
+  if (!rest || reflexFor(message, botName)) return null;
+  const only = DOING.test(rest) && !GOES_ON.test(rest) && clauses(message, name).length === 1 && !isStandingOrder(message, botName);
+  return only ? 'stop' : 'more';
+}
 
 // The message in lower case without the bot's name or punctuation.
 function plainWords(message, name) {
@@ -33,13 +58,7 @@ function plainWords(message, name) {
     .trim();
 }
 
-// "stop", "pause.", "Clodine, stop here", "stop it now please", "cancel that Clodine". Anything
-// that goes on to ask for something else ("stop by the farm") is a request.
-function isStop(message, name) {
-  return STOP.test(plainWords(message, name));
-}
-
-const LASTING = /\b(?:from now on|from here on|going forward|in (?:the )?future|at all times|always|never|whenever|every ?time|each time|this is (?:an instruction|an order|a rule)|standing order|remember (?:that|this|to)|(?:do not|don't|dont) ever)\b/;
+const LASTING = /\b(?:from now on(?:wards)?|from here on|going forward|in (?:the )?future|at all times|always|never|when ?ever|every ?time|any ?time|each time|this is (?:an instruction|an order|a rule)|standing order|remember (?:that|this|to)|(?:do not|don't|dont) ever)\b/;
 // Those words where they set no rule: "never mind", "I never said that", "you always dig up".
 const NOT_LASTING = /\b(?:never ?mind|(?:i|you|we|she|he|they|it)(?:['’](?:ve|d|s|re|m)| have| has| had| do| does| did| is| are| was| were| am)? (?:never|always)|always wanted)\b/g;
 const QUESTION = /^(?:why|what|how|who|which|where|tell me (?:why|what|how|if|whether)|explain|(?:do|does|did|are|is|have|has) (?:you|i|we|she|he|it|they))\b/;
@@ -71,6 +90,9 @@ const WORK_LEAD = String.raw`^(?:(?:ok|okay|yes|yeah|so|now|then|and|also|just|p
 const WORK_VERB = String.raw`(?:mine(?! (?:is|was|are|has|had|too|either)\b)|mining|dig|digging|tunnel|chop|chopping|gather|collect|craft|smelt|store|deposit|fetch)\b`;
 const WORK = new RegExp(`${WORK_LEAD}${WORK_VERB}`);
 const STRIP_MINE = /(?<!\b(?:stop|quit|no more|don't|dont|do not|never)\s+)\bstrip[ -]?min(?:e|es|ing)\b/;
+// A message that opens with a reflex word is about where she goes, not work: "follow me into the
+// strip mine".
+const GOES = /^(?:please )?(?:come|follow|stay)\b/;
 const CONTINUE = new RegExp(`${WORK_LEAD}(?:continue|resume|proceed|keep going|carry on)(?: (?:it|that|with it|on|now|please|where you left off))*$`);
 
 // The parts of a message between punctuation, in lower case without the bot's name.
@@ -92,6 +114,7 @@ export function workOrder(message, botName) {
   const name = escapeRegex(botName);
   if (QUESTION.test(plainWords(message, name))) return null;
   const parts = clauses(message, name);
+  if (!parts.length || GOES.test(parts[0])) return null;
   if (parts.some((c) => STRIP_MINE.test(c) || WORK.test(c))) return 'work';
   return parts.length === 1 && CONTINUE.test(parts[0]) ? 'continue' : null;
 }

@@ -45,6 +45,7 @@ export class Reflex {
     if (!bot?.entity || bot.isSleeping || bot.vehicle || bot.currentWindow) return null;
     if (kind !== 'stay' && !findPlayer(bot, username)) return null;
     this.log(`[reflex] ${kind} for ${username}`);
+    if (kind === 'stay') this.idle?.hold();
     const order = { kind, username, whisper };
     // Free time is ended by the brain once this request goes in, and a chore by the job's start:
     // the body is only taken once their tool has let go of it.

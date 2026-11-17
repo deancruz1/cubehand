@@ -21,7 +21,7 @@ function setup({ reflexes, comeResult = () => ({ ok: true, message: 'arrived' })
     currentWindow: null
   };
   const brain = { current: null, queue: [], paused: false };
-  const idle = { running: null, interrupt: async () => {} };
+  const idle = { running: null, holds: 0, interrupt: async () => {}, hold: () => idle.holds++ };
   const calls = [];
   const said = [];
   const logs = [];
@@ -98,6 +98,7 @@ test('nothing fires for a player off the allowlist or a message not for the bot'
   assert.equal(s.reflex.fire('Bob', request('Clodine come here', 'Bob')), null);
   assert.equal(s.reflex.fire('Steve', request('come here')), null);
   assert.equal(s.reflex.fire('Steve', request('Clodine stop')), null);
+  assert.equal(s.reflex.fire('Steve', request('Clodine stop and come here')), null);
   assert.deepEqual(s.calls, []);
 });
 
@@ -120,6 +121,15 @@ for (const [why, block] of Object.entries(blockers)) {
     assert.deepEqual(s.calls, []);
   });
 }
+
+test('stay holds chores and come and follow leave them be', () => {
+  const s = setup();
+  s.reflex.fire('Steve', request('Clodine come here'));
+  s.reflex.fire('Steve', request('Clodine follow me'));
+  assert.equal(s.idle.holds, 0);
+  s.reflex.fire('Steve', request('Clodine wait here'));
+  assert.equal(s.idle.holds, 1);
+});
 
 test('stay needs no one to be found', () => {
   const s = setup();
