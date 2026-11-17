@@ -2,8 +2,8 @@ import { Vec3 } from 'vec3';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import { ok, fail, posText, pause, delay } from './util.js';
 import { walkTo, watchScaffold, SCAFFOLD_BLOCKS } from './movement.js';
-import { isTerrain, isBuildTerrain, isLogName, isWild, looksBuilt, isBuiltBlock, buildGrid, nearBuilds, CLEAR_ZONE, falls, dropBelow, holdsUp, DigSpot, isOre, mineVein } from './mining.js';
-import { digBlock, inReach, isProtected, isReplaceable, removeScaffold, needsBetterTool, isOpenBlock, fixToolMaterials, blockReader, placeOne, settle } from './blocks.js';
+import { isTerrain, isBuildTerrain, isLogName, isWild, looksBuilt, isBuiltBlock, buildGrid, nearBuilds, CLEAR_ZONE, falls, dropBelow, holdsUp, DigSpot, isOre, mineVein, LIGHT, lightSupport, lightUp, makeRoom, newTrips, tripsText, fullText, countsWithStored } from './mining.js';
+import { digBlock, inReach, isProtected, isReplaceable, takeDownScaffold, needsBetterTool, isOpenBlock, fixToolMaterials, blockReader, placeOne, settle } from './blocks.js';
 import { collectDrops, gainedText } from './items.js';
 import { nearestFirst } from './build.js';
 
@@ -47,6 +47,12 @@ const FILL_MATCH = {
 };
 const FILL_ANY = ['cobblestone', 'cobbled_deepslate', 'stone', 'deepslate', 'tuff', 'andesite', 'diorite', 'granite', 'blackstone', 'netherrack', 'dirt', 'coarse_dirt'];
 const FILL_RESERVE = 4;
+
+// The filler a hole left by digging a block of name would take, best first.
+function fillOrder(name) {
+  const rock = isOre(name) ? (name.startsWith('deepslate_') ? 'deepslate' : 'stone') : name;
+  return [...new Set([...(FILL_MATCH[rock] ?? []), ...FILL_ANY])];
+}
 const HOLES_MAX = 500;
 
 // Grass, snow layers, vines and the like, which any player clears without a thought.
@@ -60,19 +66,6 @@ export function isPlant(name) {
 
 export function lavaNext(getName, pos) {
   return FACES.some((f) => getName(pos.plus(f)) === 'lava');
-}
-
-// Torches and lanterns a player puts up along a tunnel. Redstone torches are part of a circuit.
-const LIGHT = /^(soul_|copper_)?(wall_)?torch$|(^|_)lantern$/;
-const FACING = { north: [0, -1], south: [0, 1], west: [-1, 0], east: [1, 0] };
-
-// The block a torch or lantern at pos hangs on or stands on, or null when that can't be told.
-function lightSupport(block, pos) {
-  const props = block.getProperties?.() ?? {};
-  if (block.name.endsWith('lantern')) return pos.offset(0, String(props.hanging) === 'true' ? 1 : -1, 0);
-  if (!block.name.includes('wall_')) return pos.offset(0, -1, 0);
-  const f = FACING[props.facing];
-  return f ? pos.offset(-f[0], 0, -f[1]) : null;
 }
 
 // The built block touching pos face to face that digging pos would harm, as { name, pos }, or
@@ -277,8 +270,9 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
       for (let x = min.x - CLEAR_ZONE; x <= max.x + CLEAR_ZONE; x++) {
         for (let y = min.y - CLEAR_ZONE; y <= max.y + CLEAR_ZONE; y++) {
           for (let z = min.z - CLEAR_ZONE; z <= max.z + CLEAR_ZONE; z++) {
-            const b = getBlock(new Vec3(x, y, z));
-            if (b && looksBuilt(b.name, b.boundingBox)) built.push(b.position ?? new Vec3(x, y, z));
+            const q = new Vec3(x, y, z);
+            const b = getBlock(q);
+            if (b && looksBuilt(b.name, b.boundingBox) && !(LIGHT.test(b.name) && ownAt(q, b.name))) built.push(b.position ?? q);
           }
         }
       }
@@ -417,6 +411,16 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
   let lastThrown = null;
   let stopReason = '';
   let face = false;
+  // Before each break: room for its drops, or a trip to a chest. Returns a reason to stop, or ''.
+  const trips = newTrips();
+  let full = '';
+  const roomFor = async (name) => {
+    const room = await makeRoom(ctx, trips, name, fillOrder(name));
+    if (room === 'stopped') return 'stopped';
+    if (!room) return '';
+    full = room.full;
+    return full;
+  };
   const progressText = (y) => {
     const where = face || y === undefined ? '' : `, layer ${max.y - y + 1} of ${max.y - min.y + 1}`;
     return `dug ${dug} of about ${total} blocks${where}${failed.size ? `, ${failed.size} failed` : ''}`;
@@ -499,6 +503,7 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
       const rule = mayBreak;
       mayBreak = () => true;
       const vein = await mineVein(ctx, [next], {
+        beforeDig: (name) => makeRoom(ctx, trips, name, fillOrder(name)),
         onDug: (p, name) => {
           took.set(name, (took.get(name) ?? 0) + 1);
           uncovered.delete(keyOf(p));
@@ -510,12 +515,30 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
       });
       mayBreak = rule;
       if (vein.problem === 'stopped' || signal?.aborted) return 'stopped';
+      if (vein.full) {
+        full = vein.problem;
+        return full;
+      }
       if (vein.problem) veinTrouble = vein.problem;
       if (!feetCell().equals(back)) await stepTo(back);
       if (signal?.aborted) return 'stopped';
       if (await fillHoles(false)) return 'stopped';
     }
     return fillHoles(false);
+  };
+
+  // A torch where the dug space around her is dark: in an open cell of the box, held by a block
+  // outside it, so nothing the dig still has to take holds it.
+  let torches = 0;
+  let noTorches = false;
+  const lightHere = async () => {
+    if (signal?.aborted) return;
+    const lit = await lightUp(ctx, {
+      spot: inBox,
+      hold: (s) => !inBox(s) && !holes.has(keyOf(s)) && !scaffold.placed.some((q) => q.equals(s))
+    });
+    if (lit === 'placed') torches++;
+    else if (lit === 'none') noTorches = true;
   };
 
   // Counts a dig that worked, or a block that stays. Returns a reason to stop, or ''.
@@ -572,6 +595,8 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
             stuck.set(keyOf(c), 'still falling in');
             continue;
           }
+          const room = await roomFor(getName(c));
+          if (room) return room;
           if (!inReach(bot, c)) {
             failed.set(keyOf(c), 'out of reach');
             continue;
@@ -585,6 +610,8 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
           if (stop) return stop;
           if (sandAbove && result.ok) await delay(600);
         }
+        await lightHere();
+        if (signal?.aborted) return 'stopped';
         const stop = await takeOres(s);
         if (stop) return stop;
         continue;
@@ -607,9 +634,12 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
         }
         if (!rest.length) return '';
         const c = nearestFirst(rest, () => eye).next().value;
+        const name = getName(c);
+        const room = await roomFor(name);
+        if (room) return room;
+        if (!inReach(bot, c)) continue;
         forced.add(keyOf(c));
         failed.delete(keyOf(c));
-        const name = getName(c);
         const result = await digBlock(ctx, c);
         const stop = !signal?.aborted || result.ok ? await afterDig(c, name, digResult(result)) : '';
         if (signal?.aborted) return 'stopped';
@@ -673,6 +703,8 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
           }
           const name = getName(p);
           const sandAbove = falls(getName(p.offset(0, 1, 0)));
+          const room = await roomFor(name);
+          if (room) return room;
           const problem = await digOne(p);
           if (problem === 'stopped') return 'stopped';
           const stop = await afterDig(p, name, problem, y);
@@ -681,6 +713,8 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
           if (sandAbove) wait = true;
           const veins = await takeOres(feetCell());
           if (veins) return veins;
+          await lightHere();
+          if (signal?.aborted) return 'stopped';
         }
         if (wait) await delay(600);
       }
@@ -774,14 +808,16 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
   } finally {
     scaffold.stop();
   }
-  let removed = 0;
+  let down = { removed: 0, stopped: false, text: '' };
   try {
-    removed = await removeScaffold(ctx, scaffold.placed);
+    down = await takeDownScaffold(ctx, scaffold.placed);
     const center = new Vec3((min.x + max.x) / 2 + 0.5, (min.y + max.y) / 2, (min.z + max.z) / 2 + 0.5);
     if (!signal?.aborted) await collectDrops(ctx, { center, radius: Math.max(max.x - min.x, max.z - min.z) / 2 + 4, max: 24 });
   } finally {
     unlimit();
   }
+  if (full && stopReason === full) stopReason = fullText(bot, full, `${dug} of about ${total} blocks dug, about ${Math.max(0, total - dug)} still to dig`);
+  if (down.stopped) stopReason = stopReason && stopReason !== 'stopped' ? `${stopReason}; ${down.text}` : down.text;
 
   // What stays in the box and why, top down so sand on a block left is known.
   left.clear();
@@ -815,8 +851,11 @@ export async function digArea(ctx, { x1, y1, z1, x2, y2, z2, ores = false }) {
   }
   const showing = [...uncovered.values()].filter((p) => isOre(getName(p) ?? ''));
   if (showing.length) message += `. Ore showing in the walls, left in place: ${oreText(showing, getName)}`;
-  if (removed) message += `. Took down ${removed} scaffolding blocks`;
-  message += `. Picked up ${gainedText(before, inventoryCounts(bot)) || 'nothing'}, now at ${posText(bot.entity.position)}`;
+  if (down.removed && !down.stopped) message += `. Took down ${down.removed} scaffolding blocks`;
+  if (torches) message += `. Put up ${torches} torches where it was dark`;
+  if (noTorches) message += '. It is dark down here and I have no torches to light it';
+  message += `. Picked up ${gainedText(before, countsWithStored(bot, trips)) || 'nothing'}, now at ${posText(bot.entity.position)}`;
+  message += tripsText(trips);
   if (stopReason) message += `. Stopped early: ${stopReason}`;
   if (dug > 0 || took.size || filled.size) return ok(message);
   if (!stopReason && !left.size) return ok(`nothing to dig: ${message}`);

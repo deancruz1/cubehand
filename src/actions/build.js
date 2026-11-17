@@ -1,9 +1,14 @@
 import { Vec3 } from 'vec3';
+import pathfinderPkg from 'mineflayer-pathfinder';
 import { ok, fail, posText } from './util.js';
-import { placeOne, removeScaffold, digBlock, findReference, referenceWays, isReplaceable } from './blocks.js';
-import { watchScaffold, SCAFFOLD_BLOCKS } from './movement.js';
-import { parseBlock, itemFor, matchesState, stateProblem, placementOptions } from './states.js';
+import { placeOne, takeDownScaffold, digBlock, findReference, referenceWays, isReplaceable, isDoubleSlab, blockStateProblem, protectedReason, inReach, stepOff, isAir } from './blocks.js';
+import { watchScaffold, walkTo, underBot, SCAFFOLD_BLOCKS } from './movement.js';
+import { parseBlock, blockText, stateText, itemFor, matchesState, placementOptions } from './states.js';
+import { takeItems } from './containers.js';
+import { collectDrops, gainedText } from './items.js';
 import { pickSource } from '../chests.js';
+
+const { GoalLookAtBlock } = pathfinderPkg.goals;
 
 // As in blocks.js: how far from the eyes a block can be placed without walking.
 const REACH = 4.5;
@@ -146,10 +151,12 @@ export function planBuild({ origin, blocks, botPos, getName, getBlock, inventory
   const dist = (p) => (p.x - botPos.x) ** 2 + (p.y - botPos.y) ** 2 + (p.z - botPos.z) ** 2;
   placements.sort((a, b) => a.y - b.y || dist(a) - dist(b));
 
+  // A double slab takes two slabs, or one where half of it is in already.
   const needed = new Map();
   for (const p of placements) {
     const item = itemName(p.block);
-    needed.set(item, (needed.get(item) ?? 0) + 1);
+    p.uses = isDoubleSlab(p.block, p.props) && blockAt(p.x, p.y, p.z)?.name !== p.block ? 2 : 1;
+    needed.set(item, (needed.get(item) ?? 0) + p.uses);
   }
   const missing = [];
   for (const [block, need] of needed) {
@@ -164,6 +171,23 @@ export function inventoryCounts(items) {
   const counts = new Map();
   for (const item of items) counts.set(item.name, (counts.get(item.name) ?? 0) + item.count);
   return counts;
+}
+
+// Splits a plan's placements into the ones the carried items cover, taken in plan order (bottom
+// layer first, nearest first), and the ones left for want of items.
+export function withinStock(placements, inventory, itemName = (n) => itemFor(n)) {
+  const left = new Map(inventory);
+  const covered = [];
+  const short = [];
+  for (const p of placements) {
+    const item = itemName(p.block);
+    const uses = p.uses ?? 1;
+    if ((left.get(item) ?? 0) >= uses) {
+      left.set(item, left.get(item) - uses);
+      covered.push(p);
+    } else short.push(p);
+  }
+  return { covered, short };
 }
 
 // Hands out blocks one at a time, always the one closest to here() at that moment. The bot
@@ -554,15 +578,26 @@ export function watchBuildScaffold(bot, site, planned) {
 // "40 spruce_planks in the chest at 2807 64 -5121", for each of names the nearest chest the bot
 // remembers holding it, within 64 blocks.
 export function chestStock(bot, names) {
-  const index = bot.chestIndex;
-  if (!index?.list || !bot.entity) return [];
-  const entries = index.list(bot.game?.dimension);
   const out = [];
   for (const name of names) {
-    const chest = pickSource(entries, new Set([name]), bot.entity.position, new Set(), 64);
+    const chest = rememberedChest(bot, name);
     if (chest) out.push(`${chest.items.find(([n]) => n === name)[1]} ${name} in the ${chest.name} at ${posText(chest.parts[0])}`);
   }
   return out;
+}
+
+function rememberedChest(bot, name) {
+  const index = bot.chestIndex;
+  if (!index?.list || !bot.entity) return null;
+  return pickSource(index.list(bot.game?.dimension), new Set([name]), bot.entity.position, new Set(), 64);
+}
+
+// Takes what a build is short of out of the chests the bot remembers holding it. Null when no
+// chest it knows of has any.
+async function fetchMissing(ctx, missing) {
+  const known = missing.filter((m) => rememberedChest(ctx.bot, m.block));
+  if (known.length === 0) return null;
+  return takeItems(ctx, { items: known.map((m) => ({ item: m.block, count: m.need - m.have })) });
 }
 
 // What to do about items a build is short of, so the bot gets them itself before asking anyone.
@@ -589,17 +624,23 @@ export async function buildStructure(ctx, { origin, blocks = [], parts = [], dry
     return fail(`those parts are far too big, the limit is ${config.limits.maxBuildBlocks} blocks`);
   }
   const all = expandParts(parts, blocks, { slabFor: slabFinder(bot) });
-  const plan = planBuild({
-    origin,
-    blocks: all,
-    botPos: bot.entity.position.floored(),
-    getBlock: (x, y, z) => bot.blockAt(new Vec3(x, y, z), false),
-    inventory: inventoryCounts(bot.inventory.items()),
-    maxBlocks: config.limits.maxBuildBlocks,
-    isKnownBlock: (name) => Boolean(bot.registry.blocksByName[name]),
-    checkState: (name, props) => stateProblem(bot.registry, name, props),
-    itemName: (name) => itemFor(name, bot.registry)
-  });
+  const itemName = (name) => itemFor(name, bot.registry);
+  const makePlan = () => {
+    const inventory = inventoryCounts(bot.inventory.items());
+    const made = planBuild({
+      origin,
+      blocks: all,
+      botPos: bot.entity.position.floored(),
+      getBlock: (x, y, z) => bot.blockAt(new Vec3(x, y, z), false),
+      inventory,
+      maxBlocks: config.limits.maxBuildBlocks,
+      isKnownBlock: (name) => Boolean(bot.registry.blocksByName[name]),
+      checkState: (name, props) => blockStateProblem(bot.registry, name, props),
+      itemName
+    });
+    return { ...made, inventory };
+  };
+  let plan = makePlan();
 
   if (plan.error) return fail(plan.error);
   const needText = [...plan.needed].map(([n, c]) => `${c} ${n}`).join(', ') || 'nothing';
@@ -607,8 +648,19 @@ export async function buildStructure(ctx, { origin, blocks = [], parts = [], dry
   if (dry_run) {
     return ok(`Plan: ${all.length} blocks, ${plan.skipped} already in place. Needs ${needText}.${missingText ? ` Missing: ${missingText}.` : ' I have everything.'}`);
   }
+  // Short of something: first it comes out of the chests the bot remembers, then whatever is
+  // still short is left out and the rest gets built.
+  let fetched = null;
   if (plan.missing.length > 0) {
-    return fail(`missing items: ${missingText}. Nothing was placed. ${missingHelp(bot, plan.missing.map((m) => m.block), 'build_structure with the same plan')}`);
+    fetched = await fetchMissing(ctx, plan.missing);
+    if (fetched) plan = makePlan();
+  }
+  const fetchedText = fetched ? ` From the chests I remember: ${fetched.message}.` : '';
+  const again = 'build_structure with the same plan, which skips what is already in place';
+  const { covered, short } = withinStock(plan.placements, plan.inventory, itemName);
+  if (plan.missing.length > 0 && covered.length === 0) {
+    const stillText = plan.missing.map((m) => `${m.block} (need ${m.need}, have ${m.have}, ${m.need - m.have} more)`).join(', ');
+    return fail(`missing items: ${stillText}. Nothing was placed.${fetchedText} ${missingHelp(bot, plan.missing.map((m) => m.block), again)}`);
   }
 
   // Like build_house: scaffolding may go up next to its own blocks, never made of the build's
@@ -620,18 +672,19 @@ export async function buildStructure(ctx, { origin, blocks = [], parts = [], dry
   const scaffold = watchBuildScaffold(bot, site, site.planned);
   let result;
   try {
-    result = await placeGroups(ctx, groupBlocks(plan.placements), { strays: scaffold.strays });
+    result = await placeGroups(ctx, groupBlocks(covered), { strays: scaffold.strays });
   } finally {
     scaffold.stop();
     bot.buildZone = null;
     bot.buildKeep = null;
   }
-  const removed = await removeScaffold(ctx, scaffold.leftover(plan.placements));
+  const takeDown = await takeDownScaffold(ctx, scaffold.leftover(plan.placements));
 
   const { placed, failures, wrong, stoppedReason, report } = result;
   const tried = failures.length + report.reduce((n, r) => n + (r.gaveUp?.tries ?? 0), 0);
   let message = `placed ${placed}, skipped ${plan.skipped}, failed ${tried}`;
-  if (removed) message += `, took down ${removed} scaffolding blocks`;
+  if (takeDown.text) message += `, ${takeDown.text}`;
+  if (fetched) message += `. From the chests I remember, before building: ${fetched.message}`;
   if (wrong.length > 0) message += `. ${wrong.length} came out turned the wrong way, first: ${wrong.slice(0, 3).join('; ')}`;
   if (report.length > 0) {
     const climb = [...inventoryCounts(bot.inventory.items())].filter(([n]) => SCAFFOLD_BLOCKS.includes(n) && !plan.needed.has(n));
@@ -642,7 +695,279 @@ export async function buildStructure(ctx, { origin, blocks = [], parts = [], dry
     message += `. Left to do, ${count} blocks in ${report.length} group${report.length === 1 ? '' : 's'}: ${report.map((r) => leftText(r, climbText)).join('. ')}`;
   }
   if (stoppedReason) message += `. Stopped early: ${stoppedReason}`;
-  if (report.length > 0) message += '. build_structure with the same plan again skips what is already in place';
+  if (report.length > 0 && short.length === 0) message += '. build_structure with the same plan again skips what is already in place';
+  if (short.length > 0) {
+    const names = new Map();
+    for (const p of short) names.set(p.block, (names.get(p.block) ?? 0) + 1);
+    const what = [...names].map(([n, c]) => `${c} ${n}`).join(', ');
+    const missing = plan.missing.map((m) => `${m.need - m.have} ${m.block}`).join(', ');
+    message += `. Left out ${short.length} blocks (${what}) for want of items, short of ${missing}. ${missingHelp(bot, plan.missing.map((m) => m.block), again)}`;
+  }
   if (placed > 0) return ok(message);
-  return stoppedReason || report.length > 0 || failures.length > 0 ? fail(message) : ok(message);
+  return stoppedReason || report.length > 0 || failures.length > 0 || short.length > 0 ? fail(message) : ok(message);
+}
+
+// Blocks that hold items, which a copy can't bring along.
+const HOLDS_ITEMS = /(^|_)chest$|^barrel$|shulker_box$|furnace$|^smoker$|^hopper$|^dispenser$|^dropper$|^brewing_stand$|^crafter$|^chiseled_bookshelf$|^decorated_pot$|^lectern$|^jukebox$|_shelf$/;
+const NOT_PLACED = new Set(['water', 'lava', 'bubble_column', 'fire', 'soul_fire']);
+const TURN = { north: 'east', east: 'south', south: 'west', west: 'north' };
+
+// A block's state turned a quarter clockwise (seen from above) times times.
+export function turnState(props, times) {
+  const out = { ...props };
+  for (let i = 0; i < times; i++) {
+    if (TURN[out.facing]) out.facing = TURN[out.facing];
+    if (out.axis === 'x') out.axis = 'z';
+    else if (out.axis === 'z') out.axis = 'x';
+  }
+  return out;
+}
+
+// Reads the box min..max into blocks for build_structure, offsets from the lowest north-west
+// corner of the copy, turned rotate degrees clockwise. The upper half of a door or tall plant
+// and the head of a bed come with the other half, so only that one is kept. Blocks no item
+// places, or in a state build_structure can't make, go in leftOut. air has the offsets of the
+// source's air, for what stands in the way at the destination.
+export function copyPlan(bot, min, max, rotate = 0) {
+  const registry = bot.registry;
+  const turns = (((rotate / 90) % 4) + 4) % 4;
+  const cells = [];
+  const air = [];
+  const leftOut = [];
+  const containers = new Map();
+  for (let y = min.y; y <= max.y; y++) {
+    for (let x = min.x; x <= max.x; x++) {
+      for (let z = min.z; z <= max.z; z++) {
+        const p = new Vec3(x, y, z);
+        const b = bot.blockAt(p, false);
+        if (!b) return { error: `part of the source box is not loaded (around ${posText(p)}), walk closer first` };
+        const rel = { dx: x - min.x, dy: y - min.y, dz: z - min.z };
+        if (isAir(b.name)) {
+          air.push(rel);
+          continue;
+        }
+        const raw = b.getProperties?.() ?? {};
+        if (raw.half === 'upper' || raw.part === 'head') continue;
+        const { name, props } = parseBlock(stateText(b));
+        if (props.half === 'lower') delete props.half;
+        if (NOT_PLACED.has(name) || !registry.itemsByName?.[itemFor(name, registry)]) {
+          leftOut.push({ name, why: 'no item places it' });
+          continue;
+        }
+        let problem = blockStateProblem(registry, name, props);
+        if (problem && (props.facing === 'up' || props.facing === 'down')) {
+          delete props.facing;
+          problem = blockStateProblem(registry, name, props);
+        }
+        if (problem) {
+          leftOut.push({ name, why: problem });
+          continue;
+        }
+        if (HOLDS_ITEMS.test(name)) containers.set(name, (containers.get(name) ?? 0) + 1);
+        cells.push({ ...rel, block: blockText(name, turnState(props, turns)) });
+      }
+    }
+  }
+  const turn = ({ dx, dy, dz }) => {
+    for (let i = 0; i < turns; i++) [dx, dz] = [-dz, dx];
+    return { dx, dy, dz };
+  };
+  // Shifted so the turned box starts at 0 0 0 again.
+  const corners = [[0, 0], [max.x - min.x, 0], [0, max.z - min.z], [max.x - min.x, max.z - min.z]].map(([dx, dz]) => turn({ dx, dy: 0, dz }));
+  const sx = Math.min(...corners.map((c) => c.dx));
+  const sz = Math.min(...corners.map((c) => c.dz));
+  const place = (r) => {
+    const t = turn(r);
+    return { ...r, dx: t.dx - sx, dz: t.dz - sz };
+  };
+  return { blocks: cells.map(place), air: air.map(place), leftOut, containers };
+}
+
+const countsText = (names) => {
+  const counts = new Map();
+  for (const n of names) counts.set(n, (counts.get(n) ?? 0) + 1);
+  return [...counts].map(([n, c]) => `${c} ${n}`).join(', ');
+};
+
+// The copy_structure tool: build_structure with the plan read from a box in the world.
+export async function copyStructure(ctx, { x1, y1, z1, x2, y2, z2, origin, rotate = 0, clear = false, dry_run }) {
+  const { bot, config } = ctx;
+  if (![0, 90, 180, 270].includes(rotate)) return fail('rotate is 0, 90, 180 or 270');
+  const min = new Vec3(Math.min(x1, x2), Math.min(y1, y2), Math.min(z1, z2));
+  const max = new Vec3(Math.max(x1, x2), Math.max(y1, y2), Math.max(z1, z2));
+  const volume = (max.x - min.x + 1) * (max.y - min.y + 1) * (max.z - min.z + 1);
+  const limit = config.limits.maxBuildBlocks;
+  if (volume > limit * 20) return fail(`source box is ${volume} blocks, the limit is ${limit * 20} for the box and ${limit} blocks to copy. Copy it in parts.`);
+  const copy = copyPlan(bot, min, max, rotate);
+  if (copy.error) return fail(copy.error);
+  if (copy.blocks.length > limit) return fail(`the source has ${copy.blocks.length} blocks to copy, the limit is ${limit}. Copy it in parts.`);
+
+  const notes = [];
+  if (copy.leftOut.length) {
+    const kinds = new Map();
+    for (const { name, why } of copy.leftOut) {
+      const key = `${name}: ${why}`;
+      kinds.set(key, { name, why, count: (kinds.get(key)?.count ?? 0) + 1 });
+    }
+    notes.push(`Left out ${copy.leftOut.length} blocks build_structure can't place: ${[...kinds.values()].map((k) => `${k.count} ${k.name} (${k.why})`).join(', ')}`);
+  }
+  if (copy.containers.size) notes.push(`Containers are built empty, nothing inside them is copied: ${[...copy.containers].map(([n, c]) => `${c} ${n}`).join(', ')}`);
+  if (clear) {
+    const inWay = [];
+    for (const r of copy.air) {
+      const p = new Vec3(origin.x + r.dx, origin.y + r.dy, origin.z + r.dz);
+      const b = bot.blockAt(p, false);
+      if (b && !isAir(b.name)) inWay.push({ p, name: b.name });
+    }
+    if (inWay.length) {
+      const at = inWay.slice(0, 3).map((w) => posText(w.p)).join('; ');
+      notes.push(`${inWay.length} blocks at the copy stand where the source has air, left as they are: ${countsText(inWay.map((w) => w.name))} (at ${at}${inWay.length > 3 ? '; ...' : ''})`);
+    } else notes.push('nothing at the copy stands where the source has air');
+  }
+  const head = `copy of ${posText(min)} to ${posText(max)}${rotate ? `, turned ${rotate} degrees clockwise,` : ''} at ${posText(origin)}`;
+  const tail = notes.length ? `. ${notes.join('. ')}` : '';
+  if (copy.blocks.length === 0) return ok(`${head}: nothing in the source to copy${tail}`);
+  const built = await buildStructure(ctx, { origin, blocks: copy.blocks, dry_run });
+  return { ...built, message: `${head}: ${built.message}${tail}` };
+}
+
+// Spots in a row break_blocks can't break before it stops.
+const BREAK_GIVE_UP = 5;
+
+// "3 at 1 64 0; 2 64 0; 3 64 0: protected block: chest ...", one line per reason, the first
+// three spots each.
+function reasonsText(left) {
+  const kinds = new Map();
+  for (const { p, why } of left) {
+    const kind = why.replace(/-?\d+/g, 'N');
+    if (!kinds.has(kind)) kinds.set(kind, { why, at: [] });
+    kinds.get(kind).at.push(posText(p));
+  }
+  return [...kinds.values()].map(({ why, at }) => `${at.length} at ${at.slice(0, 3).join('; ')}${at.length > 3 ? '; ...' : ''}: ${why}`).join('. ');
+}
+
+// The break_blocks tool: breaks every block of one kind in the box, with the protections of
+// break_block (see protectedReason), and with replace_with puts that block in each spot right
+// after breaking it. Replacing goes bottom layer first, so each new block has the one under it
+// to go against, and with too few of it only the lowest spots are done. Breaking goes top layer
+// first. Each layer nearest first.
+export async function breakBlocks(ctx, { x1, y1, z1, x2, y2, z2, block, replace_with, confirmed }) {
+  const { bot, config, signal } = ctx;
+  const min = new Vec3(Math.min(x1, x2), Math.min(y1, y2), Math.min(z1, z2));
+  const max = new Vec3(Math.max(x1, x2), Math.max(y1, y2), Math.max(z1, z2));
+  const volume = (max.x - min.x + 1) * (max.y - min.y + 1) * (max.z - min.z + 1);
+  const limit = config.limits.maxDigBlocks ?? 1000;
+  if (volume > limit) return fail(`box is ${volume} blocks, the limit is ${limit}. Do it in parts.`);
+  const { name } = parseBlock(block);
+  if (!bot.registry.blocksByName[name]) return fail(`unknown block: ${name}`);
+  let put = null;
+  if (replace_with) {
+    put = parseBlock(replace_with);
+    if (!bot.registry.blocksByName[put.name]) return fail(`unknown block: ${put.name}`);
+    const problem = blockStateProblem(bot.registry, put.name, put.props);
+    if (problem) return fail(problem);
+    if (put.name === name && !Object.keys(put.props).length) return fail(`replace_with is ${name} too, so nothing would change`);
+  }
+  const props = put && Object.keys(put.props).length ? put.props : undefined;
+
+  const spots = [];
+  for (let y = min.y; y <= max.y; y++) {
+    for (let x = min.x; x <= max.x; x++) {
+      for (let z = min.z; z <= max.z; z++) {
+        const p = new Vec3(x, y, z);
+        const here = bot.blockAt(p, false);
+        if (!here) return fail(`part of the box is not loaded (around y ${y}), walk closer first`);
+        if (here.name === name) spots.push(p);
+      }
+    }
+  }
+  const where = `from ${posText(min)} to ${posText(max)}`;
+  if (spots.length === 0) return ok(`no ${name} in the box ${where}`);
+
+  const left = [];
+  const todo = [];
+  for (const p of spots) {
+    const refused = protectedReason(ctx, bot.blockAt(p, false), p, confirmed);
+    if (refused) left.push({ p, why: refused });
+    else todo.push(p);
+  }
+  todo.sort((a, b) => (put ? a.y - b.y : b.y - a.y));
+  if (put && todo.length) {
+    const item = itemFor(put.name, bot.registry);
+    const uses = isDoubleSlab(put.name, put.props) ? 2 : 1;
+    const have = inventoryCounts(bot.inventory.items()).get(item) ?? 0;
+    const can = Math.floor(have / uses);
+    if (can === 0) return fail(`missing item: ${item}, ${todo.length * uses} needed to replace ${todo.length} ${name}. Nothing was broken. ${missingHelp(bot, [item], 'break_blocks again')}`);
+    for (const p of todo.splice(can)) left.push({ p, why: `not replaced, I only carry ${have} ${item}` });
+  }
+
+  const before = inventoryCounts(bot.inventory.items());
+  const total = todo.length;
+  const center = new Vec3((min.x + max.x) / 2 + 0.5, (min.y + max.y) / 2, (min.z + max.z) / 2 + 0.5);
+  const radius = Math.max(max.x - min.x, max.z - min.z) / 2 + 4;
+  const dist = (p, at) => (p.x + 0.5 - at.x) ** 2 + (p.y + 0.5 - at.y) ** 2 + (p.z + 0.5 - at.z) ** 2;
+  // Ground that is still to be broken won't hold her.
+  const stays = (ground) => !todo.some((q) => q.equals(ground));
+  let broke = 0;
+  let placed = 0;
+  let streak = 0;
+  let stopReason = null;
+  while (todo.length > 0) {
+    if (signal?.aborted) {
+      stopReason = 'stopped';
+      break;
+    }
+    const y = todo[0].y;
+    const at = bot.entity.position.offset(0, 1.6, 0);
+    let best = 0;
+    const sooner = (a, b) => (a.deferred ?? false) - (b.deferred ?? false) || dist(a, at) - dist(b, at);
+    for (let i = 1; i < todo.length && todo[i].y === y; i++) if (sooner(todo[i], todo[best]) < 0) best = i;
+    const p = todo.splice(best, 1)[0];
+    if (bot.blockAt(p, false)?.name === name) {
+      if (!inReach(bot, p)) await walkTo(ctx, new GoalLookAtBlock(p, bot.world, { reach: 4 }), { place: 'climb', dig: true });
+      // The block she stands on: off it first, or once the rest of the layer is done.
+      if (underBot(bot, p) && !(await stepOff(ctx, p, stays))) {
+        if (!p.deferred) {
+          p.deferred = true;
+          const end = todo.findIndex((q) => q.y !== y);
+          todo.splice(end === -1 ? todo.length : end, 0, p);
+        } else left.push({ p, why: 'the block under me, with no ground that stays to step onto' });
+        continue;
+      }
+      const dug = await digBlock(ctx, p);
+      if (!dug.ok) {
+        left.push({ p, why: dug.message });
+        if (++streak >= BREAK_GIVE_UP) {
+          stopReason = `${streak} blocks in a row would not break, last: ${dug.message}`;
+          break;
+        }
+        continue;
+      }
+      broke++;
+      streak = 0;
+      if (put) {
+        const result = await placeOne(ctx, put.name, p, { props });
+        if (result.ok) placed++;
+        else {
+          left.push({ p, why: `broken, but nothing put back: ${result.message}` });
+          if (result.message.startsWith('missing item')) {
+            stopReason = `ran out of ${itemFor(put.name, bot.registry)}`;
+            break;
+          }
+        }
+      }
+      ctx.status?.progress(put ? `replaced ${placed} of ${total} ${name}` : `broke ${broke} of ${total} ${name}`);
+    }
+    if (todo.length > 0 && todo[0].y !== y && !signal?.aborted) await collectDrops(ctx, { center, radius, max: 8 });
+  }
+  if (signal?.aborted && !stopReason) stopReason = 'stopped';
+  for (const p of todo) left.push({ p, why: 'not done before it stopped' });
+  if (!signal?.aborted) await collectDrops(ctx, { center, radius, max: 24 });
+
+  let message = put ? `replaced ${placed} ${name} with ${blockText(put.name, put.props)} ${where}` : `broke ${broke} ${name} ${where}`;
+  if (put && broke > placed) message += ` (broke ${broke})`;
+  if (left.length) message += `. Left ${left.length}: ${reasonsText(left)}`;
+  message += `. Picked up ${gainedText(before, inventoryCounts(bot.inventory.items())) || 'nothing'}, now at ${posText(bot.entity.position)}`;
+  if (stopReason) message += `. Stopped early: ${stopReason}`;
+  return broke > 0 ? ok(message) : fail(message);
 }

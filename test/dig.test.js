@@ -34,7 +34,9 @@ const noPath = () => {
 // (steps, one-block step ups, drops of up to 3) when it can, and with tunnel set it digs a
 // straight 2-high tunnel at its feet to a spot it can't walk to, unless the walk may not break
 // those blocks.
-function fakeBot(blocks, { at = new Vec3(0.5, 64, 0.5), spots = null, fill = (p) => (p.y < 64 ? 'dirt' : 'air'), tunnel = false, items = [], states = {} } = {}) {
+// With light, blocks also carry light and skyLight as light(pos, world) gives them. A torch clicked
+// onto the side of a block comes out as a wall torch facing away from it.
+function fakeBot(blocks, { at = new Vec3(0.5, 64, 0.5), spots = null, fill = (p) => (p.y < 64 ? 'dirt' : 'air'), tunnel = false, items = [], states = {}, light = null } = {}) {
   const world = new Map(Object.entries(blocks));
   const nameAt = (p) => world.get(key(p)) ?? fill(p);
   const open = (p) => boxOf(nameAt(p)) === 'empty' && nameAt(p) !== 'lava';
@@ -83,7 +85,11 @@ function fakeBot(blocks, { at = new Vec3(0.5, 64, 0.5), spots = null, fill = (p)
     stopDigging: () => {},
     placeBlock: async (ref, face) => {
       const item = bot.heldItem ?? items[0];
-      world.set(key(ref.position.plus(face)), item.name);
+      const p = ref.position.plus(face);
+      if (item.name === 'torch' && face.y === 0) {
+        world.set(key(p), 'wall_torch');
+        states[key(p)] = { facing: face.x > 0 ? 'east' : face.x < 0 ? 'west' : face.z > 0 ? 'south' : 'north' };
+      } else world.set(key(p), item.name);
       item.count--;
     },
     moveModes: Object.fromEntries(['walk', 'climb', 'noPlace', 'follow'].map((n) => [n, { exclusionAreasBreak: [] }])),
@@ -125,7 +131,7 @@ function fakeBot(blocks, { at = new Vec3(0.5, 64, 0.5), spots = null, fill = (p)
     },
     blockAt: (p) => {
       const name = nameAt(p);
-      return { name, position: p, boundingBox: boxOf(name), getProperties: () => states[key(p)] ?? {} };
+      return { name, position: p, boundingBox: boxOf(name), getProperties: () => states[key(p)] ?? {}, ...light?.(p, world) };
     },
     canDigBlock: () => true,
     equip: async (item) => {
@@ -767,4 +773,208 @@ test('a dig with ores stopped in the middle of a vein takes the rest and fills t
   assert.equal(bot.world.get('6,63,0'), 'cobbled_deepslate');
   for (let x = 1; x <= 10; x++) for (const y of [64, 65]) assert.equal(bot.world.get(`${x},${y},0`), 'air', `${x} ${y}`);
   assert.equal(bot.dug.every((d) => inside(box)(d.pos) || ores[d.pos]), true);
+});
+// Block light from the torches in the world, falling by one a block, and the given sky light.
+const torchLight = (sky = 0) => (p, world) => {
+  let light = 0;
+  for (const [k, name] of world) {
+    if (name !== 'torch' && name !== 'wall_torch') continue;
+    const [x, y, z] = k.split(',').map(Number);
+    light = Math.max(light, 14 - Math.abs(x - p.x) - Math.abs(y - p.y) - Math.abs(z - p.z));
+  }
+  return { light, skyLight: sky };
+};
+const torchesIn = (bot) => [...bot.world].filter(([, name]) => name === 'torch' || name === 'wall_torch').map(([k]) => k);
+
+test('a dark tunnel gets a torch on the wall at head height about every 8 blocks, held by rock outside the box', async () => {
+  const placed = tempPlaced();
+  try {
+    const items = [{ name: 'torch', count: 10 }];
+    const bot = fakeBot(mineWorld([0, 64, -5, 0, 65, 5]), { at: new Vec3(0.5, 64, 3.5), fill: rock, items, light: torchLight() });
+    const ctx = { ...fakeCtx(bot), config: bigConfig, placed };
+    const box = { x1: 1, y1: 64, z1: 0, x2: 30, y2: 65, z2: 0 };
+    const result = await digArea(ctx, box);
+    assert.equal(result.ok, true, result.message);
+    const torches = torchesIn(bot);
+    assert.match(result.message, new RegExp(`^dug 60 blocks .*\\(60 deepslate\\)\\. Put up ${torches.length} torches where it was dark\\. Picked up nothing`));
+    assert.doesNotMatch(result.message, /Left|no torches/);
+    assert.ok(torches.length >= 3 && torches.length <= 5, torches.join('; '));
+    assert.equal(items[0].count, 10 - torches.length);
+    const xs = torches.map((k) => Number(k.split(',')[0])).sort((a, b) => a - b);
+    for (let i = 1; i < xs.length; i++) assert.ok(xs[i] - xs[i - 1] >= 6 && xs[i] - xs[i - 1] <= 9, xs.join(' '));
+    for (const k of torches) {
+      const p = new Vec3(...k.split(',').map(Number));
+      assert.equal(inside(box)(k), true, k);
+      assert.equal(p.y, 65, k);
+      assert.equal(bot.world.get(k), 'wall_torch', k);
+      // Recorded under the name it came out as, and hung on the tunnel wall, not on a block of it.
+      assert.equal(placed.has(p, 'wall_torch'), true, k);
+      const facing = bot.blockAt(p).getProperties().facing;
+      assert.ok(facing === 'north' || facing === 'south', k);
+    }
+    // The whole tunnel is still dug out next to them.
+    for (let x = 1; x <= 30; x++) for (const y of [64, 65]) assert.ok(['air', 'wall_torch'].includes(bot.world.get(`${x},${y},0`)), `${x} ${y}`);
+
+    // Run again, her torches are part of the open space: nothing is dug and nothing more goes up.
+    const dugBefore = bot.dug.length;
+    const again = await digArea(ctx, box);
+    assert.equal(again.ok, true, again.message);
+    assert.match(again.message, /^nothing to dig: dug 0 blocks/);
+    assert.doesNotMatch(again.message, /Left|torches/);
+    assert.equal(bot.dug.length, dugBefore);
+    assert.deepEqual(torchesIn(bot), torches);
+
+    // A tunnel dug right beside them is not held up by them either.
+    const beside = await digArea(ctx, { x1: 1, y1: 64, z1: 2, x2: 30, y2: 65, z2: 2 });
+    assert.equal(beside.ok, true, beside.message);
+    assert.match(beside.message, /^dug 60 blocks/);
+    assert.doesNotMatch(beside.message, /Left/);
+    for (const k of torches) assert.equal(bot.world.get(k), 'wall_torch', k);
+  } finally {
+    placed.done();
+  }
+});
+
+test('a dark tunnel with no torches says so once, and none go up where daylight reaches or light is unknown', async () => {
+  const box = { x1: 1, y1: 64, z1: 0, x2: 20, y2: 65, z2: 0 };
+  const dark = fakeBot(mineWorld([0, 64, -5, 0, 65, 5]), { at: new Vec3(0.5, 64, 3.5), fill: rock, light: torchLight() });
+  const none = await digArea({ ...fakeCtx(dark), config: bigConfig }, box);
+  assert.equal(none.ok, true, none.message);
+  assert.equal(none.message.match(/It is dark down here and I have no torches to light it/g)?.length, 1, none.message);
+
+  for (const light of [torchLight(9), null]) {
+    const items = [{ name: 'torch', count: 10 }];
+    const bot = fakeBot(mineWorld([0, 64, -5, 0, 65, 5]), { at: new Vec3(0.5, 64, 3.5), fill: rock, items, light });
+    const result = await digArea({ ...fakeCtx(bot), config: bigConfig }, box);
+    assert.equal(result.ok, true, result.message);
+    assert.doesNotMatch(result.message, /torches/);
+    assert.deepEqual(torchesIn(bot), []);
+    assert.equal(items[0].count, 10);
+  }
+
+  // Under open sky with the light not sent (it reads 0), nothing goes up either.
+  const items = [{ name: 'torch', count: 10 }];
+  const trench = fakeBot({}, { at: new Vec3(-1.5, 64, 0.5), items, light: () => ({ light: 0, skyLight: 0 }) });
+  const dug = await digArea({ ...fakeCtx(trench), config: bigConfig }, { x1: 0, y1: 62, z1: 0, x2: 2, y2: 63, z2: 0 });
+  assert.equal(dug.ok, true, dug.message);
+  assert.deepEqual(torchesIn(trench), []);
+  assert.doesNotMatch(dug.message, /torches/);
+});
+
+// A chest at pos the bot remembers, for stash to empty a full inventory into.
+function rememberChest(bot, items, pos) {
+  const CHEST = 900;
+  bot.world.set(key(pos), 'chest');
+  bot.registry.blocksArray.push({ id: CHEST, name: 'chest' });
+  bot.findBlocks = (q) => (q.matching.includes(CHEST) ? [pos] : []);
+  bot.lookAt = async () => {};
+  const stored = new Map();
+  const entry = { key: 'c', dim: 'overworld', name: 'chest', parts: [{ x: pos.x, y: pos.y, z: pos.z }], items: [], free: 27, labels: [] };
+  bot.chestIndex = {
+    list: () => [entry],
+    find: (p) => (p.x === pos.x && p.y === pos.y && p.z === pos.z ? entry : null),
+    record: (r) => Object.assign(entry, { items: [...r.items], free: r.free }),
+    remove: () => {}
+  };
+  bot.openContainer = async () => ({
+    inventoryStart: 27,
+    inventoryEnd: 63,
+    selectedItem: null,
+    containerItems: () => [...stored].map(([name, count]) => ({ name, count })),
+    items: () => items.filter((i) => i.count > 0),
+    deposit: async (type, meta, n) => {
+      let left = n;
+      for (const i of items) {
+        if (i.type !== type || !left) continue;
+        const t = Math.min(i.count, left);
+        i.count -= t;
+        left -= t;
+        stored.set(i.name, (stored.get(i.name) ?? 0) + t);
+      }
+    },
+    close: () => {}
+  });
+  return stored;
+}
+
+const fullOf = (name, n) => Array.from({ length: n }, () => ({ name, count: 64, type: 1 }));
+
+test('dig_area with a full inventory and no chest she knows stops, and says how much is done, left and lying', async () => {
+  const blocks = {};
+  for (const x of [2, 3]) for (const z of [-1, 0]) blocks[`${x},64,${z}`] = 'stone';
+  const items = fullOf('cobblestone', 35);
+  const bot = fakeBot(blocks, { items });
+  const dig = bot.dig;
+  bot.dig = async (block) => {
+    await dig(block);
+    items.push({ name: 'gravel', count: 64, type: 2 });
+  };
+  const result = await digArea(fakeCtx(bot), { x1: 3, y1: 63, z1: 0, x2: 2, y2: 64, z2: -1 });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(bot.dug.length, 1);
+  assert.match(result.message, /Stopped early: my inventory is full, with no room for stone and I know of no chest with room within 32 blocks\. 1 of about 8 blocks dug, about 7 still to dig; no drops are left lying around\. stash, or a chest with room within 32 blocks, would let me go on$/);
+});
+
+test('dig_area empties a full inventory into a chest she remembers and digs the whole box', async () => {
+  const blocks = {};
+  for (const x of [2, 3]) for (const z of [-1, 0]) blocks[`${x},64,${z}`] = 'stone';
+  const items = fullOf('dirt', 36);
+  const bot = fakeBot(blocks, { items });
+  const stored = rememberChest(bot, items, new Vec3(0, 64, -2));
+  const ctx = fakeCtx(bot);
+  const result = await digArea(ctx, { x1: 3, y1: 63, z1: 0, x2: 2, y2: 64, z2: -1 });
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^dug 8 blocks from 2 63 -1 to 3 64 0 \(4 stone, 4 dirt\)\. .*Emptied my inventory once, into the chest at 0 64 -2$/);
+  // A stack of dirt stays with her for scaffolding and filler.
+  assert.equal(stored.get('dirt'), 35 * 64);
+  assert.equal(items.reduce((n, i) => n + i.count, 0), 64);
+  assert.ok(ctx.progress.some((t) => t.startsWith('inventory full, putting things away (trip 1 of 3)')));
+});
+
+test('dig_area stopped while taking down its scaffolding says so', async () => {
+  const { markPathfinderPlace } = await import('../src/actions/movement.js');
+  const blocks = {};
+  for (const x of [2, 3]) for (const z of [-1, 0]) blocks[`${x},64,${z}`] = 'stone';
+  const bot = fakeBot(blocks);
+  const updates = [];
+  const on = bot.on;
+  bot.on = (name, fn) => {
+    if (name === 'blockUpdate') updates.push(fn);
+    on(name, fn);
+  };
+  const controller = new AbortController();
+  const dig = bot.dig;
+  bot.dig = async (block) => {
+    await dig(block);
+    // The pathfinder puts a scaffold block down beside the box, then the job is stopped.
+    const p = new Vec3(1, 64, 1);
+    markPathfinderPlace(bot, p);
+    bot.world.set(key(p), 'dirt');
+    for (const fn of updates) fn({ position: p, boundingBox: 'empty' }, { name: 'dirt', position: p, boundingBox: 'block' });
+    controller.abort();
+  };
+  const ctx = { ...fakeCtx(bot), signal: controller.signal };
+  const result = await digArea(ctx, { x1: 3, y1: 64, z1: 0, x2: 2, y2: 64, z2: -1 });
+  assert.match(result.message, /Stopped early: stopped taking down my scaffolding after 0, 1 still up$/);
+  assert.equal(bot.world.get('1,64,1'), 'dirt');
+});
+
+test('a trip to empty a full inventory keeps a stack of filler, and the dig still fills its ore hole', async () => {
+  const placed = tempPlaced();
+  try {
+    const blocks = { ...mineWorld([0, 64, -5, 0, 65, 5]), '8,65,-1': 'deepslate_redstone_ore' };
+    const items = fullOf('cobbled_deepslate', 36);
+    const bot = fakeBot(blocks, { at: new Vec3(0.5, 64, 3.5), fill: rock, items });
+    const stored = rememberChest(bot, items, new Vec3(0, 64, -5));
+    const ctx = { ...fakeCtx(bot), config: bigConfig, placed };
+    const result = await digArea(ctx, { x1: 1, y1: 64, z1: 0, x2: 10, y2: 65, z2: 0, ores: true });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(stored.get('cobbled_deepslate'), 35 * 64);
+    assert.equal(bot.world.get('8,65,-1'), 'cobbled_deepslate');
+    assert.match(result.message, /Filled 1 ore holes in the walls, floor and ceiling with 1 cobbled_deepslate\./);
+    assert.match(result.message, /Emptied my inventory once, into the chest at 0 64 -5$/);
+    assert.equal(items.reduce((n, i) => n + i.count, 0), 63);
+  } finally {
+    placed.done();
+  }
 });

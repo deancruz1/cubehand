@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { Vec3 } from 'vec3';
-import { mine, chopTree, isTerrain, isBuildTerrain, looksBuilt, buildGrid, nearBuilds, nextToBuild, notTerrainText, saplingFor, canPlantOn, treeLogTest, dropsOnto } from '../src/actions/mining.js';
+import { mine, chopTree, isTerrain, isBuildTerrain, looksBuilt, buildGrid, nearBuilds, nextToBuild, notTerrainText, saplingFor, canPlantOn, treeLogTest, dropsOnto, isDark, holdsLight } from '../src/actions/mining.js';
 import { findBlock } from '../src/actions/blocks.js';
-import { collectDrops, skippedDrop } from '../src/actions/items.js';
+import { collectDrops, collectItems, skippedDrop } from '../src/actions/items.js';
 import { isTarget, leftAlone, sparedText } from '../src/actions/combat.js';
 import { setPauseScale } from '../src/actions/util.js';
 import { PlacedLog } from '../src/placed.js';
@@ -356,9 +356,18 @@ test('mine leaves ore buried in the rock and says how a player would find some',
   assert.equal(bot.world.get('3,60,0'), 'diamond_ore');
   assert.deepEqual(bot.walks, []);
 
+  // None in sight is an answer, not a failure, so the rest of the batch still runs.
   const found = await findBlock(fakeCtx(bot), { block: 'diamond_ore' });
-  assert.equal(found.ok, false);
+  assert.equal(found.ok, true);
   assert.match(found.message, /no exposed diamond_ore/);
+});
+
+test('find_block answers ok when there is none in range, and fails on a name that is no block', async () => {
+  const bot = fakeBot({});
+  const none = await findBlock(fakeCtx(bot), { block: 'oak_log' });
+  assert.deepEqual([none.ok, none.message], [true, 'no oak_log within 64 blocks']);
+  const unknown = await findBlock(fakeCtx(bot), { block: 'poplar_log' });
+  assert.deepEqual([unknown.ok, unknown.message], [false, 'unknown block: poplar_log']);
 });
 
 test('mine takes an exposed ore with the rest of its vein, then walks back to where the vein began', async () => {
@@ -421,6 +430,34 @@ test('a drop with no path to it stays skipped across pickups, one just picked up
   assert.equal(walks, 2);
 });
 
+test('picking up drops walks on foot only, and collect_items says which drops it could not get to that way', async () => {
+  const bot = fakeBot({});
+  const movements = [];
+  bot.moveModes = { follow: 'on foot' };
+  bot.pathfinder.setMovements = (m) => movements.push(m);
+  bot.pathfinder.setGoal = () => {};
+  bot.pathfinder.goto = async () => {
+    const err = new Error('no path');
+    err.name = 'NoPath';
+    throw err;
+  };
+  bot.entities = { 9: { id: 9, name: 'item', position: new Vec3(6.5, 64, 0.5) } };
+  const result = await collectItems(fakeCtx(bot), {});
+  assert.deepEqual(movements, ['on foot']);
+  assert.deepEqual(result, { ok: false, message: "picked up nothing, 1 I couldn't get to without digging or building my way there" });
+});
+
+test('a pickup cut short by a stop says so', async () => {
+  const bot = fakeBot({});
+  bot.entities = { 9: { id: 9, name: 'item', position: new Vec3(6.5, 64, 0.5) } };
+  const controller = new AbortController();
+  controller.abort();
+  const run = await collectDrops({ ...fakeCtx(bot), signal: controller.signal });
+  assert.deepEqual(run, { walked: 0, unreachable: 0, stopped: true });
+  const result = await collectItems({ ...fakeCtx(bot), signal: controller.signal }, {});
+  assert.deepEqual(result, { ok: false, message: 'picked up nothing, 1 still on the ground (not got to before I stopped). Stopped part-way' });
+});
+
 test('any hostile mob leaves creepers and neutral mobs alone unless they are named', () => {
   const zombie = { type: 'hostile', name: 'zombie', metadata: [] };
   const creeper = { type: 'hostile', name: 'creeper', metadata: [] };
@@ -468,4 +505,157 @@ test('the placed log keeps far more than one big build and saves it whole', asyn
   assert.equal(existsSync(`${path}.tmp`), false);
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).length, 20000);
   rmSync(path, { force: true });
+});
+
+test('it is dark only with no sky light, little block light and a roof, and light the server never sent is not dark', () => {
+  const lights = new Map([['0,64,0', { light: 0, skyLight: 0 }], ['1,64,0', { light: 6, skyLight: 0 }], ['2,64,0', { light: 7, skyLight: 0 }], ['3,64,0', { light: 0, skyLight: 4 }]]);
+  const names = { '0,70,0': 'stone', '1,70,0': 'stone', '2,70,0': 'stone', '3,70,0': 'stone' };
+  const bot = { blockAt: (p) => ({ name: names[key(p)] ?? 'air', boundingBox: names[key(p)] ? 'block' : 'empty', ...lights.get(key(p)) }) };
+  assert.equal(isDark(bot, new Vec3(0, 64, 0)), true);
+  assert.equal(isDark(bot, new Vec3(1, 64, 0)), true);
+  assert.equal(isDark(bot, new Vec3(2, 64, 0)), false);
+  assert.equal(isDark(bot, new Vec3(3, 64, 0)), false);
+  assert.equal(isDark(bot, new Vec3(5, 64, 0)), false);
+  lights.set('4,64,0', { light: 0, skyLight: 0 });
+  assert.equal(isDark(bot, new Vec3(4, 64, 0)), false);
+});
+
+test('a torch or lantern holds the block it stands or hangs on', () => {
+  const blocks = { '2,65,0': ['torch', {}], '5,65,1': ['wall_torch', { facing: 'north' }], '8,63,0': ['lantern', { hanging: 'true' }] };
+  const getBlock = (p) => {
+    const [name, props] = blocks[key(p)] ?? ['stone', {}];
+    return { name, getProperties: () => props };
+  };
+  assert.equal(holdsLight(getBlock, new Vec3(2, 64, 0)), true);
+  assert.equal(holdsLight(getBlock, new Vec3(3, 65, 0)), false);
+  assert.equal(holdsLight(getBlock, new Vec3(5, 65, 2)), true);
+  assert.equal(holdsLight(getBlock, new Vec3(5, 65, 0)), false);
+  assert.equal(holdsLight(getBlock, new Vec3(8, 64, 0)), true);
+  assert.equal(holdsLight(getBlock, new Vec3(8, 62, 0)), false);
+});
+
+test('mine puts a torch on the wall where it is dark underground, and leaves the block her own torch stands on', async () => {
+  const roof = {};
+  for (let x = -4; x <= 4; x++) for (let z = -4; z <= 4; z++) roof[`${x},66,${z}`] = 'dirt';
+  const bot = walking(fakeBot({ ...roof, '2,64,0': 'stone', '0,65,-2': 'dirt' }, { items: [{ name: 'torch', count: 3 }] }));
+  const blockAt = bot.blockAt;
+  bot.blockAt = (p) => ({ ...blockAt(p), light: 0, skyLight: 0 });
+  const result = await mine(fakeCtx(bot), { count: 1 });
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^mined 1 stone, .*\. Put up 1 torches where it was dark$/);
+  assert.equal(bot.world.get('0,65,-1'), 'torch');
+
+  const own = walking(fakeBot({ ...roof, '2,64,0': 'stone', '3,64,0': 'stone', '2,65,0': 'torch' }));
+  const ownBlockAt = own.blockAt;
+  own.blockAt = (p) => ({ ...ownBlockAt(p), light: 0, skyLight: 0 });
+  const left = await mine(fakeCtx(own, new Set(['2,65,0'])), { count: 5 });
+  assert.equal(left.ok, true, left.message);
+  // The torch is near, so no other is wanted, and with none at all she would say so.
+  assert.match(left.message, /^mined 1 stone, .*\. Stopped early: no more stone/);
+  assert.doesNotMatch(left.message, /torches/);
+  assert.equal(own.world.get('2,64,0'), 'stone');
+  assert.equal(own.world.get('3,64,0'), 'air');
+});
+
+// Stacks of 64 for a full inventory, each with a type so a chest can take them.
+const stacks = (name, n) => Array.from({ length: n }, () => ({ name, count: 64, type: NAMES.indexOf(name) }));
+
+// A chest at pos the bot remembers, holding up to room stacks, for stash to empty the inventory into.
+function withChest(bot, items, pos, { room = 1000, free = 27 } = {}) {
+  const CHEST = 100;
+  bot.world.set(key(pos), 'chest');
+  bot.registry.blocksArray.push({ id: CHEST, name: 'chest', boundingBox: 'block' });
+  const find = bot.findBlocks;
+  bot.findBlocks = (q) => (q.matching.includes(CHEST) ? [pos] : find(q));
+  bot.lookAt = async () => {};
+  const stored = [];
+  const entry = { key: 'c', dim: 'overworld', name: 'chest', parts: [{ x: pos.x, y: pos.y, z: pos.z }], items: [], free, labels: [] };
+  bot.chestIndex = {
+    list: () => [entry],
+    find: (p) => (p.x === pos.x && p.y === pos.y && p.z === pos.z ? entry : null),
+    record: (r) => Object.assign(entry, { items: [...r.items], free: r.free }),
+    remove: () => {}
+  };
+  bot.openContainer = async () => ({
+    inventoryStart: 27,
+    inventoryEnd: 63,
+    selectedItem: null,
+    containerItems: () => stored.filter((s) => s.count > 0),
+    items: () => items.filter((i) => i.count > 0),
+    deposit: async (type, meta, n) => {
+      let left = n;
+      for (const i of items) {
+        if (i.type !== type || !left || room <= 0) continue;
+        const t = Math.min(i.count, left);
+        i.count -= t;
+        left -= t;
+        const there = stored.find((s) => s.type === type);
+        if (there) there.count += t;
+        else stored.push({ name: i.name, count: t, type });
+      }
+      if (left) throw new Error('destination full');
+    },
+    close: () => {}
+  });
+  bot.inventory.items = () => items.filter((i) => i.count > 0);
+  return stored;
+}
+
+test('mine stops when the inventory is full and no chest she knows has room, and says what is left and lying', async () => {
+  const items = stacks('dirt', 35);
+  const bot = fakeBot({ '2,64,0': 'stone', '-2,64,0': 'stone', '0,64,2': 'stone' }, { items });
+  bot.inventory.items = () => items.filter((i) => i.count > 0);
+  bot.entities = { 7: { id: 7, name: 'item', position: new Vec3(0.5, 64, 0.5), getDroppedItem: () => ({ name: 'stone', count: 1 }) } };
+  bot.dig = async (block) => {
+    bot.world.set(key(block.position), 'air');
+    items.push({ name: 'stone', count: 64, type: NAMES.indexOf('stone') });
+  };
+  const result = await mine(fakeCtx(bot), { count: 3 });
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^mined 1 stone, picked up 64 stone, now at 0 64 0\. Stopped early: my inventory is full, with no room for stone and I know of no chest with room within 32 blocks\. 2 of 3 stone still to mine; 1 dropped item is lying on the ground around 0 64 0\. stash, or a chest with room within 32 blocks, would let me go on$/);
+});
+
+test('mine empties a full inventory into a chest she remembers, keeps her pickaxe and torches, and carries on', async () => {
+  const items = [...stacks('dirt', 33), { name: 'stone', count: 64, type: NAMES.indexOf('stone') }, { name: 'iron_pickaxe', count: 1, type: 50 }, { name: 'torch', count: 10, type: NAMES.indexOf('torch') }];
+  const bot = fakeBot({ '2,64,0': 'stone', '-2,64,0': 'stone', '0,64,2': 'stone' }, { items });
+  const stored = withChest(bot, items, new Vec3(0, 65, -2));
+  bot.dig = async (block) => {
+    bot.world.set(key(block.position), 'air');
+    items.push({ name: 'stone', count: 1, type: NAMES.indexOf('stone') });
+  };
+  const ctx = fakeCtx(bot);
+  const result = await mine(ctx, { count: 3 });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.message, 'mined 3 stone, picked up 3 stone, now at 0 64 0. Emptied my inventory once, into the chest at 0 65 -2');
+  // A stack of dirt stays with her for scaffolding.
+  assert.equal(stored.reduce((sum, s) => sum + s.count, 0), 32 * 64 + 64);
+  assert.equal(items.filter((i) => i.name === 'dirt').reduce((n, i) => n + i.count, 0), 64);
+  assert.ok(items.some((i) => i.name === 'iron_pickaxe' && i.count === 1));
+  assert.ok(items.some((i) => i.name === 'torch' && i.count === 10));
+  assert.ok(ctx.progress.includes('inventory full, putting things away (trip 1 of 3), starting with the chest at 0 65 -2'));
+  assert.ok(ctx.progress.includes('emptied my inventory (1 of 3), walking back to 0 64 0'));
+});
+
+test('mine empties the inventory at most three times in one call, then stops and says so', async () => {
+  const items = stacks('dirt', 36);
+  const blocks = { '2,64,0': 'stone', '-2,64,0': 'stone', '0,64,2': 'stone', '1,64,-2': 'stone', '2,64,2': 'stone' };
+  const bot = fakeBot(blocks, { items });
+  withChest(bot, items, new Vec3(0, 65, -2));
+  bot.dig = async (block) => {
+    bot.world.set(key(block.position), 'air');
+    items.push(...stacks('stone', 36 - items.filter((i) => i.count > 0).length));
+  };
+  const result = await mine(fakeCtx(bot), { count: 5 });
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^mined 3 stone, .*\. Emptied my inventory 3 times, into the chest at 0 65 -2\. Stopped early: my inventory is full, with no room for stone again after emptying it 3 times\. 2 of 5 stone still to mine; /);
+});
+
+test('mine stops when putting things away frees nothing', async () => {
+  const items = stacks('dirt', 36);
+  const bot = fakeBot({ '2,64,0': 'stone' }, { items });
+  withChest(bot, items, new Vec3(0, 65, -2), { room: 0 });
+  const result = await mine(fakeCtx(bot), { count: 1 });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /my inventory is full, with no room for stone, and putting things away freed nothing \(put nothing away/);
+  assert.equal(bot.world.get('2,64,0'), 'stone');
 });

@@ -2,8 +2,10 @@ import { Vec3 } from 'vec3';
 import pathfinderPkg from 'mineflayer-pathfinder';
 import { ok, fail, posText, pause } from './util.js';
 import { walkTo, watchScaffold, SCAFFOLD_BLOCKS, isNaturalBlock } from './movement.js';
-import { matchesBlockName, inReach, isProtected, findNearest, removeScaffold, placeOne, isReplaceable, openSpace, buriedText, fixToolMaterials, settle } from './blocks.js';
-import { collectDrops, gainedText } from './items.js';
+import { matchesBlockName, inReach, isProtected, findNearest, takeDownScaffold, placeOne, isReplaceable, openSpace, buriedText, fixToolMaterials, settle, blockReader } from './blocks.js';
+import { collectDrops, gainedText, dropsNear, droppedItem } from './items.js';
+import { stash, stashSelection, isPickable } from './containers.js';
+import { partsDistance } from '../chests.js';
 
 const { GoalLookAtBlock, GoalNear } = pathfinderPkg.goals;
 
@@ -219,6 +221,105 @@ export function isExposed(getName, pos) {
   return FACES.some((f) => OPEN.has(getName(pos.plus(f))));
 }
 
+// Torches and lanterns a player puts up along a tunnel. Redstone torches are part of a circuit.
+export const LIGHT = /^(soul_|copper_)?(wall_)?torch$|(^|_)lantern$/;
+const FACING = { north: [0, -1], south: [0, 1], west: [-1, 0], east: [1, 0] };
+const SIDES = FACES.filter((f) => f.y === 0);
+// Torches she carries, the plain kind first.
+const TORCHES = ['torch', 'soul_torch', 'copper_torch'];
+// A torch gives 14 and light drops by one a block, so putting one up once her spot is down to 6
+// spaces them about 8 apart along a tunnel, as a player does.
+const DARK_LIGHT = 6;
+// No new torch this near a torch or lantern: the server sends light a moment after a block
+// changes, so a spot right by her last torch can still read dark.
+const TORCH_GAP = 6;
+// How far up a roof is looked for.
+const ROOF_SCAN = 64;
+
+// The block a torch or lantern at pos hangs on or stands on, or null when that can't be told.
+export function lightSupport(block, pos) {
+  const props = block.getProperties?.() ?? {};
+  if (block.name.endsWith('lantern')) return pos.offset(0, String(props.hanging) === 'true' ? 1 : -1, 0);
+  if (!block.name.includes('wall_')) return pos.offset(0, -1, 0);
+  const f = FACING[props.facing];
+  return f ? pos.offset(-f[0], 0, -f[1]) : null;
+}
+
+// True when a torch or lantern next to pos hangs or stands on it, or might.
+export function holdsLight(getBlock, pos) {
+  return FACES.some((f) => {
+    const n = pos.plus(f);
+    const b = getBlock(n);
+    if (!b || !LIGHT.test(b.name)) return false;
+    const support = lightSupport(b, n);
+    return !support || support.equals(pos);
+  });
+}
+
+// Dark enough underground for mobs to spawn: block light of DARK_LIGHT or less, no sky light, and
+// something solid over it, since light the server never sent for a section reads as 0. Light is
+// block.light and block.skyLight on what bot.blockAt gives; without them it is never dark.
+export function isDark(bot, p, read = blockReader(bot)) {
+  const b = bot.blockAt(p, false);
+  if (!b || typeof b.light !== 'number' || typeof b.skyLight !== 'number') return false;
+  if (b.skyLight > 0 || b.light > DARK_LIGHT) return false;
+  for (let y = 1; y <= ROOF_SCAN; y++) if (read(p.offset(0, y, 0))?.boundingBox === 'block') return true;
+  return false;
+}
+
+// Puts a torch up near her when the spot she stands in is dark and no torch or lantern is near, as
+// a player lights a mine on the way: on a wall at head height, else at her feet, else on the
+// floor, nearest first. spot(cell) says where a torch may go and hold(pos) which block may hold
+// one; either way only natural rock and dirt hold one, never ore, sand, gravel or leaves, and
+// nothing goes under sand or gravel or next to water. A wall torch is recorded under its own name.
+// Gives 'placed', 'none' (dark and she has no torches) or ''.
+export async function lightUp(ctx, { spot = () => true, hold = () => true } = {}) {
+  const { bot } = ctx;
+  const read = blockReader(bot);
+  const feet = bot.entity.position.floored();
+  if (!isDark(bot, feet, read)) return '';
+  for (let dx = -TORCH_GAP; dx <= TORCH_GAP; dx++) {
+    for (let dy = -TORCH_GAP; dy <= TORCH_GAP; dy++) {
+      for (let dz = -TORCH_GAP; dz <= TORCH_GAP; dz++) {
+        if (dx * dx + dy * dy + dz * dz > TORCH_GAP * TORCH_GAP) continue;
+        const name = read(feet.offset(dx, dy, dz))?.name;
+        if (name && LIGHT.test(name)) return '';
+      }
+    }
+  }
+  const torch = TORCHES.find((name) => bot.inventory.items().some((i) => i.name === name));
+  if (!torch) return 'none';
+  const holds = (s) => {
+    const name = read(s)?.name;
+    return Boolean(name) && read(s).boundingBox === 'block' && isTerrain(name) && !isOre(name) && !falls(name) && !name.endsWith('_leaves') && hold(s);
+  };
+  const body = (c) => c.y >= feet.y && c.y <= feet.y + 1 && inColumn(bot.entity.position, c);
+  const eye = bot.entity.position.offset(0, 1.6, 0);
+  const ways = [];
+  for (let dx = -4; dx <= 4; dx++) {
+    for (let dy = -2; dy <= 3; dy++) {
+      for (let dz = -4; dz <= 4; dz++) {
+        const c = feet.offset(dx, dy, dz);
+        if (!AIR.has(read(c)?.name) || body(c) || !inReach(bot, c) || !spot(c)) continue;
+        if (falls(read(c.offset(0, 1, 0))?.name) || FACES.some((f) => read(c.plus(f))?.name === 'water')) continue;
+        const far = c.offset(0.5, 0.5, 0.5).distanceTo(eye);
+        for (const d of SIDES) if (holds(c.plus(d))) ways.push({ c, d, rank: c.y === feet.y + 1 ? 0 : c.y === feet.y ? 1 : 3, far });
+        if (holds(c.offset(0, -1, 0))) ways.push({ c, d: new Vec3(0, -1, 0), rank: 2, far });
+      }
+    }
+  }
+  ways.sort((a, b) => a.rank - b.rank || a.far - b.far);
+  for (const { c, d } of ways.slice(0, 3)) {
+    if (ctx.signal?.aborted) return '';
+    const placed = await placeOne(ctx, torch, c, { attach: d });
+    if (!placed.ok) continue;
+    const now = bot.blockAt(c, false)?.name;
+    if (now && now !== torch && LIGHT.test(now)) ctx.placed?.add(now, c);
+    return 'placed';
+  }
+  return '';
+}
+
 // Lower is better. Like a player in a quarry: work the visible wall in front of you, from
 // your feet up to a little above your head, close to where you last mined so you clear one
 // face at a time. Digging into the floor makes pits, so it comes last. Hidden blocks cost a
@@ -236,6 +337,121 @@ function inventoryCounts(bot) {
   const counts = new Map();
   for (const i of bot.inventory.items()) counts.set(i.name, (counts.get(i.name) ?? 0) + i.count);
   return counts;
+}
+
+// The main inventory and the hotbar.
+const INVENTORY_SLOTS = 36;
+export const MAX_TRIPS = 3;
+const CHEST_RANGE = 32;
+
+// The items breaking a block of name can drop, or the block itself when the data has none.
+export function dropNames(bot, name) {
+  const drops = (bot.registry.blocksByName?.[name]?.drops ?? [])
+    .map((d) => bot.registry.items?.[typeof d === 'object' ? d.drop : d]?.name)
+    .filter(Boolean);
+  return drops.length ? [...new Set(drops)] : [name];
+}
+
+// True when what breaking a block of name drops has nowhere to go: no empty slot, and no stack
+// of a drop with space left on it.
+export function noRoomFor(bot, name) {
+  const items = bot.inventory.items();
+  if (items.length < INVENTORY_SLOTS) return false;
+  const drops = dropNames(bot, name);
+  const stackSize = (i) => i.stackSize ?? bot.registry.itemsByName?.[i.name]?.stackSize ?? 64;
+  return !items.some((i) => drops.includes(i.name) && i.count < stackSize(i));
+}
+
+// The chest she remembers with room that is nearest, within CHEST_RANGE, never a trapped one.
+function roomyChest(bot) {
+  const here = bot.entity.position;
+  return (bot.chestIndex?.list(bot.game?.dimension) ?? [])
+    .filter((c) => isPickable(c.name) && (c.free ?? 0) > 0 && partsDistance(c.parts, here) <= CHEST_RANGE)
+    .sort((a, b) => partsDistance(a.parts, here) - partsDistance(b.parts, here))[0] ?? null;
+}
+
+// What a mid-job trip puts away: what stash would by default, less the torches, the held tool
+// and up to FILLER_KEPT of the blocks in filler (best first) for scaffolding and filling holes.
+// stash matches items by name ending too, so the kept filler goes last: a block named after it
+// (smooth_stone after stone) is counted out by its own entry first.
+const FILLER_KEPT = 64;
+
+function stashItems(bot, carried, filler) {
+  const foods = bot.registry.foodsByName;
+  const keep = [...TORCHES, ...(bot.heldItem ? [bot.heldItem.name] : [])];
+  const { put } = stashSelection(carried, { keep }, foods ? (n) => Boolean(foods[n]) : undefined);
+  let spare = FILLER_KEPT;
+  const kept = new Set();
+  for (const n of filler) {
+    if (spare <= 0) break;
+    const c = put.get(n);
+    if (!c) continue;
+    const k = Math.min(spare, c);
+    spare -= k;
+    kept.add(n);
+    if (c > k) put.set(n, c - k);
+    else put.delete(n);
+  }
+  return [...put].sort(([a], [b]) => kept.has(a) - kept.has(b)).map(([item, count]) => ({ item, count }));
+}
+
+// Before breaking a block of name: when its drops have no room, puts things away with stash and
+// walks back, at most MAX_TRIPS times per call (trips counts them and where they went). filler
+// is the order the job picks its scaffolding or filler in, so a trip leaves her a stack of it.
+// Returns null to dig on, 'stopped', or { full } with why she can't.
+export async function makeRoom(ctx, trips, name, filler = SCAFFOLD_BLOCKS) {
+  const { bot } = ctx;
+  if (!noRoomFor(bot, name)) return null;
+  const why = `my inventory is full, with no room for ${dropNames(bot, name).join(' or ')}`;
+  if (trips.count >= MAX_TRIPS) return { full: `${why} again after emptying it ${MAX_TRIPS} times` };
+  const chest = roomyChest(bot);
+  if (!chest) return { full: `${why} and I know of no chest with room within ${CHEST_RANGE} blocks` };
+  const back = bot.entity.position.floored();
+  const free = () => INVENTORY_SLOTS - bot.inventory.items().length;
+  const freeBefore = free();
+  ctx.status?.progress(`inventory full, putting things away (trip ${trips.count + 1} of ${MAX_TRIPS}), starting with the ${chest.name} at ${posText(chest.parts[0])}`);
+  const had = inventoryCounts(bot);
+  const items = stashItems(bot, had, filler);
+  const result = items.length ? await stash(ctx, { items }) : fail('nothing to put away');
+  for (const [n, c] of had) {
+    const gone = c - (inventoryCounts(bot).get(n) ?? 0);
+    if (gone > 0) trips.stored.set(n, (trips.stored.get(n) ?? 0) + gone);
+  }
+  if (ctx.signal?.aborted) return 'stopped';
+  if (!result.ok || free() <= freeBefore) return { full: `${why}, and putting things away freed nothing (${result.message})` };
+  trips.count++;
+  for (const m of result.message.matchAll(/ in ([a-z_]+ at -?\d+ -?\d+ -?\d+)/g)) if (!trips.into.includes(m[1])) trips.into.push(m[1]);
+  ctx.status?.progress(`emptied my inventory (${trips.count} of ${MAX_TRIPS}), walking back to ${posText(back)}`);
+  const away = () => bot.entity.position.distanceTo(back.offset(0.5, 0, 0.5)) > 1.5;
+  if (!away()) return null;
+  const walked = await walkTo(ctx, new GoalNear(back.x, back.y, back.z, 0), { place: false });
+  if (ctx.signal?.aborted) return 'stopped';
+  if (away()) return { full: `I emptied my inventory but couldn't walk back to ${posText(back)}: ${walked.message}` };
+  return null;
+}
+
+export const newTrips = () => ({ count: 0, into: [], stored: new Map() });
+
+// What she carries plus what the trips put away, so a pickup count still counts it.
+export function countsWithStored(bot, trips) {
+  const counts = inventoryCounts(bot);
+  for (const [n, c] of trips.stored) counts.set(n, (counts.get(n) ?? 0) + c);
+  return counts;
+}
+
+export function tripsText(trips) {
+  if (!trips.count) return '';
+  const times = trips.count === 1 ? 'once' : trips.count === 2 ? 'twice' : `${trips.count} times`;
+  return `. Emptied my inventory ${times}${trips.into.length ? `, into the ${trips.into.join(', ')}` : ''}`;
+}
+
+// Why a job stopped on a full inventory: why, what is still to do (left), and the drops lying
+// near her that had no room.
+export function fullText(bot, why, left) {
+  const drops = dropsNear(bot, bot.entity.position, 8);
+  const n = drops.reduce((sum, e) => sum + (droppedItem(e)?.count ?? 1), 0);
+  const lying = n ? `${n} dropped ${n === 1 ? 'item is' : 'items are'} lying on the ground around ${posText(bot.entity.position)}` : 'no drops are left lying around';
+  return `${why}. ${left}; ${lying}. stash, or a chest with room within ${CHEST_RANGE} blocks, would let me go on`;
 }
 
 function lavaNext(getName, pos) {
@@ -256,8 +472,9 @@ async function harvest(bot, block) {
 // Mines the ore blocks in start and every block of the same ore joined to them face to face,
 // which come into view one by one as she digs, then walks back to back. Reaching a block of the
 // vein may mean digging a step or two, as a player following a vein would. onDug(pos, name) hears
-// of each block. Gives { taken: name to count, problem }.
-export async function mineVein(ctx, start, { back, onDug } = {}) {
+// of each block. beforeDig(name) runs before each break and can stop the vein the way makeRoom
+// does. Gives { taken: name to count, problem, full }.
+export async function mineVein(ctx, start, { back, onDug, beforeDig } = {}) {
   const { bot, config, signal } = ctx;
   const getName = (p) => bot.blockAt(p, false)?.name;
   const first = getName(start[0]);
@@ -272,6 +489,7 @@ export async function mineVein(ctx, start, { back, onDug } = {}) {
   const todo = [...start];
   let total = 0;
   let problem = '';
+  let full = false;
   while (todo.length && total < VEIN_MAX) {
     if (signal?.aborted) {
       problem = 'stopped';
@@ -295,6 +513,20 @@ export async function mineVein(ctx, start, { back, onDug } = {}) {
     }
     const at = bot.entity.position;
     if (!inReach(bot, p) || holdsUp(at, p, getName) || dropsOnto(at, p, getName)) continue;
+    const room = await beforeDig?.(name);
+    if (room === 'stopped') {
+      problem = 'stopped';
+      break;
+    }
+    if (room) {
+      problem = room.full;
+      full = true;
+      break;
+    }
+    if (!inReach(bot, p)) {
+      todo.push(p);
+      continue;
+    }
     let result;
     try {
       result = await harvest(bot, bot.blockAt(p, false));
@@ -322,7 +554,7 @@ export async function mineVein(ctx, start, { back, onDug } = {}) {
       problem = problem || `could not walk back to ${posText(back)} after the vein: ${walked.message}`;
     }
   }
-  return { taken, problem };
+  return { taken, problem, full };
 }
 
 // Mines like a player would: picks the easiest visible blocks nearby, walks around to reach
@@ -378,6 +610,10 @@ export async function mine(ctx, { block, count }) {
 
   let buried = 0;
   let veinTrouble = '';
+  let torches = 0;
+  let noTorches = false;
+  const trips = newTrips();
+  let full = '';
   while (mined < target) {
     if (signal?.aborted) {
       stopReason = 'stopped';
@@ -396,7 +632,7 @@ export async function mine(ctx, { block, count }) {
         return name && wanted(name);
       });
       const seen = pool
-        .filter((p) => !skip.has(p.toString()) && !p.equals(under) && !lavaNext(getName, p) && dropBelow(getName, p) < 3)
+        .filter((p) => !skip.has(p.toString()) && !p.equals(under) && !lavaNext(getName, p) && dropBelow(getName, p) < 3 && !holdsLight(getBlock, p))
         .map((p) => ({ pos: p, name: getName(p), exposed: xray ? isExposed(getName, p) : sight.sees(p) }))
         .filter((c) => !isProtected(c.name, config.protectedBlocks) && !ctx.placed?.has(c.pos, c.name));
       const candidates = xray ? seen : seen.filter((c) => c.exposed);
@@ -444,6 +680,18 @@ export async function mine(ctx, { block, count }) {
 
     const fresh = bot.blockAt(pick.pos, false);
     if (!fresh || fresh.name !== pick.name) continue;
+    const made = trips.count;
+    const room = await makeRoom(ctx, trips, fresh.name);
+    if (room === 'stopped') {
+      stopReason = 'stopped';
+      break;
+    }
+    if (room) {
+      full = room.full;
+      break;
+    }
+    // Back from a chest, so the pick is made again from where she stands.
+    if (trips.count > made) continue;
     let problem;
     let thrown = null;
     try {
@@ -483,14 +731,21 @@ export async function mine(ctx, { block, count }) {
         return name && isOre(name) && oreKind(name) === oreKind(pick.name);
       });
       if (next.length) {
-        const vein = await mineVein(ctx, next, { back: bot.entity.position.floored(), onDug: took });
+        const vein = await mineVein(ctx, next, { back: bot.entity.position.floored(), onDug: took, beforeDig: (name) => makeRoom(ctx, trips, name) });
         if (vein.problem === 'stopped') {
           stopReason = 'stopped';
+          break;
+        }
+        if (vein.full) {
+          full = vein.problem;
           break;
         }
         if (vein.problem) veinTrouble = vein.problem;
       }
     }
+    const lit = await lightUp(ctx);
+    if (lit === 'placed') torches++;
+    else if (lit === 'none') noTorches = true;
     if (++sinceCollect >= 4) {
       await collectDrops(ctx);
       sinceCollect = 0;
@@ -498,11 +753,13 @@ export async function mine(ctx, { block, count }) {
     await pause(100, 300);
   }
   await collectDrops(ctx);
+  if (full) stopReason = fullText(bot, full, `${target - mined} of ${target} ${query} still to mine`);
 
   const oreText = ores.size ? `, plus ${[...ores].map(([n, c]) => `${c} ${n}`).join(', ')}` : '';
-  const gained = [...inventoryCounts(bot)].map(([n, c]) => [n, c - (before.get(n) ?? 0)]).filter(([, c]) => c > 0);
+  const gained = [...countsWithStored(bot, trips)].map(([n, c]) => [n, c - (before.get(n) ?? 0)]).filter(([, c]) => c > 0);
   const pickedUp = gained.length ? gained.map(([n, c]) => `${c} ${n}`).join(', ') : 'nothing';
-  const summary = `mined ${mined} ${query}${oreText}, picked up ${pickedUp}, now at ${posText(bot.entity.position)}${veinTrouble ? `. In a vein: ${veinTrouble}` : ''}`;
+  const lightText = `${torches ? `. Put up ${torches} torches where it was dark` : ''}${noTorches ? '. It is dark down here and I have no torches to light it' : ''}`;
+  const summary = `mined ${mined} ${query}${oreText}, picked up ${pickedUp}, now at ${posText(bot.entity.position)}${veinTrouble ? `. In a vein: ${veinTrouble}` : ''}${lightText}${tripsText(trips)}`;
   if (mined >= target) return ok(summary);
   return mined > 0 || ores.size ? ok(`${summary}. Stopped early: ${stopReason}`) : fail(`${summary}. ${stopReason}`);
 }
@@ -671,7 +928,8 @@ async function chopOne(ctx, logs) {
   } finally {
     scaffold.stop();
   }
-  await removeScaffold(ctx, scaffold.placed);
+  const down = await takeDownScaffold(ctx, scaffold.placed);
+  if (down.stopped) problem = problem && problem !== 'stopped' ? `${problem}; ${down.text}` : down.text;
   await collectDrops(ctx, { radius: 8, center: base, max: 12 });
   return { chopped, problem };
 }

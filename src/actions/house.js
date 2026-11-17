@@ -1,7 +1,7 @@
 import { Vec3 } from 'vec3';
 import { ok, fail, posText } from './util.js';
 import { isNaturalBlock } from './movement.js';
-import { digBlock, removeScaffold, isReplaceable, isProtected } from './blocks.js';
+import { digBlock, takeDownScaffold, isReplaceable, isProtected } from './blocks.js';
 import { placeAll, inventoryCounts, expandParts, watchBuildScaffold, groundUnder, buildZone, groupBlocks, leftText, missingHelp } from './build.js';
 import { collectDrops } from './items.js';
 import { parseBlock, dirVector, opposite, matchesState } from './states.js';
@@ -474,16 +474,17 @@ export async function buildHouse(ctx, input) {
     bot.buildZone = null;
     bot.buildKeep = null;
   }
-  const removed = await removeScaffold(ctx, scaffold.leftover(todo));
+  const down = await takeDownScaffold(ctx, scaffold.leftover(todo));
 
   const { placed, wrong, stoppedReason } = result;
   let message = `${summary} Placed ${placed} of ${todo.length} blocks`;
-  if (removed) message += `, took down ${removed} scaffolding blocks`;
+  if (down.removed && !down.stopped) message += `, took down ${down.removed} scaffolding blocks`;
   if (wrong.length) message += `. ${wrong.length} came out turned the wrong way, first: ${wrong.slice(0, 3).join('; ')}`;
   const left = todo.filter((b) => !b.done);
   const groups = groupBlocks(left);
   if (left.length) message += `. Left to do, ${left.length} blocks in ${groups.length} group${groups.length === 1 ? '' : 's'}: ${groups.slice(0, 6).map((g) => leftText({ left: g })).join('. ')}${groups.length > 6 ? `. And ${groups.length - 6} more groups` : ''}`;
-  const stopped = digProblem ?? stoppedReason ?? (signal?.aborted ? 'stopped' : null);
+  let stopped = digProblem ?? stoppedReason ?? (signal?.aborted ? 'stopped' : null);
+  if (down.stopped) stopped = stopped && stopped !== 'stopped' ? `${stopped}; ${down.text}` : down.text;
   if (stopped) message += `. Stopped early: ${stopped}`;
   if (left.length) message += '. build_house with the same settings again keeps what is done and goes on with the rest';
   record(left.length ? `stopped at ${clock()} with ${placed} of ${todo.length} blocks placed${stopped ? `, ${stopped}` : ''}` : `finished at ${clock()}`);
