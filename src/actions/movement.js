@@ -98,30 +98,85 @@ function touchesBuild(bot, pos, attachedOnly) {
   return false;
 }
 
+// The two states of a door or gate, as bits.
+const SHUT = 1;
+const OPEN = 2;
+const stateBit = (open) => (open ? OPEN : SHUT);
+const CLOCKWISE = { north: 'east', east: 'south', south: 'west', west: 'north' };
+const ACROSS = { north: 'south', south: 'north', east: 'west', west: 'east' };
+const ORIGIN = { x: 0, z: 0 };
+// What it costs the walk to switch a door on the way, about a block of walking.
+const DOOR_COST = 1;
+
+const doorOrGate = (name) => name.endsWith('_door') || isGate(name);
+
+// The edge of its block a door's panel stands on, as in the game's door shapes: shut, the side
+// away from the way it faces; open, the side it swings round to on its hinge.
+export function doorPanel({ facing, open, hinge }) {
+  if (String(open) !== 'true') return ACROSS[facing];
+  return hinge === 'right' ? CLOCKWISE[facing] : ACROSS[CLOCKWISE[facing]];
+}
+
+// The states (SHUT, OPEN bits) a door or gate can be in for someone to cross the given edge of its
+// block. A gate is a bar right across its block when shut and nothing at all when open.
+export function clearStates(block, edge) {
+  if (isGate(block.name)) return OPEN;
+  const props = block.getProperties();
+  return (doorPanel({ ...props, open: 'false' }) !== edge ? SHUT : 0) | (doorPanel({ ...props, open: 'true' }) !== edge ? OPEN : 0);
+}
+
+// The side of from's block that faces to, by whichever way they are further apart.
+function edgeToward(from, to) {
+  const dx = to.x - from.x;
+  const dz = to.z - from.z;
+  if (Math.abs(dx) >= Math.abs(dz)) return dx > 0 ? 'east' : 'west';
+  return dz > 0 ? 'south' : 'north';
+}
+
+function onDoorStep(move, doors) {
+  if (!move) return;
+  move.cost += doors.cost;
+  if (doors.states) move.doorStates = doors.states;
+}
+
 // Snow up to 5 layers is low enough to step onto; deeper snow has to be dug out of the way.
 export function deepSnow(layers) {
   return layers >= 6;
 }
 
+// Plants that only grow in water: the pathfinder takes them for air and plans down through them.
+const WATER_PLANTS = new Set(['seagrass', 'tall_seagrass', 'kelp', 'kelp_plant', 'bubble_column']);
+// The most blocks of water she swims in one go, and what each one costs on top of the step: a
+// swim of n blocks is worth a dry detour of up to 3n blocks more.
+export const SWIM = { most: 12, cost: 3 };
+const wet = (b) => Boolean(b.liquid) && b.name !== 'lava';
+const SIDES4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const SPOT5 = [[0, 0], ...SIDES4];
+
 // The pathfinder treats doors, gates and trapdoors as walls. This lets it plan through
-// wooden doors and gates, and through trapdoor hatches on top of ladders (an open trapdoor
-// above a ladder is climbable in vanilla). passagesOnPath opens them as the bot arrives.
+// wooden doors and gates, and through trapdoor hatches on top of ladders. passagesOnPath opens
+// them as the bot arrives.
 class DoorMovements extends Movements {
   getBlock(pos, dx, dy, dz) {
     const b = super.getBlock(pos, dx, dy, dz);
     if (!b.name) return b;
     if (b.name.endsWith('_door') || isGate(b.name)) {
-      // Iron doors only count as a way through from a side that can open them (ironShut).
+      // Whether a move can go through, and in which state, is up to throughDoors.
       b.safe = true;
       b.physical = false;
       b.openable = false;
       b.passage = true;
       b.height = pos.y + dy;
     } else if (isHandTrapdoor(b.name) && this.bot.blockAt(b.position.offset(0, -1, 0), false)?.name === 'ladder') {
+      const ladder = this.bot.blockAt(b.position.offset(0, -1, 0), false);
       b.safe = true;
       b.physical = false;
-      b.climbable = true;
+      // An open hatch over a ladder facing the same way is climbable in the game, but the bot
+      // moves by her own physics, which on newer versions doesn't climb it: she gets her feet into
+      // the hatch and no higher.
+      b.climbable = Boolean(this.bot.registry.supportFeature?.('climbableTrapdoor')) && b.getProperties().facing === ladder.getProperties().facing;
       b.passage = true;
+      b.hatch = true;
       b.height = pos.y + dy;
     } else if (b.name.endsWith('_trapdoor') && isOpen(b)) {
       // An open trapdoor, like a window shutter, is a thin panel on one side of its block:
@@ -131,8 +186,106 @@ class DoorMovements extends Movements {
     } else if (b.name === 'snow' && deepSnow(b.getProperties().layers)) {
       b.safe = false;
       b.physical = false;
+    } else if (WATER_PLANTS.has(b.name)) {
+      b.liquid = true;
     }
     return b;
+  }
+
+  // Whether pos holds lava, looked up once a second at most for each cell.
+  lavaAt(x, y, z) {
+    const now = Date.now();
+    if (!this.lavaSeen || now - this.lavaSince > 1000) {
+      this.lavaSeen = new Map();
+      this.lavaSince = now;
+    }
+    const key = `${x},${y},${z}`;
+    let lava = this.lavaSeen.get(key);
+    if (lava === undefined) {
+      lava = this.bot.blockAt(new Vec3(x, y, z), false)?.name === 'lava';
+      this.lavaSeen.set(key, lava);
+    }
+    return lava;
+  }
+
+  // The lava touching someone who stands at p: at or beside their feet, head or floor, or right
+  // over their head. Null when there is none.
+  lavaBeside(p) {
+    for (const dy of [-1, 0, 1]) {
+      for (const [dx, dz] of SPOT5) if (this.lavaAt(p.x + dx, p.y + dy, p.z + dz)) return new Vec3(p.x + dx, p.y + dy, p.z + dz);
+    }
+    return this.lavaAt(p.x, p.y + 2, p.z) ? new Vec3(p.x, p.y + 2, p.z) : null;
+  }
+
+  // The pathfinder's own moves can't get out of deep water onto a bank as high as the water (it
+  // measures the jump from the water under her feet), can't get into it straight on from a bank
+  // like that (a drop lands a block under the surface), and have no way up from under water.
+  // These add those moves.
+  swimMoves(node, neighbors) {
+    const feet = this.getBlock(node, 0, 0, 0);
+    const head = this.getBlock(node, 0, 1, 0);
+    const taken = new Set(neighbors.map((n) => n.hash));
+    const add = (x, y, z, cost) => {
+      const move = new Move(x, y, z, node.remainingBlocks, cost);
+      if (!taken.has(move.hash)) neighbors.push(move);
+    };
+    if (wet(feet) && wet(head)) {
+      if (this.getBlock(node, 0, 2, 0).safe) add(node.x, node.y + 1, node.z, 1);
+      return;
+    }
+    const clear = (b) => b.safe && !b.passage;
+    for (const [dx, dz] of SIDES4) {
+      const c = this.getBlock(node, dx, 0, dz);
+      const b = this.getBlock(node, dx, 1, dz);
+      if (wet(feet)) {
+        if (!c.physical || c.height > node.y + 1 || !clear(b) || !clear(this.getBlock(node, dx, 2, dz)) || !this.getBlock(node, 0, 2, 0).safe) continue;
+        add(node.x + dx, node.y + 1, node.z + dz, 2);
+      } else if (clear(c) && !c.liquid && clear(b) && wet(this.getBlock(node, dx, -1, dz)) && this.getBlock(node, 0, -1, 0).physical) {
+        add(node.x + dx, node.y - 1, node.z + dz, 1);
+      }
+    }
+  }
+
+  // Every move goes through here. None ends next to lava or with her head under water, a swim
+  // costs SWIM.cost a block and ends after SWIM.most, and with keepFarmland set no move jumps up
+  // from or onto farmland, or drops onto it. onHazard hears of lava and too much water it turned
+  // a move down for.
+  getNeighbors(node) {
+    const neighbors = super.getNeighbors(node);
+    this.swimMoves(node, neighbors);
+    const floor = (p) => this.getBlock(p, 0, -1, 0).name;
+    return neighbors.filter((move) => {
+      let lava = this.lavaBeside(move);
+      // A jump over a gap goes over the cells in between too.
+      const gap = move.parkour ? Math.max(Math.abs(move.x - node.x), Math.abs(move.z - node.z)) : 0;
+      for (let d = 1; d < gap && !lava; d++) {
+        lava = this.lavaBeside({ x: node.x + (Math.sign(move.x - node.x) * d), y: Math.max(node.y, move.y), z: node.z + (Math.sign(move.z - node.z) * d) });
+      }
+      if (lava) {
+        this.onHazard?.('lava', lava);
+        return false;
+      }
+      if (wet(this.getBlock(move, 0, 0, 0))) {
+        if (wet(this.getBlock(move, 0, 1, 0)) && !(move.x === node.x && move.z === node.z && move.y > node.y)) return false;
+        // Wading, with ground under her feet, is only slow.
+        if (!wet(this.getBlock(move, 0, -1, 0))) {
+          move.cost += 1;
+        } else {
+          move.swim = (node.swim ?? 0) + 1;
+          if (move.swim > SWIM.most) {
+            this.onHazard?.('water', new Vec3(move.x, move.y, move.z));
+            return false;
+          }
+          move.cost += SWIM.cost;
+        }
+      }
+      if (this.keepFarmland) {
+        if (move.parkour) return false;
+        if (move.y > node.y && (floor(node) === 'farmland' || floor(move) === 'farmland')) return false;
+        if (move.y < node.y && floor(move) === 'farmland') return false;
+      }
+      return true;
+    });
   }
 
   // Never dig what the bot built itself, even when it's made of something that looks natural,
@@ -146,33 +299,66 @@ class DoorMovements extends Movements {
     return !(block.position && touchesBuild(this.bot, block.position, this.digWalk));
   }
 
-  // Doors and gates can only be walked through straight on, along the way they face. From the
-  // side, the frame or the open door itself is in the way. Checks the block the move starts in
-  // and the given heights of the block it goes to.
-  intoPassageSideways(node, dir, dys) {
-    const along = dir.x !== 0 ? ['east', 'west'] : ['north', 'south'];
-    const cells = [this.getBlock(node, 0, 0, 0), ...dys.map((dy) => this.getBlock(node, dir.x, dy, dir.z))];
-    return cells.some((b) => b.passage && (b.name.endsWith('_door') || isGate(b.name)) && !along.includes(b.getProperties().facing));
-  }
-
-  // A closed iron door at the given heights of the block the move goes to, with nothing on
-  // this side to open it.
-  ironShut(node, dir, dys) {
+  // A door is a thin panel on one edge of its block (doorPanel) and an open gate is no obstacle
+  // at all, so a move out of the block the move starts in, or into the given heights of the one
+  // it goes to, only goes in a state that keeps the edge it crosses clear. Wooden doors and gates
+  // get switched on the way (passagesOnPath), at DOOR_COST. Iron doors only open from a side with
+  // something to open them, and never shut by hand. The move into a door keeps the states it can
+  // go in on its step, so the way out has to fit one of them. Returns the extra cost and those
+  // states, or null when the move can't be made.
+  throughDoors(node, dir, dys) {
+    let cost = 0;
+    const here = this.getBlock(node, 0, 0, 0);
+    if (here.passage && doorOrGate(here.name)) {
+      const now = stateBit(isOpen(here));
+      const states = clearStates(here, edgeToward(ORIGIN, dir)) & (node.doorStates ?? (here.name === 'iron_door' ? now : SHUT | OPEN));
+      if (!states) return null;
+      if (!node.doorStates && !(states & now)) cost += DOOR_COST;
+    }
+    let door = null;
+    let states = SHUT | OPEN;
     for (const dy of dys) {
       const b = this.getBlock(node, dir.x, dy, dir.z);
-      if (!b.passage || b.name !== 'iron_door') continue;
-      const door = lowerHalf(b);
-      const front = door.offset(-dir.x, 0, -dir.z);
-      if (canPassIron(this.bot, door, front)) continue;
-      this.onRefusedDoor?.(door, front);
-      return true;
+      if (!b.passage || !doorOrGate(b.name)) continue;
+      door = b;
+      states &= clearStates(b, edgeToward(dir, ORIGIN));
     }
-    return false;
+    if (!door) return { cost };
+    const now = stateBit(isOpen(door));
+    if (door.name === 'iron_door') {
+      let can = now;
+      if (!(states & now) && states & OPEN) {
+        const pos = lowerHalf(door);
+        const front = pos.offset(-dir.x, 0, -dir.z);
+        if (canPassIron(this.bot, pos, front)) can |= OPEN;
+        else this.onRefusedDoor?.(pos, front);
+      }
+      states &= can;
+    }
+    if (!states) return null;
+    return { cost: cost + (states & now ? 0 : DOOR_COST), states };
+  }
+
+  // An open hatch is a panel on the edge of its block away from the way it faces, and
+  // passagesOnPath opens a hatch on the way, so no move crosses that edge, at the feet or higher
+  // up: the move starts in the given heights and 0, and goes to the given heights.
+  acrossHatch(node, dir, dys) {
+    const panel = (b) => (b.hatch ? ACROSS[b.getProperties().facing] : null);
+    const out = edgeToward(ORIGIN, dir);
+    const into = edgeToward(dir, ORIGIN);
+    return [0, ...dys].some((dy) => panel(this.getBlock(node, 0, dy, 0)) === out) || dys.some((dy) => panel(this.getBlock(node, dir.x, dy, dir.z)) === into);
+  }
+
+  // With her feet in a hatch she can't climb, the ladder top under her is no floor to jump from.
+  inHatch(node) {
+    const b = this.getBlock(node, 0, 0, 0);
+    return b.hatch && !b.climbable;
   }
 
   // A door's lower half counts as no floor, so a jump over it looks fine, but the body goes
   // through the upper half and stops at the door.
   getMoveParkourForward(node, dir, neighbors) {
+    if (this.inHatch(node)) return;
     for (let d = 1; d <= 4; d++) {
       for (const dy of [-1, 0, 1]) {
         const b = this.getBlock(node, dir.x * d, dy, dir.z * d);
@@ -189,19 +375,30 @@ class DoorMovements extends Movements {
   }
 
   getMoveForward(node, dir, neighbors) {
-    if (this.overLadder(node, dir.x, 0, dir.z) || this.intoPassageSideways(node, dir, [0, 1]) || this.ironShut(node, dir, [0, 1])) return;
+    if (this.overLadder(node, dir.x, 0, dir.z) || this.acrossHatch(node, dir, [0, 1])) return;
+    const doors = this.throughDoors(node, dir, [0, 1]);
+    if (!doors) return;
+    const before = neighbors.length;
     super.getMoveForward(node, dir, neighbors);
+    onDoorStep(neighbors[before], doors);
   }
 
   getMoveDropDown(node, dir, neighbors) {
-    if (this.intoPassageSideways(node, dir, [0, 1]) || this.ironShut(node, dir, [0, 1])) return;
+    if (this.acrossHatch(node, dir, [0, 1])) return;
+    const doors = this.throughDoors(node, dir, [0, 1]);
+    if (!doors) return;
+    const before = neighbors.length;
     super.getMoveDropDown(node, dir, neighbors);
+    onDoorStep(neighbors[before], doors);
   }
 
   getMoveJumpUp(node, dir, neighbors) {
-    if (this.overLadder(node, dir.x, 1, dir.z) || this.intoPassageSideways(node, dir, [1, 2]) || this.ironShut(node, dir, [1, 2])) return;
+    if (this.overLadder(node, dir.x, 1, dir.z) || this.inHatch(node) || this.acrossHatch(node, dir, [1, 2])) return;
+    const doors = this.throughDoors(node, dir, [1, 2]);
+    if (!doors) return;
     const before = neighbors.length;
     super.getMoveJumpUp(node, dir, neighbors);
+    onDoorStep(neighbors[before], doors);
     // Three or more snow layers on the step make the jump too high, so clear them first.
     const move = neighbors[before];
     const feet = this.getBlock(node, dir.x, 1, dir.z);
@@ -211,9 +408,9 @@ class DoorMovements extends Movements {
     }
   }
 
-  // Door frames block diagonal movement, so only go through passages straight on.
+  // Door frames block diagonal movement, so only go into and out of passages straight on.
   getMoveDiagonal(node, dir, neighbors) {
-    for (const [x, z] of [[dir.x, dir.z], [dir.x, 0], [0, dir.z]]) {
+    for (const [x, z] of [[0, 0], [dir.x, dir.z], [dir.x, 0], [0, dir.z]]) {
       if (this.getBlock(node, x, 0, z).passage || this.getBlock(node, x, 1, z).passage) return;
     }
     if (this.overLadder(node, dir.x, 0, dir.z)) return;
@@ -254,20 +451,35 @@ const cellOf = (p) => new Vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z)
 
 // The pathfinder lifts each step onto whatever has a shape in its cell, so a step through a
 // door lands a block above the floor (a closed gate one and a half), and the bot can only
-// reach it by jumping in the doorway. Put those steps back on the floor.
+// reach it by jumping in the doorway. A step into an open hatch over a ladder lands on top of
+// its panel, higher than she can climb. Put those steps back on the floor.
 export function fixPassageSteps(path, getBlock) {
   for (const node of path) {
     const cell = new Vec3(Math.floor(node.x), Math.floor(node.y) - 1, Math.floor(node.z));
     const b = getBlock(cell);
-    if (!b || !(b.name.endsWith('_door') || isGate(b.name))) continue;
+    const hatch = b && isHandTrapdoor(b.name) && getBlock(cell.offset(0, -1, 0))?.name === 'ladder';
+    if (!b || !(b.name.endsWith('_door') || isGate(b.name) || hatch)) continue;
     node.x = cell.x + 0.5;
     node.y = cell.y;
     node.z = cell.z + 0.5;
   }
 }
 
-// Opens closed doors, gates and trapdoors on the path ahead, and closes the ones it opened
-// once the bot is past them, like a player would.
+// The states a door or gate in cells[i] can be in for the walk to get through it, from the cells
+// she comes from and goes to next.
+function wayThrough(block, cells, i) {
+  const cell = cells[i];
+  const other = (p) => p.x !== cell.x || p.z !== cell.z;
+  const from = cells.slice(0, i).reverse().find(other);
+  const to = cells.slice(i + 1).find(other);
+  let states = SHUT | OPEN;
+  if (from) states &= clearStates(block, edgeToward(cell, from));
+  if (to) states &= clearStates(block, edgeToward(cell, to));
+  return states;
+}
+
+// Switches doors, gates and trapdoors on the path ahead that are in the way she is going, and
+// puts them back as she found them once she is past, like a player would.
 function passagesOnPath(bot) {
   let path = [];
   const lastTry = new Map();
@@ -283,7 +495,8 @@ function passagesOnPath(bot) {
   // it: a plate needs nothing, a button or lever gets pressed. A button only holds the door for
   // a second or so, so she presses again when it shut before she got through. When two presses
   // in a row left it shut, the door doesn't open from this side and walks leave it for 5 minutes.
-  const openIron = (door, here) => {
+  // states is what the way she is going lets the door be in: a shut door she can pass is left be.
+  const openIron = (door, here, states) => {
     const block = bot.blockAt(door, false);
     if (!block || block.name !== 'iron_door') return;
     const key = door.toString();
@@ -292,6 +505,7 @@ function passagesOnPath(bot) {
       if (press) press.opened = true;
       return;
     }
+    if (states & SHUT || !(states & OPEN)) return;
     const front = frontOf(door, block.getProperties().facing, here);
     if (Math.hypot(here.x - front.x - 0.5, here.z - front.z - 0.5) > 1.2 || Math.abs(here.y - front.y) > 1) return;
     const opener = doorOpener(bot, door, front);
@@ -317,20 +531,24 @@ function passagesOnPath(bot) {
 
     if (bot.pathfinder.isMoving()) {
       // The cell she stands in counts too: once she is in the doorway the door is no longer ahead.
-      for (const cell of [cellOf(here), ...path.slice(0, 3).map(cellOf)]) {
+      const cells = [cellOf(here), ...path.slice(0, 4).map(cellOf)];
+      for (let i = 0; i < Math.min(cells.length, 4); i++) {
         for (const dy of [0, 1]) {
-          let block = bot.blockAt(cell.offset(0, dy, 0));
-          if (block?.name === 'iron_door') openIron(lowerHalf(block), here);
+          let block = bot.blockAt(cells[i].offset(0, dy, 0));
+          if (block?.name === 'iron_door') openIron(lowerHalf(block), here, wayThrough(block, cells, i));
           if (!block || !isPassage(block)) continue;
           // Both halves toggle the same door, so always use the bottom half. Using both
           // in one tick opens the door and shuts it again straight away.
           if (isHandDoor(block.name) && block.getProperties().half === 'upper') block = bot.blockAt(block.position.offset(0, -1, 0));
-          if (!block || !isPassage(block) || isOpen(block)) continue;
+          if (!block || !isPassage(block)) continue;
+          // A hatch is climbed through, which only an open one lets her do.
+          const states = isHandTrapdoor(block.name) ? OPEN : wayThrough(block, cells, i);
+          if (!states || states & stateBit(isOpen(block))) continue;
           if (block.position.offset(0.5, 0.5, 0.5).distanceTo(here) > 3) continue;
           const key = block.position.toString();
           if (Date.now() - (lastTry.get(key) ?? 0) < 1500) continue;
           lastTry.set(key, Date.now());
-          opened.set(key, { pos: block.position, at: Date.now() });
+          opened.set(key, { pos: block.position, at: Date.now(), was: opened.get(key)?.was ?? isOpen(block) });
           bot.activateBlock(block).catch(() => {});
         }
       }
@@ -338,7 +556,7 @@ function passagesOnPath(bot) {
 
     // Right after a path reset the new path isn't there yet, so it's unknown whether a door is still needed.
     const replanning = bot.pathfinder.goal && path.length === 0;
-    for (const [key, { pos, at }] of opened) {
+    for (const [key, { pos, at, was }] of opened) {
       const age = Date.now() - at;
       if (age > 300000) {
         opened.delete(key);
@@ -352,7 +570,7 @@ function passagesOnPath(bot) {
       opened.delete(key);
       if (distance > 4.5) continue;
       const block = bot.blockAt(pos);
-      if (block && isPassage(block) && isOpen(block)) bot.activateBlock(block).catch(() => {});
+      if (block && isPassage(block) && isOpen(block) !== was) bot.activateBlock(block).catch(() => {});
     }
 
     for (const [key, { lever, door, at }] of levers) {
@@ -613,6 +831,8 @@ function makeMovements(bot, cantBreak, { digCost = 0, placeCost = 0, place, dig 
   // Plan around players and mobs where there's room, so someone standing in one half of a
   // double door doesn't block the way.
   m.entityCost = 4;
+  // Water is costed in getNeighbors instead.
+  m.liquidCost = 0;
   m.blocksCantBreak = cantBreak;
   m.allow1by1towers = place;
   m.scafoldingBlocks = place ? SCAFFOLD_BLOCKS.map((name) => bot.registry.itemsByName[name]?.id).filter((id) => id !== undefined) : [];
@@ -944,7 +1164,54 @@ function nowhereToStand(m, goal) {
   return true;
 }
 
-function noRouteText(bot, goal, m, tried, refused, doors = new Map()) {
+// Where she would stand in the column at x z, looking a few blocks up and down from y: with her
+// feet in the top of water (wet), or on dry ground. Null when neither is near.
+function columnSpot(m, x, y, z) {
+  for (const dy of [0, -1, 1, -2, 2, -3, 3]) {
+    const p = new Vec3(x, y + dy, z);
+    const feet = m.getBlock(p, 0, 0, 0);
+    const head = m.getBlock(p, 0, 1, 0);
+    if (wet(feet) && !wet(head)) return { pos: p, wet: true };
+    if (feet.safe && !feet.liquid && head.safe && !head.liquid && m.getBlock(p, 0, -1, 0).physical) return { pos: p, wet: false };
+  }
+  return null;
+}
+
+// The first stretch of water on the straight line from from to to (64 blocks of it at most): where
+// it starts and ends, and the dry ground before and after it, or null when there is none.
+export function waterOnLine(m, from, to) {
+  const dx = to.x - from.x;
+  const dz = to.z - from.z;
+  const n = Math.min(64, Math.ceil(Math.max(Math.abs(dx), Math.abs(dz))));
+  let y = Math.floor(from.y);
+  let near = null;
+  let start = null;
+  let end = null;
+  for (let i = 0; i <= n; i++) {
+    const spot = columnSpot(m, Math.floor(from.x + (dx * i) / n), y, Math.floor(from.z + (dz * i) / n));
+    if (!spot) continue;
+    y = spot.pos.y;
+    if (spot.wet) {
+      start ??= spot.pos;
+      end = spot.pos;
+    } else if (start) {
+      return { near, start, end, far: spot.pos };
+    } else {
+      near = spot.pos;
+    }
+  }
+  return start ? { near, start, end, far: null } : null;
+}
+
+function waterText(m, here, target, hazard) {
+  const across = target ? waterOnLine(m, here, target) : null;
+  if (!across) return hazard ? `There is water wider than I swim (${SWIM.most} blocks) near ${posText(hazard)}` : null;
+  const width = Math.round(Math.max(Math.abs(across.end.x - across.start.x), Math.abs(across.end.z - across.start.z))) + 1;
+  const sides = [across.near ? `on my side at ${posText(across.near)}` : null, across.far ? `on the far side at ${posText(across.far)}` : 'none on the far side within 64 blocks'];
+  return `Water is in the way from ${posText(across.start)} to ${posText(across.end)}, about ${width} blocks across. I swim at most ${SWIM.most} blocks and only climb out where the bank is no higher than the water. Dry ground ${sides.filter(Boolean).join(', ')}`;
+}
+
+function noRouteText(bot, goal, m, tried, refused, { doors = new Map(), hazards = {} } = {}) {
   const parts = [`no route found, so nothing was dug or placed. Tried ${tried.join(', then ')}`];
   const here = bot.entity.position;
   const door = [...doors.values()].sort((a, b) => a.door.distanceTo(here) - b.door.distanceTo(here))[0];
@@ -954,6 +1221,9 @@ function noRouteText(bot, goal, m, tried, refused, doors = new Map()) {
       ? `The iron door at ${posText(door.door)} didn't open with the button or lever on this side`
       : `There is an iron door at ${posText(door.door)} with no button, lever or pressure plate on this side`);
   }
+  if (hazards.lava) parts.push(`Lava at ${posText(hazards.lava.pos)} is in the way, and I never walk through lava or next to it`);
+  const wetText = waterText(m, here, goalPos(goal), hazards.water?.pos);
+  if (wetText) parts.push(wetText);
   const target = goalPos(goal);
   if (target && nowhereToStand(m, goal)) {
     const r = Math.round(Math.sqrt(goal.rangeSq ?? 0));
@@ -1004,20 +1274,41 @@ function digGoal(goal, weight) {
 // for a block to dig out), where it may dig: it only goes through what the walk may dig anyway.
 // With onFoot set there is only the first search. Null when stopped.
 export async function planRoute(bot, goal, place, options = {}) {
-  const doors = new Map();
+  const seen = { doors: new Map(), hazards: {} };
   const m = options.onFoot ? bot.planModes.onFoot : bot.planModes[planModeName(place, options.dig)];
-  const onDoor = (door, front) => doors.set(doorSide(door, front), { door, front });
-  bot.planModes.onFoot.onRefusedDoor = onDoor;
-  m.onRefusedDoor = onDoor;
+  const onDoor = (door, front) => seen.doors.set(doorSide(door, front), { door, front });
+  // Of the lava and wide water the searches turned down between her and the goal, the one most on
+  // the way to it.
+  const from = bot.entity.position;
+  const target = goalPos(goal);
+  const onHazard = (kind, pos) => {
+    if (target && from.distanceTo(pos) > from.distanceTo(target) + 2) return;
+    const off = from.distanceTo(pos) + (target ? pos.distanceTo(target) - from.distanceTo(target) : 0);
+    if (off > 16 || (seen.hazards[kind] && seen.hazards[kind].off <= off)) return;
+    seen.hazards[kind] = { pos, off };
+  };
+  for (const modes of new Set([bot.planModes.onFoot, m])) {
+    modes.onRefusedDoor = onDoor;
+    modes.onHazard = onHazard;
+  }
   try {
-    return await planSearches(bot, goal, place, m, doors, options);
+    return await planSearches(bot, goal, place, m, seen, options);
   } finally {
-    bot.planModes.onFoot.onRefusedDoor = null;
-    m.onRefusedDoor = null;
+    for (const modes of [bot.planModes.onFoot, m]) {
+      modes.onRefusedDoor = null;
+      modes.onHazard = null;
+    }
   }
 }
 
-async function planSearches(bot, goal, place, m, doors, { dig = false, onFoot = false, onFootMs = PLAN_BUDGET.onFoot, buildMs = PLAN_BUDGET.build, stopped = () => false }) {
+// A way that only gets closer stops on dry ground or in shallow water, not out in deep water.
+function ashore(m, path) {
+  let end = path.length;
+  while (end > 0 && wet(m.getBlock(path[end - 1], 0, 0, 0)) && wet(m.getBlock(path[end - 1], 0, -1, 0))) end--;
+  return path.slice(0, end);
+}
+
+async function planSearches(bot, goal, place, m, seen, { dig = false, onFoot = false, onFootMs = PLAN_BUDGET.onFoot, buildMs = PLAN_BUDGET.build, stopped = () => false }) {
   const here = bot.entity.position.floored();
   if (goal.isEnd(here)) return { status: 'success', path: [] };
   const digging = dig && goal.pos;
@@ -1027,15 +1318,16 @@ async function planSearches(bot, goal, place, m, doors, { dig = false, onFoot = 
   if (!foot) return null;
   if (foot.status === 'success') return { status: 'success', path: foot.path };
 
-  const left = foot.context.bestNode.h;
+  const way = ashore(bot.planModes.onFoot, foot.path);
+  const left = way.length ? footGoal.heuristic(way[way.length - 1]) : h;
   const tried = [foot.status === 'noPath'
     ? `on foot (no way within ${Math.round(h + onFootRadius(h))} blocks of walking)`
     : `on foot (nothing complete after ${onFootMs / 1000}s)`];
-  const closer = foot.path.length > 0 && h - left >= 2 ? { status: 'partial', path: foot.path, left } : null;
+  const closer = way.length > 0 && h - left >= 2 ? { status: 'partial', path: way, left } : null;
   // Still getting closer on foot when time ran out: keep walking and look again from there.
-  if (foot.status === 'timeout' && closer && h - left >= Math.max(8, h / 4)) return { ...closer, message: noRouteText(bot, goal, m, tried, 0, doors) };
+  if (foot.status === 'timeout' && closer && h - left >= Math.max(8, h / 4)) return { ...closer, message: noRouteText(bot, goal, m, tried, 0, seen) };
   if (onFoot) {
-    const message = noRouteText(bot, goal, m, tried, 0, doors);
+    const message = noRouteText(bot, goal, m, tried, 0, seen);
     return closer ? { ...closer, message } : { status: 'none', message };
   }
 
@@ -1048,10 +1340,11 @@ async function planSearches(bot, goal, place, m, doors, { dig = false, onFoot = 
   if (build.status === 'success') return { status: 'success', path: build.path };
   const how = m.allow1by1towers ? 'digging and placing' : 'digging';
   tried.push(build.status === 'noPath' ? `${how} (no way at all)` : `${how} (nothing complete after ${buildMs / 1000}s)`);
-  const message = noRouteText(bot, goal, m, tried, refused, doors);
-  if (build.status === 'timeout' && digging && build.path.length > 0) {
-    const dug = goal.heuristic(build.context.bestNode.data);
-    if (h - dug >= 2) return { status: 'partial', path: build.path, left: dug, message };
+  const message = noRouteText(bot, goal, m, tried, refused, seen);
+  const dugWay = digging ? ashore(m, build.path) : [];
+  if (build.status === 'timeout' && dugWay.length > 0) {
+    const dug = goal.heuristic(dugWay[dugWay.length - 1]);
+    if (h - dug >= 2) return { status: 'partial', path: dugWay, left: dug, message };
   }
   if (build.status === 'timeout' && closer) return { ...closer, message };
   return { status: 'none', message };
@@ -1069,6 +1362,11 @@ function ownChanges(path) {
     for (const p of step.toPlace) if (!p.useOne) cells.add(cellKey({ x: p.x + p.dx, y: p.y + p.dy, z: p.z + p.dz }));
   }
   return cells;
+}
+
+function onClimbable(bot) {
+  const feet = bot.entity && bot.blockAt(bot.entity.position, false);
+  return feet?.name === 'ladder' || feet?.name === 'vine';
 }
 
 function pathError(name, message) {
@@ -1106,6 +1404,9 @@ async function plannedGoto(bot, goal, place, dig, onFoot) {
       return { status: 'success', path: walk.steps };
     }
     bot.clearControlStates();
+    // Let go on a ladder and she slides down it while the plan, which starts where she was, is
+    // worked out. Sneaking holds her there.
+    if (onClimbable(bot)) bot.setControlState('sneak', true);
     if (walk.following) again();
     return { status: 'planning', path: [] };
   };
@@ -1184,8 +1485,9 @@ function walkFail(reason, message) {
 // digging or placing blocks on the way. A fixed goal gets its route planned first
 // (plannedGoto); a moving one (an entity) is left to the pathfinder, which keeps up with it.
 // Set dig when the walk is to a block the bot will dig out, so a buried one can be dug to, and
-// onFoot for a walk that neither digs nor places. A lever left on to get through an iron door is
-// mentioned at the end. Scaffolding the walk put down comes down again where she can reach it
+// onFoot for a walk that neither digs nor places, and keepFarmland to walk a field without
+// jumping on its farmland (treadLightly). A far goal is walked in legs (walkLegs). A lever left
+// on to get through an iron door is mentioned at the end. Scaffolding the walk put down comes down again where she can reach it
 // from where she ends up, unless the walk was stopped for something else.
 export async function walkTo(ctx, goal, options = {}) {
   const { bot } = ctx;
@@ -1193,11 +1495,13 @@ export async function walkTo(ctx, goal, options = {}) {
   const placed = [];
   const outer = bot.walkPlacements;
   bot.walkPlacements = placed;
+  const restore = options.keepFarmland ? treadLightly(bot) : null;
   let result;
   try {
-    result = await walkOnce(ctx, goal, options);
+    result = await walkLegs(ctx, goal, options);
   } finally {
     bot.walkPlacements = outer;
+    restore?.();
   }
   settleLevers(bot);
   if (placed.length && bot.walkScaffold && result.reason !== 'stopped' && result.reason !== 'interrupted') await takeDownBehind(ctx, placed);
@@ -1205,6 +1509,92 @@ export async function walkTo(ctx, goal, options = {}) {
   if (left.length === 0) return result;
   const text = left.map(({ lever, door }) => `I left the lever at ${posText(lever)} on, so the iron door at ${posText(door)} stays open`).join('. ');
   return { ...result, message: `${result.message}. ${text}` };
+}
+
+const onFarmland = (bot) => [0, -1].some((dy) => bot.blockAt(bot.entity.position.offset(0, dy, 0), false)?.name === 'farmland');
+
+// Landing from a jump can turn farmland back to dirt. For a keepFarmland walk: no parkour and no
+// sprinting, no planned jump up from farmland or onto it and no drop onto it (getNeighbors), and
+// no jump pressed while she stands on it. Returns what puts things back.
+function treadLightly(bot) {
+  const modes = [...Object.values(bot.planModes ?? {}), ...Object.values(bot.moveModes ?? {})];
+  const before = modes.map((m) => [m, m.allowParkour, m.allowSprinting, m.keepFarmland]);
+  for (const m of modes) {
+    m.allowParkour = false;
+    m.allowSprinting = false;
+    m.keepFarmland = true;
+  }
+  const onTick = () => {
+    if (!bot.entity || bot.entity.isInWater) return;
+    bot.setControlState('sprint', false);
+    if (onFarmland(bot)) bot.setControlState('jump', false);
+  };
+  bot.setControlState?.('sprint', false);
+  bot.on?.('physicsTick', onTick);
+  return () => {
+    bot.removeListener?.('physicsTick', onTick);
+    for (const [m, parkour, sprint, keep] of before) {
+      m.allowParkour = parkour;
+      m.allowSprinting = sprint;
+      m.keepFarmland = keep;
+    }
+  };
+}
+
+// A walk to a fixed goal further than LEG.far goes in legs of about LEG.length blocks, each
+// planned and walked on its own, so no one search has to reach all the way. It ends when she
+// gets there, when two legs in a row get her no closer, or when she is stopped.
+export const LEG = { far: 96, length: 64 };
+
+// Somewhere to walk to on the way to target: about length blocks along the straight line from
+// here (half that if nothing is found there), in loaded chunks, on dry ground she can stand on
+// with no lava next to it, near the height the line passes at. Null when there is nowhere.
+export function legSpot(bot, here, target) {
+  const m = bot.planModes.onFoot;
+  const line = target.minus(here);
+  for (const length of [LEG.length, LEG.length / 2]) {
+    const at = here.plus(line.scaled(length / line.norm())).floored();
+    for (let r = 0; r <= 4; r++) {
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dz = -r; dz <= r; dz++) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+          for (let i = 0; i <= 16; i++) {
+            const p = at.offset(dx, i % 2 ? (i + 1) / 2 : -i / 2, dz);
+            if (!bot.blockAt(p, false) || !standable(m, p) || m.getBlock(p, 0, 0, 0).liquid || m.lavaBeside(p)) continue;
+            return p;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function walkLegs(ctx, goal, options) {
+  const { bot } = ctx;
+  const target = goal.pos || goal.y !== undefined ? goalPos(goal) : null;
+  if (!target || 'entity' in goal || !bot.planModes) return walkOnce(ctx, goal, options);
+  const total = bot.entity.position.distanceTo(target);
+  const sofar = () => `${Math.round(Math.max(0, total - bot.entity.position.distanceTo(target)))} of ${Math.round(total)} blocks towards ${posText(target)}`;
+  let idle = 0;
+  while (bot.entity.position.distanceTo(target) > LEG.far) {
+    const left = bot.entity.position.distanceTo(target);
+    // After a leg that got nowhere (its spot may be a cave pocket or a ledge with no way up),
+    // the next one goes for the goal itself.
+    const stop = idle ? null : legSpot(bot, bot.entity.position, target);
+    ctx.status?.progress(`walking to ${posText(target)}, ${Math.round(left)} blocks to go`);
+    const leg = await walkOnce(ctx, stop ? new GoalNear(stop.x, stop.y, stop.z, 2) : goal, options);
+    if (leg.reason === 'stopped' || leg.reason === 'interrupted') return walkFail(leg.reason, `${leg.reason === 'stopped' ? 'stopped' : 'movement was interrupted'} after walking ${sofar()}, ${botPos(bot)}`);
+    if (!stop && leg.ok) return leg;
+    if (left - bot.entity.position.distanceTo(target) >= 4) {
+      idle = 0;
+    } else if (++idle >= 2) {
+      return walkFail(leg.reason ?? 'stuck', `walked ${sofar()}, then two legs in a row got no closer. The last one: ${leg.message}`);
+    }
+  }
+  const result = await walkOnce(ctx, goal, options);
+  if (result.ok || total <= LEG.far) return result;
+  return { ...result, message: `${result.message}. Walked ${sofar()} on the way` };
 }
 
 async function walkOnce(ctx, goal, { place = true, dig = false, onFoot = false }) {

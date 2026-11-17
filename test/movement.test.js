@@ -5,9 +5,9 @@ import { Vec3 } from 'vec3';
 import AStar from 'mineflayer-pathfinder/lib/astar.js';
 import Move from 'mineflayer-pathfinder/lib/move.js';
 import pathfinderPkg from 'mineflayer-pathfinder';
-import { setImmediate } from 'node:timers/promises';
+import { setImmediate, setTimeout as wait } from 'node:timers/promises';
 import { EventEmitter } from 'node:events';
-import { setupMovements, walkTo, walkPatience, followPlayer, planRoute, centreRawSteps, playerPlaced, ladderEntrySteps, doorOpener, underBot, watchScaffold } from '../src/actions/movement.js';
+import { setupMovements, walkTo, walkPatience, followPlayer, planRoute, centreRawSteps, playerPlaced, ladderEntrySteps, doorOpener, underBot, watchScaffold, doorPanel, SWIM, LEG } from '../src/actions/movement.js';
 import { DigSpot } from '../src/actions/mining.js';
 import { placeOne, removeScaffold } from '../src/actions/blocks.js';
 import { watchBuildScaffold, buildZone } from '../src/actions/build.js';
@@ -640,6 +640,81 @@ test('a step up a ladder from the side gets a step into the ladder block first, 
   assert.equal(path.length, 2);
 });
 
+// A gatehouse corner: a room with its floor at y 63 and a roof at y 69, a ladder facing east at
+// (0, 64..69, 0) on a plank wall at x -1, a spruce hatch facing east over it at (0, 70, 0), and a
+// parapet of tuff at y 70 along z -1, one higher than the roof, as in the build that stalled.
+function hatchShaft(open) {
+  const w = world();
+  slab(w, -4, 4, -4, 4);
+  slab(w, -3, 3, -1, 3, 69, 'cobbled_deepslate');
+  for (let y = 64; y <= 69; y++) {
+    w.set(0, y, 0, 'ladder', { facing: 'east', waterlogged: 'false' });
+    w.set(-1, y, 0, 'spruce_planks');
+  }
+  for (let x = -3; x <= 3; x++) for (let y = 64; y <= 68; y++) w.set(x, y, -1, 'spruce_planks');
+  for (let x = -3; x <= 3; x++) w.set(x, 70, -1, 'tuff');
+  w.set(0, 70, 0, 'spruce_trapdoor', { facing: 'east', half: 'bottom', open: String(open), powered: 'false', waterlogged: 'false' });
+  let bot;
+  const toggle = (b) => {
+    if (!b.name.endsWith('_trapdoor')) return;
+    const old = w.get(b.position);
+    w.set(b.position.x, b.position.y, b.position.z, b.name, { ...b.getProperties(), open: String(!isOpenProp(b)) });
+    bot.emit('blockUpdate', old, w.get(b.position));
+  };
+  return { w, place: (at) => (bot = physicsBot(w, at, { press: toggle })) };
+}
+
+const isOpenProp = (b) => String(b.getProperties().open) === 'true';
+
+test("an open hatch over a ladder: she can't climb on through it, so the plan steps off at the roof", () => {
+  const { w } = hatchShaft(true);
+  const m = movementsIn(w);
+  const hatch = m.getBlock(new Vec3(0, 70, 0), 0, 0, 0);
+  assert.equal(hatch.passage, true);
+  assert.equal(hatch.climbable, false);
+  const out = m.getNeighbors(new Move(0, 70, 0, 0, 0)).map((n) => `${n.x},${n.y},${n.z}`);
+  assert.ok(!out.some((c) => c.endsWith(',71,0') || c.endsWith(',71,-1')), out.join(' '));
+  assert.ok(out.includes('1,70,0'), out.join(' '));
+  // The panel is on the hatch's west edge, over the wall: nothing goes in or out that way.
+  assert.ok(!out.includes('-1,70,0'), out.join(' '));
+  const fromWall = m.getNeighbors(new Move(-1, 70, 0, 0, 0)).map((n) => `${n.x},${n.y},${n.z}`);
+  assert.ok(!fromWall.some((c) => c.startsWith('0,')), fromWall.join(' '));
+});
+
+test('up a ladder through a hatch and onto a block higher than the roof, open or shut', async () => {
+  for (const open of [true, false]) {
+    const { w, place } = hatchShaft(open);
+    const bot = place(new Vec3(0.5, 64, 0.5));
+    const result = await run(bot, walkTo({ bot, config: limits }, new GoalBlock(0, 71, -1), { place: false }));
+    assert.equal(result.ok, true, `open ${open}: ${result.message}`);
+    assert.deepEqual(bot.pressed, open ? [] : ['spruce_trapdoor']);
+  }
+});
+
+test("down through an open hatch from the wall its panel stands over: she goes round to the open side", async () => {
+  const { place } = hatchShaft(true);
+  const bot = place(new Vec3(-0.5, 70, 0.5));
+  const result = await run(bot, walkTo({ bot, config: limits }, new GoalBlock(2, 64, 2), { place: false }));
+  assert.equal(result.ok, true, result.message);
+});
+
+test('while a walk plans again on a ladder she holds on instead of sliding down', async () => {
+  const { w, out } = ladderShaft('east', false);
+  const bot = physicsBot(w, new Vec3(0.5, 58, 0.5));
+  // A search in a big world takes many slices, a tick each here.
+  const getPathFromTo = bot.pathfinder.getPathFromTo;
+  bot.pathfinder.getPathFromTo = function * (...args) {
+    for (let i = 0; i < 30; i++) yield { result: { status: 'partial', path: [] } };
+    yield * getPathFromTo.apply(this, args);
+  };
+  let lowest = Infinity;
+  bot.on('physicsTick', () => { if (!bot.pathfinder.isMoving()) lowest = Math.min(lowest, bot.entity.position.y); });
+  const result = await run(bot, walkTo({ bot, config: limits }, out, { place: false }));
+  assert.equal(result.ok, true, result.message);
+  assert.ok(lowest > 57.7, `slid to ${lowest}`);
+  assert.equal(bot.controlState.sneak, false);
+});
+
 // A wall of deepslate bricks along z = 0 with an iron door at x 0, natural stone right beside
 // and over the door, and the bot to the north.
 function ironDoorWall(opener) {
@@ -1116,4 +1191,332 @@ test('a walk never digs the block a door stands on, not even a dig walk', () => 
     assert.equal(bot.planModes[mode].safeToBreak(under), false, mode);
     assert.equal(bot.planModes[mode].safeToBreak(away), true, mode);
   }
+});
+
+test("a door's panel is on the edge the game's own door shape puts it", () => {
+  const edgeOf = ([x0, , z0, x1, , z1]) => (x1 - x0 < 1 ? (x0 === 0 ? 'west' : 'east') : (z0 === 0 ? 'north' : 'south'));
+  for (const name of ['spruce_door', 'iron_door']) {
+    for (const facing of ['north', 'east', 'south', 'west']) {
+      for (const open of ['false', 'true']) {
+        for (const hinge of ['left', 'right']) {
+          const props = { facing, open, hinge, half: 'lower' };
+          const b = Block.fromProperties(name, props, 0);
+          assert.equal(doorPanel(props), edgeOf(b.shapes[0]), `${name} ${JSON.stringify(props)}`);
+        }
+      }
+    }
+  }
+});
+
+// The bedroom the bot respawned in: a plank wall along x at z -5019 with a spruce door at
+// 2777 67 -5019 facing east, so the way through it runs north to south across the way it faces.
+function bedroomDoorway({ open = true, hinge = 'left' } = {}) {
+  const w = world();
+  slab(w, 2773, 2781, -5023, -5015, 66);
+  for (let x = 2773; x <= 2781; x++) for (let y = 67; y <= 69; y++) if (x !== 2777 || y === 69) w.set(x, y, -5019, 'spruce_planks');
+  const door = (state) => {
+    for (const [y, half] of [[67, 'lower'], [68, 'upper']]) w.set(2777, y, -5019, 'spruce_door', { facing: 'east', half, hinge, open: String(state) });
+  };
+  door(open);
+  return { w, door };
+}
+
+const doorAt = new Vec3(2777, 67, -5019);
+const outOfBedroom = new GoalBlock(2777, 67, -5015);
+
+test('the bedroom door, open across the way: the plan goes through it, whichever side it hangs on', async () => {
+  for (const hinge of ['left', 'right']) {
+    for (const open of [true, false]) {
+      const { w } = bedroomDoorway({ open, hinge });
+      const bot = liveBot(w, { at: new Vec3(2777.5, 67, -5021.5) });
+      const plan = await planRoute(bot, outOfBedroom, false);
+      assert.equal(plan.status, 'success', `hinge ${hinge}, open ${open}`);
+      assert.ok(steps(plan.path).some((c) => c.startsWith('2777,') && c.endsWith(',-5019')), steps(plan.path).join(' '));
+      assert.equal(builds(plan.path), false);
+    }
+  }
+});
+
+// A bot in the bedroom whose door the server switches when she uses it.
+function bedroomBot(state) {
+  const { w, door } = bedroomDoorway(state);
+  let bot;
+  bot = physicsBot(w, new Vec3(2777.5, 67, -5021.5), {
+    press: (b) => {
+      if (b.name !== 'spruce_door') return;
+      const old = [w.get(doorAt), w.get(doorAt.offset(0, 1, 0))];
+      door(String(b.getProperties().open) !== 'true');
+      for (const o of old) bot.emit('blockUpdate', o, w.get(o.position));
+    }
+  });
+  return { w, bot };
+}
+
+const doorOpen = (w) => String(w.get(doorAt).getProperties().open) === 'true';
+
+test('the bedroom door, open across the way: she shuts it to get out, and opens it again once past', async () => {
+  for (const hinge of ['left', 'right']) {
+    const { w, bot } = bedroomBot({ open: true, hinge });
+    let shutAsSheWent = false;
+    bot.on('physicsTick', () => {
+      if (Math.floor(bot.entity.position.z) === -5019) shutAsSheWent ||= !doorOpen(w);
+    });
+    const result = await run(bot, walkTo({ bot, config: limits }, outOfBedroom, { place: false }));
+    assert.equal(result.ok, true, `hinge ${hinge}: ${result.message}`);
+    assert.equal(shutAsSheWent, true);
+    assert.deepEqual(bot.dug, []);
+    // Put back as she found it, once she is well past.
+    await wait(900);
+    for (let i = 0; i < 5; i++) bot.tick();
+    assert.deepEqual(bot.pressed, ['spruce_door', 'spruce_door']);
+    assert.equal(doorOpen(w), true);
+  }
+});
+
+test('the bedroom door, shut: its panel is along the way, so she walks through and leaves it alone', async () => {
+  const { w, bot } = bedroomBot({ open: false });
+  const result = await run(bot, walkTo({ bot, config: limits }, outOfBedroom, { place: false }));
+  assert.equal(result.ok, true, result.message);
+  await wait(900);
+  for (let i = 0; i < 5; i++) bot.tick();
+  assert.deepEqual(bot.pressed, []);
+  assert.equal(doorOpen(w), false);
+});
+
+test('a door is gone through in one state: a move into it decides which, and the way out has to fit', () => {
+  const w = world();
+  w.floor();
+  // Shut, the panel is on the west edge; open, on the north edge.
+  w.set(0, 64, 0, 'spruce_door', { facing: 'east', half: 'lower', hinge: 'left', open: 'false' });
+  w.set(0, 65, 0, 'spruce_door', { facing: 'east', half: 'upper', hinge: 'left', open: 'false' });
+  const m = movementsIn(w);
+  const east = { x: 1, z: 0 };
+  const into = m.throughDoors(new Move(-1, 64, 0, 0, 0), east, [0, 1]);
+  assert.deepEqual(into, { cost: 1, states: 2 });
+  const inDoor = new Move(0, 64, 0, 0, 0);
+  inDoor.doorStates = into.states;
+  assert.equal(m.throughDoors(inDoor, { x: 0, z: -1 }, [0, 1]), null);
+  assert.deepEqual(m.throughDoors(inDoor, { x: 0, z: 1 }, [0, 1]), { cost: 0 });
+  // Straight through north to south it is fine shut, as it is.
+  assert.deepEqual(m.throughDoors(new Move(0, 64, -1, 0, 0), { x: 0, z: 1 }, [0, 1]), { cost: 0, states: 1 });
+});
+
+// A corridor along z, walled with bedrock at x -1 and 1, with a door or gate at 0 64 0.
+function corridor(name, props) {
+  const w = world();
+  w.floor();
+  for (let z = -4; z <= 4; z++) for (let y = 64; y <= 66; y++) for (const x of [-1, 1]) w.set(x, y, z, 'bedrock');
+  w.set(0, 64, 0, name, props.lower ?? props);
+  if (props.upper) w.set(0, 65, 0, name, props.upper);
+  return w;
+}
+
+test('a fence gate is no obstacle open, so one facing across the corridor is gone through too', () => {
+  for (const open of ['true', 'false']) {
+    const w = corridor('oak_fence_gate', { facing: 'east', open, in_wall: 'false', powered: 'false' });
+    const result = plan(w, new Vec3(0, 64, -3), new GoalBlock(0, 64, 3));
+    assert.equal(result.status, 'success', `open ${open}`);
+    assert.ok(cells(result.path).includes('0,64,0'));
+  }
+});
+
+test('an iron door hung across the way: shut she walks past its panel, open she has no way to shut it', () => {
+  const iron = (open) => {
+    const props = (half) => ({ facing: 'east', half, hinge: 'left', open, powered: open });
+    return corridor('iron_door', { lower: props('lower'), upper: props('upper') });
+  };
+  const refused = [];
+  const search = (w) => {
+    const m = movementsIn(w);
+    m.onRefusedDoor = (door) => refused.push(door);
+    return new AStar(new Move(0, 64, -3, 0, 0), m, new GoalBlock(0, 64, 3), 5000, 10000, -1).compute();
+  };
+  const shut = search(iron('false'));
+  assert.equal(shut.status, 'success');
+  assert.ok(cells(shut.path).includes('0,64,0'));
+  assert.notEqual(search(iron('true')).status, 'success');
+  assert.deepEqual(refused, []);
+});
+
+// A lake right across a strip that is walled off with bedrock at z -5 and 5, so there is no way
+// round: stone ground with its top at y 64 on both sides, and water from the bed up to surface.
+function lake(width, { surface = 63, depth = 4, plants = false, bridge = false } = {}) {
+  const w = world();
+  for (let x = -12; x < width + 12; x++) {
+    for (let z = -5; z <= 5; z++) {
+      if (Math.abs(z) === 5) {
+        for (let y = 55; y <= 72; y++) w.set(x, y, z, 'bedrock');
+      } else if (x >= 0 && x < width && !(bridge && z === 4)) {
+        w.set(x, surface - depth, z, 'stone');
+        for (let y = surface - depth + 1; y <= surface; y++) w.set(x, y, z, 'water', { level: 0 });
+        if (plants) w.set(x, surface - depth + 1, z, 'seagrass');
+      } else {
+        for (let y = 58; y <= 63; y++) w.set(x, y, z, 'stone');
+      }
+    }
+  }
+  return w;
+}
+
+// The longest run of ticks with her eyes under water.
+function watchBreath(bot, w) {
+  const breath = { run: 0, most: 0 };
+  bot.on('physicsTick', () => {
+    breath.run = w.get(bot.entity.position.offset(0, 1.62, 0)).name === 'water' ? breath.run + 1 : 0;
+    breath.most = Math.max(breath.most, breath.run);
+  });
+  return breath;
+}
+
+const inWater = (w, p) => w.get(p).name === 'water';
+
+test('across a lake with banks as high as the water she swims over and climbs out, head above water', async () => {
+  // The pathfinder alone had no way out of deep water onto a bank like that: she swam out and
+  // stopped in the water, as on the lake by the wall where she drowned.
+  const w = lake(10);
+  const bot = physicsBot(w, new Vec3(-5.5, 64, 0.5));
+  const breath = watchBreath(bot, w);
+  const result = await run(bot, walkTo({ bot, config: limits }, new GoalBlock(14, 64, 0), { onFoot: true }), 1500);
+  assert.equal(result.ok, true, result.message);
+  assert.equal(breath.most, 0);
+});
+
+test('a lake wider than she swims: she stays on the bank, and the failure names the water and the dry ground on each side', async () => {
+  const w = lake(SWIM.most + 1);
+  const bot = physicsBot(w, new Vec3(-5.5, 64, 0.5));
+  const result = await run(bot, walkTo({ bot, config: limits }, new GoalBlock(SWIM.most + 5, 64, 0), { onFoot: true }), 1500);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /Water is in the way from 0 63 0 to 12 63 0, about 13 blocks across/);
+  assert.match(result.message, /Dry ground on my side at -1 64 0, on the far side at 13 64 0/);
+  assert.ok(bot.entity.position.x < 0 && !inWater(w, bot.entity.position), bot.entity.position.toString());
+});
+
+test('a bank higher than the water: she does not swim out to where she cannot climb out', async () => {
+  const w = lake(6, { surface: 62 });
+  const bot = physicsBot(w, new Vec3(-5.5, 64, 0.5));
+  const result = await run(bot, walkTo({ bot, config: limits }, new GoalBlock(10, 64, 0), { onFoot: true }), 1500);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /Water is in the way from 0 62 0 to 5 62 0/);
+  assert.ok(bot.entity.position.x < 0 && !inWater(w, bot.entity.position), bot.entity.position.toString());
+});
+
+test('a dry way round of a few blocks beats a swim', () => {
+  const result = plan(lake(6, { bridge: true }), new Vec3(-3, 64, 0), new GoalBlock(9, 64, 0));
+  assert.equal(result.status, 'success');
+  assert.ok(result.path.every((n) => n.y === 64), steps(result.path).join(' '));
+});
+
+test('no step ends with her head under water, going in from a bank or out over seagrass', () => {
+  const w = lake(6, { plants: true });
+  const m = movementsIn(w);
+  assert.equal(m.getBlock(new Vec3(2, 60, 0), 0, 0, 0).liquid, true);
+  // From the bank a drop lands a block under the surface: the way in is at the surface instead.
+  const fromBank = m.getNeighbors(new Move(-1, 64, 0, 0, 0)).filter((n) => n.x === 0);
+  assert.ok(fromBank.length > 0);
+  assert.ok(fromBank.every((n) => n.y === 63), cells(fromBank).join(' '));
+  const result = plan(w, new Vec3(-3, 64, 0), new GoalBlock(9, 64, 0));
+  assert.equal(result.status, 'success');
+  assert.ok(result.path.every((n) => !inWater(w, n.offset(0, 1, 0))), steps(result.path).join(' '));
+  // Under water already, the way is up.
+  assert.ok(m.getNeighbors(new Move(2, 61, 0, 0, 0)).some((n) => n.x === 2 && n.y === 62 && n.z === 0));
+});
+
+const LAVA_AROUND = [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]].flatMap(([x, , z]) => [-1, 0, 1].map((y) => [x, y, z])).concat([[0, 2, 0]]);
+const byLava = (w, n) => LAVA_AROUND.some(([x, y, z]) => w.get(n.offset(x, y, z)).name === 'lava');
+
+test('a walk past a lava pool keeps a block away from it', () => {
+  const w = world();
+  slab(w, -6, 6, -3, 3);
+  for (let x = -1; x <= 1; x++) for (let z = -3; z <= -1; z++) w.set(x, 63, z, 'lava', { level: 0 });
+  const result = plan(w, new Vec3(-5, 64, -1), new GoalBlock(5, 64, -1));
+  assert.equal(result.status, 'success');
+  assert.ok(!result.path.some((n) => byLava(w, n)), steps(result.path).join(' '));
+});
+
+test('lava across a tunnel: no way on foot, not even a jump over it, and the failure says where the lava is', async () => {
+  const w = world();
+  for (let x = -6; x <= 8; x++) {
+    w.set(x, 63, 0, 'stone');
+    w.set(x, 67, 0, 'bedrock');
+    for (let y = 63; y <= 67; y++) for (const z of [-1, 1]) w.set(x, y, z, 'bedrock');
+  }
+  // With a hole on each side of the lava, a sprint jump would clear all three.
+  w.set(1, 63, 0, 'air');
+  w.set(2, 63, 0, 'lava', { level: 0 });
+  w.set(3, 63, 0, 'air');
+  const bot = liveBot(w, { at: new Vec3(-4.5, 64, 0.5) });
+  const result = await planRoute(bot, new GoalBlock(6, 64, 0), false, { onFoot: true });
+  // As close as she gets, which stops short of the lava.
+  assert.equal(result.status, 'partial');
+  assert.ok(result.path.every((n) => n.x < 1), steps(result.path).join(' '));
+  assert.match(result.message, /Lava at 2 63 0 is in the way, and I never walk through lava or next to it/);
+});
+
+// A field of farmland at y 63 from x -3 to 3, a stone step a block higher from x 4 to 6, and a
+// stone path along z 4 beside the field.
+function field() {
+  const w = world();
+  slab(w, -3, 3, -3, 3, 63, 'farmland');
+  slab(w, -3, 3, 4, 4);
+  slab(w, 4, 6, -3, 4);
+  slab(w, 4, 6, -3, 4, 64);
+  return w;
+}
+
+const jumpsOnFarmland = (w, path, from) => path.some((n, i) => {
+  const prev = i ? path[i - 1] : from;
+  const farm = (p) => w.get(p.offset(0, -1, 0)).name === 'farmland';
+  return (n.y > prev.y && (farm(prev) || farm(n))) || (n.y < prev.y && farm(n));
+});
+
+test('keepFarmland: the plan steps up off the path beside the field, never off the farmland', () => {
+  const w = field();
+  const from = new Vec3(0, 64, 0);
+  const goal = new GoalBlock(5, 65, 0);
+  assert.ok(jumpsOnFarmland(w, plan(w, from, goal).path, from));
+  const m = movementsIn(w);
+  Object.assign(m, { keepFarmland: true, allowParkour: false, allowSprinting: false });
+  const result = new AStar(new Move(0, 64, 0, 0, 0), m, goal, 5000, 10000, -1).compute();
+  assert.equal(result.status, 'success');
+  assert.ok(!jumpsOnFarmland(w, result.path, from), steps(result.path).join(' '));
+});
+
+test('keepFarmland: walking off the field she never jumps on farmland, and the walk settings go back after', async () => {
+  const w = field();
+  const bot = physicsBot(w, new Vec3(0.5, 63.9375, 0.5));
+  let jumped = 0;
+  bot.on('physicsTick', () => {
+    const p = bot.entity.position;
+    if (bot.controlState.jump && [0, -1].some((dy) => w.get(p.offset(0, dy, 0)).name === 'farmland')) jumped++;
+  });
+  const result = await run(bot, walkTo({ bot, config: limits }, new GoalBlock(5, 65, 0), { onFoot: true, keepFarmland: true }), 1500);
+  assert.equal(result.ok, true, result.message);
+  assert.equal(jumped, 0);
+  assert.equal(bot.planModes.onFoot.allowParkour, true);
+  assert.equal(bot.moveModes.follow.allowSprinting, true);
+  assert.ok(!bot.planModes.onFoot.keepFarmland);
+});
+
+test('a far walk goes in legs, saying how far is left each time, and gets there', async () => {
+  const w = world();
+  slab(w, -2, 205, -2, 2);
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5));
+  const progress = [];
+  const ctx = { bot, config: limits, status: { progress: (text) => progress.push(text) } };
+  const result = await run(bot, walkTo(ctx, new GoalNear(200, 64, 0, 1)), 4000);
+  assert.equal(result.ok, true, result.message);
+  assert.ok(progress.length >= 2, progress.join(' | '));
+  assert.match(progress[0], /^walking to 200 64 0, 200 blocks to go$/);
+  assert.ok(LEG.far < 200);
+});
+
+test('a far walk stops after two legs in a row get no closer, and says how far she got', async () => {
+  const w = world();
+  slab(w, -2, 245, -2, 2);
+  for (let y = 64; y <= 72; y++) for (let z = -2; z <= 2; z++) w.set(90, y, z, 'bedrock');
+  const bot = physicsBot(w, new Vec3(0.5, 64, 0.5));
+  const result = await run(bot, walkTo({ bot, config: limits }, new GoalNear(240, 64, 0, 1)), 4000);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /^walked \d+ of 240 blocks towards 240 64 0, then two legs in a row got no closer\. The last one: no route found/);
+  assert.ok(bot.entity.position.x > 50 && bot.entity.position.x < 90, bot.entity.position.toString());
 });
