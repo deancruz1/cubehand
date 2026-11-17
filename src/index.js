@@ -96,7 +96,8 @@ const status = new Status({
   quietSeconds: config.limits.quietSeconds
 });
 // requester is the player whose job is running, or null for the bot's own chores.
-const makeCtx = (signal) => ({ bot: currentBot(), config, signal, memory, placed, tended, areas, smeltJobs, status, skills, log, requester: brain.current?.self ? null : brain.current?.player ?? null });
+// renders is the folder preview_structure and view_area keep their pictures in.
+const makeCtx = (signal) => ({ bot: currentBot(), config, signal, memory, placed, tended, areas, smeltJobs, status, skills, log, renders: 'renders', requester: brain.current?.self ? null : brain.current?.player ?? null });
 
 function snapshot() {
   const bot = currentBot();

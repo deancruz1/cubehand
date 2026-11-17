@@ -1,5 +1,6 @@
 // The call to the API for a job's step, what each model takes in it, and the log of a refused one.
 import { createHash } from 'node:crypto';
+import { withoutPictureData } from './brainpictures.js';
 
 const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 
@@ -15,11 +16,11 @@ export const hasSystemMessages = (model) => /opus-5|opus-4-8|fable|mythos|sonnet
 export const apiMethods = {
   // With claude.streaming on, the answer streams in and onEvent(event, message so far) hears each
   // part of it. Either way this resolves with the whole message.
-  createMessage(messages, signal, effort = this.config.claude.effort, model = this.config.claude.model, onEvent = null) {
+  createMessage(messages, signal, effort = this.config.claude.effort, model = this.config.claude.model, onEvent = null, maxTokens = this.config.claude.maxTokens) {
     const { claude } = this.config;
     const params = {
       model,
-      max_tokens: claude.maxTokens,
+      max_tokens: maxTokens,
       system: this.systemBlocks,
       tools: strictTools(claude, model) ? this.tools : this.looseTools,
       messages,
@@ -66,7 +67,7 @@ export const apiMethods = {
         strictTools: strictTools(this.config.claude, model),
         system: { length: this.system.length, sha256: createHash('sha256').update(this.system).digest('hex') },
         tools: this.tools.map((t) => t.name),
-        messages
+        messages: withoutPictureData(messages)
       }
     });
     this.log(

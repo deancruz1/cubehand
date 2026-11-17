@@ -8,6 +8,9 @@ import { isAdmin } from './guard.js';
 // The model is told once, when this many steps are left, so it can finish up.
 export const STEPS_WARNING = 3;
 export const STEPS_LEFT = `This job has ${STEPS_WARNING} steps left, this one included. Use them to finish up, or to tell the player what is still left to do.`;
+// A build job whose reply ran out of room is told so this many times before the job ends on it.
+export const MAX_CUT_OFFS = 2;
+export const PLAN_CUT_OFF = 'Your last reply got cut off: the plan was too long for one reply, so none of it ran and nothing was placed. Build in sections instead, the shell first, then the roof, then the details and surroundings, and preview each one before you build it. Shorten each plan with repeat, mirror and kit parts where they fit.';
 
 // Why a held job stopped its tool, as the model is told it.
 export const HOLD_CAUSES = {

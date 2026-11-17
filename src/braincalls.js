@@ -2,6 +2,7 @@
 // state (see brainsteps.js).
 import { asText } from './lessons.js';
 import { isBuildCall } from './brainroute.js';
+import { MAX_PICTURE_RESULTS, PICTURE_LIMIT, hasPictures, toolContent, picturesNote, picturesText } from './brainpictures.js';
 import { STEPS_WARNING, HOLD_CAUSES, NOT_YOURS, EARLIER_FAILED, MAX_NUDGES, FINISH_MORE, OR_ESCALATE, promisesMore, unsavedRules, ruleNudge } from './brainlines.js';
 
 // Time inside a tool doesn't count against the job, but one call is stopped after this long, so a
@@ -113,6 +114,7 @@ function becomeBuild(brain, run) {
   run.maxSteps = Math.max(run.maxSteps, run.buildSteps);
   if (run.warned && run.maxSteps - run.step >= STEPS_WARNING) run.warned = false;
   run.effort = run.moreEffort;
+  run.maxTokens = run.moreTokens;
   if (run.record) run.record.effort = run.effort;
   run.clock.setLimit(Math.max(run.clock.limit, run.buildSeconds * 1000));
   brain.log('[brain] this job is a build now');
@@ -123,6 +125,15 @@ async function toolCall(brain, run, turn, block) {
   const building = !run.self && isBuildCall(block);
   brain.log(`[tool] ${block.name} ${JSON.stringify(block.input)}`);
   if (building && !run.build) becomeBuild(brain, run);
+  const turnedBack = brain.previewFirst(run, block);
+  if (turnedBack) {
+    brain.log('[brain] turned back build_structure: that plan was not previewed');
+    turn.toolLog.push({ name: block.name, ok: false, ms: 0, error: turnedBack });
+    job.ran.push(`${block.name} (turned back, not previewed)`);
+    turn.failed = true;
+    notDone(turn, block, turnedBack);
+    return;
+  }
   const tool = new AbortController();
   job.tool = tool;
   const watch = brain.watchTool?.(block.name, tool);
@@ -148,6 +159,7 @@ async function toolCall(brain, run, turn, block) {
     job.running = null;
     clock.release('tool');
   }
+  brain.notePlan(block, result);
   // After a long build there's always a little time left to check on it.
   if (building) clock.setLimit(Math.max(clock.limit, clock.used + 120000));
   toolResult(brain, run, turn, block, { result, tool, watch, toolSeconds, ran });
@@ -171,8 +183,16 @@ function toolResult(brain, run, turn, block, { result, tool, watch, toolSeconds,
     turn.heldUp = why;
     content += ` (Stopped because ${HOLD_CAUSES[why]}, see below.)`;
   }
-  brain.log(`[tool] -> ${result.ok && !why ? 'ok' : 'failed'}: ${result.message}${why ? ` (${why})` : ''}`);
   const ok = Boolean(result.ok && !why);
+  // Only a call that went through hands its pictures on, and only up to the job's limit. The
+  // count is on the job, so a hand-over or a restart on another model keeps it.
+  let images = ok && hasPictures(result.images) ? result.images : null;
+  if (images && (job.pictureResults ?? 0) >= MAX_PICTURE_RESULTS) {
+    brain.log(`[brain] left out ${images.length} picture${images.length === 1 ? '' : 's'}: the job has had ${MAX_PICTURE_RESULTS} results with pictures`);
+    images = null;
+    content += `\n${PICTURE_LIMIT}`;
+  } else if (images) job.pictureResults = (job.pictureResults ?? 0) + 1;
+  brain.log(`[tool] -> ${result.ok && !why ? 'ok' : 'failed'}: ${result.message}${why ? ` (${why})` : ''}${picturesText(images)}`);
   if (ok && block.name === 'remember') {
     job.savedRules = job.rules.length;
     job.heard = [];
@@ -186,6 +206,7 @@ function toolResult(brain, run, turn, block, { result, tool, watch, toolSeconds,
     ok,
     ms: Date.now() - ran,
     ...action,
+    ...picturesNote(images),
     ...(ok ? {} : { error: String(content).slice(0, 300) }),
     ...(interrupted ? { interrupted: true } : {})
   });
@@ -203,7 +224,7 @@ function toolResult(brain, run, turn, block, { result, tool, watch, toolSeconds,
   turn.results.push({
     type: 'tool_result',
     tool_use_id: block.id,
-    content,
+    content: toolContent(content, images),
     ...(result.ok && why !== 'stuck' ? {} : { is_error: true })
   });
 }

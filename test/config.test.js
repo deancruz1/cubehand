@@ -118,6 +118,19 @@ test('streaming defaults to on and can be turned off', () => {
   assert.equal(validateConfig(raw, env).claude.streaming, false);
 });
 
+test('buildMaxTokens defaults to 32000 and must be a whole number above 0', () => {
+  const raw = copy();
+  assert.equal(validateConfig(raw, env).claude.buildMaxTokens, 32000);
+  delete raw.claude.buildMaxTokens;
+  assert.equal(validateConfig(raw, env).claude.buildMaxTokens, 32000);
+  raw.claude.buildMaxTokens = 48000;
+  assert.equal(validateConfig(raw, env).claude.buildMaxTokens, 48000);
+  for (const value of [0, -1, 2.5, '32000']) {
+    raw.claude.buildMaxTokens = value;
+    assert.throws(() => validateConfig(raw, env), /claude\.buildMaxTokens/);
+  }
+});
+
 test('security defaults to 12 hours, 5 tries and 10 minutes, and each must be above 0', () => {
   const raw = copy();
   assert.deepEqual(validateConfig(raw, env).security, { sessionHours: 12, maxTries: 5, lockMinutes: 10 });

@@ -5,7 +5,9 @@ import { isStandingOrder, workOrder } from './chat.js';
 const BUILD_VERB = /(?<!\b(?:the|your|my|our|this|that|his|her|their|a)\s+)(?<!\b(?:did|have|has|had)\s+(?:you|she|he|we|they|i)\s+)\b(?:re)?(?:build|construct)\b/i;
 // "make me a small house", but not "make a door for the house".
 const MAKE_STRUCTURE = /\b(?:make|put up|set up|raise)\b(?:\s+(?!(?:in|at|near|by|to|for|from|of|on|inside|behind|next|beside|around|into|with|under)\b)[\w']+){0,4}?\s+(?:house|hut|cabin|shelter|tower|bridge|castle|barn|shed|wall|fort)s?\b/i;
-const BUILD_TOOLS = new Set(['build_house', 'build_structure', 'copy_structure']);
+// Asking for the design guide and previewing a plan are part of building, so they get the build
+// budget too.
+const BUILD_TOOLS = new Set(['build_house', 'build_structure', 'copy_structure', 'design_guide', 'preview_structure']);
 // A build_structure of at most this many blocks, counting every block in the box of each part, is
 // a patch (filling a few ore holes, say), not a build: it runs on the model that asked for it,
 // with the usual budget. A roof is never a patch.

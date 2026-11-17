@@ -532,6 +532,53 @@ test('a job that turns into a build gets the build budget', async () => {
   assert.deepEqual(client.calls[1].params.output_config, { effort: 'high' });
 });
 
+test('a build job gets the bigger reply cap from when it becomes a build, other jobs the normal one, and never less than maxTokens', async () => {
+  const capOf = async (text, config = baseConfig) => {
+    const client = fakeClient([reply('end_turn', [])]);
+    await makeBrain({ client, config }).brain.start({ player: 'Steve', text });
+    return client.calls[0].params.max_tokens;
+  };
+  assert.equal(await capOf('build a house here'), 32000);
+  assert.equal(await capOf('mine some stone'), 16000);
+  const withCap = (buildMaxTokens) => ({ ...baseConfig, claude: { ...baseConfig.claude, buildMaxTokens } });
+  assert.equal(await capOf('build a house here', withCap(40000)), 40000);
+  assert.equal(await capOf('build a house here', withCap(8000)), 16000);
+
+  const client = fakeClient([reply('tool_use', [toolUse('a', 'build_house', { x: 0, y: 64, z: 0 })]), reply('end_turn', [])]);
+  await makeBrain({ client }).brain.start({ player: 'Steve', text: 'carry on' });
+  assert.deepEqual(client.calls.map((c) => c.params.max_tokens), [16000, 32000]);
+});
+
+test('with streaming off a build job keeps the normal reply cap', async () => {
+  const client = fakeClient([reply('end_turn', [])]);
+  await makeBrain({ client, config: { ...plain, claude: { ...plain.claude, buildMaxTokens: 32000 } } }).brain.start({ player: 'Steve', text: 'build a house here' });
+  assert.equal(client.calls[0].streamed, undefined);
+  assert.equal(client.calls[0].params.max_tokens, 16000);
+  assert.deepEqual(client.calls[0].params.output_config, { effort: 'high' });
+});
+
+test('a build step cut off mid-plan is asked for again in sections, twice at most, and other jobs still end on it', async () => {
+  for (const config of [plain, baseConfig]) {
+    const half = toolUse('a', 'build_structure', { origin: { x: 0, y: 64, z: 0 }, parts: [] });
+    const client = fakeClient([reply('max_tokens', [{ type: 'text', text: 'Building the bridge.' }, half]), reply('end_turn', [{ type: 'text', text: 'Built it.' }])]);
+    const { brain, said, toolCalls } = makeBrain({ client, config });
+    await brain.start({ player: 'Steve', text: 'build a bridge here' });
+    assert.equal(client.calls.length, 2);
+    assert.equal(toolCalls.length, 0);
+    const second = JSON.stringify(client.calls[1].params.messages);
+    assert.match(second, /the plan was too long for one reply, so none of it ran/);
+    assert.match(second, /the shell first, then the roof, then the details and surroundings/);
+    assert.ok(!second.includes('Building the bridge.'));
+    assert.ok(!said.some((line) => /cut off/.test(line)));
+
+    const always = fakeClient(() => reply('max_tokens', []));
+    const cut = makeBrain({ client: always, config });
+    await cut.brain.start({ player: 'Steve', text: 'build a bridge here' });
+    assert.equal(always.calls.length, 3);
+    assert.deepEqual(cut.said, ['My answer got cut off. Try asking for something smaller.']);
+  }
+});
+
 test('time spent building does not count against the job', async () => {
   const client = fakeClient([
     reply('tool_use', [toolUse('a', 'build_house', { x: 0, y: 64, z: 0 })]),
@@ -3818,4 +3865,201 @@ test('a request she dies doing a second time is not picked up again', async () =
   assert.equal(client.calls.length, 2);
   assert.match(textOf(client.calls[1].params.messages[0].content), /You were doing Steve's request "mine by the lava" when you died, and you had died doing it once before, so it won't be picked up again/);
   assert.equal(brain.queue.length, 0);
+});
+
+
+// A tool that hands back pictures, the way preview_structure and view_area do.
+const PIXELS = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+const pictureTool = (labels) => async (name) => ({ ok: true, message: `${name} drew it`, images: labels.map((label) => ({ media_type: 'image/png', data: PIXELS, label })) });
+
+test('a tool that returns pictures sends them in its result, after the text, each with its label', async () => {
+  const lines = [];
+  const logged = [];
+  const client = fakeClient([
+    reply('tool_use', [toolUse('a', 'preview_structure', { origin: { x: 0, y: 64, z: 0 }, parts: [] })]),
+    reply('end_turn', [{ type: 'text', text: 'Looks plain, I will add a roof.' }])
+  ]);
+  const { brain } = makeBrain({ client, config: plain, runTool: pictureTool(['south-east', 'top']), jobLog: { write: (line) => lines.push(line) }, log: (line) => logged.push(line) });
+  await brain.start({ player: 'Steve', text: 'Clodine build a hut' });
+  const result = client.calls[1].params.messages.at(-1).content[0];
+  assert.deepEqual(result, {
+    type: 'tool_result',
+    tool_use_id: 'a',
+    content: [
+      { type: 'text', text: 'preview_structure drew it' },
+      { type: 'text', text: 'Picture 1: south-east' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PIXELS } },
+      { type: 'text', text: 'Picture 2: top' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PIXELS } }
+    ]
+  });
+  assert.deepEqual(lines[0].steps[0].tools[0].images, { count: 2, labels: ['south-east', 'top'] });
+  assert.ok(!JSON.stringify(lines).includes(PIXELS));
+  assert.ok(!logged.join('\n').includes(PIXELS));
+  assert.ok(logged.includes('[tool] -> ok: preview_structure drew it (+2 pictures: south-east, top)'));
+});
+
+test('a failed tool sends its text only, without pictures, and looking is no build', async () => {
+  const client = fakeClient([reply('tool_use', [toolUse('a', 'view_area', { x1: 0, y1: 0, z1: 0, x2: 1, y2: 1, z2: 1 })]), reply('end_turn', [])]);
+  const runTool = async () => ({ ok: false, message: 'part of the box is not loaded', images: [{ media_type: 'image/png', data: PIXELS, label: 'top' }] });
+  const logged = [];
+  const { brain } = makeBrain({ client, config: plain, runTool, log: (line) => logged.push(line) });
+  await brain.start({ player: 'Steve', text: 'Clodine look at the house' });
+  const result = client.calls[1].params.messages.at(-1).content[0];
+  assert.equal(typeof result.content, 'string');
+  assert.match(result.content, /^part of the box is not loaded/);
+  assert.equal(result.is_error, true);
+  assert.ok(!logged.includes('[brain] this job is a build now'));
+});
+
+test('only the first 12 picture results in a job carry pictures, and the conversation is only added to', async () => {
+  const look = (i) => reply('tool_use', [{ type: 'thinking', thinking: `thought ${i}`, signature: `sig${i}` }, toolUse(`t${i}`, 'view_area', { x1: 0, y1: 64, z1: 0, x2: 4, y2: 68, z2: 4 })]);
+  const client = fakeClient([...Array.from({ length: 13 }, (_, i) => look(i)), reply('end_turn', [{ type: 'text', text: 'Seen it.' }])]);
+  const lines = [];
+  const { brain, toolCalls } = makeBrain({ client, config: plain, runTool: pictureTool(['top']), jobLog: { write: (line) => lines.push(line) } });
+  await brain.start({ player: 'Steve', text: 'Clodine look around the house' });
+  assert.equal(client.calls.length, 14);
+  const last = client.calls[13].params.messages;
+  const results = last.filter((m) => m.role === 'user' && Array.isArray(m.content)).map((m) => m.content[0]);
+  assert.equal(results.length, 13);
+  assert.ok(results.slice(0, 12).every((r) => Array.isArray(r.content) && r.content[2].type === 'image'));
+  assert.equal(typeof results[12].content, 'string');
+  assert.match(results[12].content, /\n\(No pictures with this one: this job has reached its limit of 12 results with pictures\. A new request starts a fresh count\.\)$/);
+  assert.equal(results[12].is_error, undefined);
+  // Every request starts with the one before it, unchanged, thinking and pictures included.
+  for (let i = 1; i < client.calls.length; i++) {
+    const before = client.calls[i - 1].params.messages;
+    assert.deepEqual(client.calls[i].params.messages.slice(0, before.length), before);
+  }
+  assert.equal(toolCalls.length, 0);
+  assert.equal(lines[0].steps[12].tools[0].images, undefined);
+  assert.deepEqual(lines[0].steps[11].tools[0].images, { count: 1, labels: ['top'] });
+});
+
+test('view_area is no build, a build job that looks afterwards keeps its build budget, and design_guide is build work', async () => {
+  const config = { ...plain, limits: { ...plain.limits, maxSteps: 3, buildMaxSteps: 6 } };
+  const wall = { origin: { x: 0, y: 64, z: 0 }, parts: [{ shape: 'walls', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 6, dy: 3, dz: 6 }, block: 'oak_planks' }] };
+  const look = toolUse('v', 'view_area', { x1: 0, y1: 64, z1: 0, x2: 6, y2: 67, z2: 6 });
+  const built = fakeClient((n) => reply('tool_use', [n === 1 ? toolUse('b', 'build_structure', wall) : { ...look, id: `v${n}` }]));
+  const logged = [];
+  const job = makeBrain({ client: built, config, runTool: pictureTool(['south-east']), log: (line) => logged.push(line) });
+  await job.brain.start({ player: 'Steve', text: 'Clodine make it look nice' });
+  assert.equal(built.calls.length, 6);
+  assert.equal(logged.filter((l) => l === '[brain] this job is a build now').length, 1);
+
+  const looked = fakeClient((n) => reply('tool_use', [{ ...look, id: `v${n}` }]));
+  const quick = makeBrain({ client: looked, config, runTool: pictureTool(['south-east']) });
+  await quick.brain.start({ player: 'Steve', text: 'Clodine look at that' });
+  assert.equal(looked.calls.length, 3);
+
+  // Asking for the design guide is build work from that step on.
+  const guided = fakeClient((n) => reply('tool_use', [toolUse(`g${n}`, 'design_guide', { structure: 'cabin' })]));
+  const guide = makeBrain({ client: guided, config, log: (line) => logged.push(line) });
+  await guide.brain.start({ player: 'Steve', text: 'Clodine something nice please' });
+  assert.equal(guided.calls.length, 6);
+  assert.equal(logged.filter((l) => l === '[brain] this job is a build now').length, 2);
+});
+
+test('a refused request is saved without the picture data', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'brain-pictures-'));
+  try {
+    const client = fakeClient([reply('tool_use', [toolUse('a', 'view_area', { x1: 0, y1: 0, z1: 0, x2: 1, y2: 1, z2: 1 })]), refusal('cyber'), refusal('cyber'), refusal('cyber')]);
+    const refusalLog = new RefusalLog(join(dir, 'refusals'), 20, () => {});
+    const brain = new Brain({ client, config: plain, refusalLog, runTool: pictureTool(['top']), snapshot: () => 'SNAPSHOT', say: () => {}, log: () => {} });
+    await brain.start({ player: 'Steve', text: 'look at the house' });
+    const files = readdirSync(join(dir, 'refusals'));
+    assert.ok(files.length >= 1);
+    const text = readFileSync(join(dir, 'refusals', files.sort()[0]), 'utf8');
+    assert.ok(!text.includes(PIXELS));
+    const saved = JSON.parse(text);
+    const image = saved.request.messages[2].content[0].content[2];
+    assert.equal(image.type, 'image');
+    assert.equal(image.source.data, `(${PIXELS.length} base64 characters left out)`);
+    assert.equal(client.calls[1].params.messages[2].content[0].content[2].source.data, PIXELS);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A house plan big enough to need a look first: one part's box is 7 by 4 by 7.
+const housePlan = {
+  origin: { x: 100, y: 64, z: 200 },
+  palette: { wall: 'oak_planks' },
+  parts: [{ shape: 'walls', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 6, dy: 3, dz: 6 }, block: 'oak_planks' }],
+  blocks: [{ dx: 3, dy: 0, dz: 0, block: 'air' }]
+};
+// Calls each step in turn, then a plain reply.
+const callsClient = (...steps) => fakeClient([...steps.map((s, i) => reply('tool_use', [toolUse(`c${i}`, s[0], s[1])])), reply('end_turn', [{ type: 'text', text: 'Done.' }])]);
+const ranTools = (toolCalls) => toolCalls.map((t) => t.name);
+
+test('a big build_structure is turned back until that plan was previewed', async () => {
+  const client = callsClient(['build_structure', housePlan]);
+  const logged = [];
+  const { brain, toolCalls } = makeBrain({ client, config: plain, log: (line) => logged.push(line) });
+  await brain.start({ player: 'Steve', text: 'Clodine build a house here' });
+  assert.deepEqual(toolCalls, []);
+  const result = client.calls[1].params.messages.at(-1).content[0];
+  assert.equal(result.is_error, true);
+  assert.equal(result.content, 'Not built: preview this plan first with preview_structure, look at the pictures, fix what looks plain or wrong, then call build_structure with the plan you previewed (it may go at another origin).');
+  assert.ok(logged.includes('[brain] turned back build_structure: that plan was not previewed'));
+});
+
+test('a previewed plan builds, at another origin and with its keys in another order too', async () => {
+  const moved = { blocks: housePlan.blocks, parts: [{ block: 'oak_planks', to: { dz: 6, dy: 3, dx: 6 }, from: { dz: 0, dy: 0, dx: 0 }, shape: 'walls' }], palette: { wall: 'oak_planks' }, origin: { x: 5, y: 70, z: 5 } };
+  const client = callsClient(['preview_structure', { ...housePlan, views: ['top'], cut_above: 2 }], ['build_structure', housePlan], ['build_structure', moved]);
+  const { brain, toolCalls } = makeBrain({ client, config: plain });
+  await brain.start({ player: 'Steve', text: 'Clodine build a house here' });
+  assert.deepEqual(ranTools(toolCalls), ['preview_structure', 'build_structure', 'build_structure']);
+
+  // A different plan is still turned back.
+  const other = callsClient(['build_structure', { ...housePlan, palette: { wall: 'spruce_planks' } }]);
+  const again = makeBrain({ client: other, config: plain });
+  again.brain.previewedPlans = brain.previewedPlans;
+  await again.brain.start({ player: 'Steve', text: 'Clodine build a house here' });
+  assert.deepEqual(again.toolCalls, []);
+});
+
+test('small plans, dry runs and a plan built before go straight through', async () => {
+  const wall = { origin: { x: 0, y: 64, z: 0 }, parts: [{ shape: 'fill', from: { dx: 0, dy: 0, dz: 0 }, to: { dx: 9, dy: 3, dz: 0 }, block: 'cobblestone' }] };
+  const client = callsClient(['build_structure', wall], ['build_structure', { ...housePlan, dry_run: true }]);
+  const { brain, toolCalls } = makeBrain({ client, config: plain });
+  await brain.start({ player: 'Steve', text: 'Clodine build a wall' });
+  assert.deepEqual(ranTools(toolCalls), ['build_structure', 'build_structure']);
+
+  // Eight parts and blocks together count as big, however small each is.
+  const bits = { origin: { x: 0, y: 64, z: 0 }, blocks: Array.from({ length: 8 }, (_, i) => ({ dx: i, dy: 0, dz: 0, block: 'torch' })) };
+  const torches = makeBrain({ client: callsClient(['build_structure', bits]), config: plain });
+  await torches.brain.start({ player: 'Steve', text: 'Clodine put torches along there' });
+  assert.deepEqual(torches.toolCalls, []);
+
+  // Once built, the same plan at the same spot is mostly standing, so it goes through again.
+  const built = makeBrain({ client: callsClient(['build_structure', housePlan]), config: plain });
+  built.brain.builtPlans = [];
+  built.brain.notePlan({ name: 'build_structure', input: housePlan }, { ok: true, message: 'placed 3' });
+  await built.brain.start({ player: 'Steve', text: 'Clodine carry on with the house' });
+  assert.deepEqual(ranTools(built.toolCalls), ['build_structure']);
+});
+
+test('a plan previewed in one job can be built in a later one, and the switch turns the check off', async () => {
+  const answers = [
+    reply('tool_use', [toolUse('p', 'preview_structure', housePlan)]),
+    reply('end_turn', [{ type: 'text', text: 'Here is the plan.' }]),
+    reply('tool_use', [toolUse('b', 'build_structure', housePlan)]),
+    reply('end_turn', [{ type: 'text', text: 'Built.' }])
+  ];
+  const { brain, toolCalls } = makeBrain({ client: fakeClient(answers), config: plain });
+  await brain.start({ player: 'Steve', text: 'Clodine plan a house' });
+  await brain.start({ player: 'Steve', text: 'Clodine resume' });
+  assert.deepEqual(ranTools(toolCalls), ['preview_structure', 'build_structure']);
+
+  // replace and clear don't change the look, so a plan previewed without them builds with them.
+  const replaced = makeBrain({ client: callsClient(['build_structure', { ...housePlan, replace: true, clear: true }]), config: plain });
+  replaced.brain.previewedPlans = brain.previewedPlans;
+  await replaced.brain.start({ player: 'Steve', text: 'Clodine build it over the old shed' });
+  assert.deepEqual(ranTools(replaced.toolCalls), ['build_structure']);
+
+  const off = { ...plain, bot: { ...plain.bot, previewBuilds: false } };
+  const unchecked = makeBrain({ client: callsClient(['build_structure', housePlan]), config: off });
+  await unchecked.brain.start({ player: 'Steve', text: 'Clodine build a house here' });
+  assert.deepEqual(ranTools(unchecked.toolCalls), ['build_structure']);
 });

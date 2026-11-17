@@ -73,6 +73,13 @@ export function validateConfig(raw, env) {
   if (raw.bot.xray !== undefined && typeof raw.bot.xray !== 'boolean') {
     throw new ConfigError('config.json bot.xray must be true or false.');
   }
+  if (raw.bot.previewBuilds !== undefined && typeof raw.bot.previewBuilds !== 'boolean') {
+    throw new ConfigError('config.json bot.previewBuilds must be true or false.');
+  }
+  const buildTokens = raw.claude.buildMaxTokens;
+  if (buildTokens !== undefined && !(Number.isInteger(buildTokens) && buildTokens > 0)) {
+    throw new ConfigError('config.json claude.buildMaxTokens must be a whole number above 0.');
+  }
   for (const key of ['lessons', 'skills']) {
     const value = raw.learning?.[key];
     if (value !== undefined && typeof value !== 'boolean') throw new ConfigError(`config.json learning.${key} must be true or false.`);
@@ -104,11 +111,14 @@ export function validateConfig(raw, env) {
     // pauseScale scales the short human-like waits between actions, 0 for none. gestures is the
     // head movement, nods and turning to players while she waits on the model. reflexes start
     // her moving on a plain "come here", "follow me" or "stay" before the model answers. xray lets
-    // mine and find_block go for ore buried in the rock, which no player could see.
-    bot: { pauseScale: 1, gestures: true, reflexes: true, xray: false, ...raw.bot },
+    // mine and find_block go for ore buried in the rock, which no player could see. previewBuilds
+    // turns back a player's bigger build_structure until she has drawn that plan with preview_structure.
+    bot: { pauseScale: 1, gestures: true, reflexes: true, xray: false, previewBuilds: true, ...raw.bot },
+    // buildMaxTokens caps each reply once a job is a build, since its plans are the longest thing
+    // she writes. It is never below maxTokens, and with streaming off maxTokens is used instead.
     claude: {
       fallback: true, strictTools: true, streaming: true, maxTokens: 16000, maxRetries: 2, busyReplies: true, buildEffort: 'high',
-      routing: true, everydayModel: 'claude-sonnet-5-5', quickModel: 'claude-haiku-5-5', ...raw.claude
+      buildMaxTokens: 32000, routing: true, everydayModel: 'claude-sonnet-5-5', quickModel: 'claude-haiku-5-5', ...raw.claude
     },
     // maxDigBlocks is the biggest box dig_area takes. warnCostUsd is the job cost that gets a
     // warning (and again each time it doubles), 0 for none. It never stops a job.

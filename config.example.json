@@ -9,7 +9,8 @@
     "pauseScale": 1,
     "gestures": true,
     "reflexes": true,
-    "xray": false
+    "xray": false,
+    "previewBuilds": true
   },
   "allowlist": ["YourName", "FriendName"],
   "admins": ["YourName"],
@@ -23,6 +24,7 @@
     "maxRetries": 2,
     "busyReplies": true,
     "buildEffort": "high",
+    "buildMaxTokens": 32000,
     "routing": true,
     "everydayModel": "claude-sonnet-5-5",
     "quickModel": "claude-haiku-5-5"

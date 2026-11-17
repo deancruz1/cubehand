@@ -6,10 +6,11 @@ import { asText } from './lessons.js';
 import { isBuildCall, isBuildRequest, REFLEX_MOVES } from './brainroute.js';
 import { strictTools, hasSystemMessages } from './brainapi.js';
 import { recoveryAsk } from './braindeath.js';
-import { runCalls, drop, outdated } from './braincalls.js';
-import {
+import { runCalls, drop, outdated } from './braincalls.js';import {
   STEPS_WARNING,
   STEPS_LEFT,
+  MAX_CUT_OFFS,
+  PLAN_CUT_OFF,
   FREE_TIME,
   SORTING,
   HANDED_OVER,
@@ -155,6 +156,10 @@ export function startRun(brain, run) {
   const maxSeconds = self ? idle.freeTimeSeconds : build ? buildSeconds : limits.maxSeconds;
   const maxSteps = self ? idle.freeTimeSteps : build ? buildSteps : limits.maxSteps;
   const effort = build ? moreEffort : claude.effort;
+  // Without streaming the SDK turns away a request whose cap could run past ten minutes, which
+  // a build's bigger cap can.
+  const moreTokens = claude.streaming === true ? Math.max(claude.maxTokens, claude.buildMaxTokens ?? 32000) : claude.maxTokens;
+  const maxTokens = build ? moreTokens : claude.maxTokens;
   if (record) Object.assign(record, { tier, model, effort });
   // The time limit only counts time outside tools and holds.
   const clock = new JobClock(maxSeconds * 1000, () => brain.current?.controller.abort('time'));
@@ -169,7 +174,7 @@ export function startRun(brain, run) {
         ? `[brain] standing job round ${job.standing.number} for ${player}${using}`
         : `[brain] request from ${player}: ${text}${build ? ' (build)' : ''}${whisper ? ' (whispered)' : ''}${using}`
   );
-  Object.assign(run, { tier, sorting, sortingAsked, model, build, buildSeconds, buildSteps, moreEffort, maxSteps, effort, clock });
+  Object.assign(run, { tier, sorting, sortingAsked, model, build, buildSeconds, buildSteps, moreEffort, maxSteps, effort, moreTokens, maxTokens, clock });
   Object.assign(run, { nudges: 0, warned: false, excused: REFLEX_MOVES.has(job.reflex), rulesHeld: 0, retryStep: 0, tried: new Set(), step: 0 });
 }
 
@@ -322,6 +327,14 @@ export async function runStep(brain, run) {
   if (job.leanTry) leanCured(brain, run);
   if (response.stop_reason === 'max_tokens') {
     await drop(run, turn, 'max_tokens');
+    // The cut-off reply never goes into the conversation, so a build can ask again in parts as
+    // long as none of its calls had started.
+    if (run.build && turn.calls.length === 0 && (job.cutOffs ?? 0) < MAX_CUT_OFFS) {
+      job.cutOffs = (job.cutOffs ?? 0) + 1;
+      brain.log('[brain] a build step got cut off, asking for the plan in sections');
+      brain.addNotices(run.messages, [PLAN_CUT_OFF], run.model);
+      return NEXT;
+    }
     if (run.record) run.record.end = 'max_tokens';
     if (!run.self) await run.speak('My answer got cut off. Try asking for something smaller.');
     return;
@@ -437,7 +450,7 @@ async function askModel(brain, run, turn, newNotice) {
     const done = brain.startThinking(job);
     turn.doneThinking = done;
     job.doneThinking = done;
-    return brain.createMessage(run.messages, signal, run.effort, run.model, onEvent).finally(done);
+    return brain.createMessage(run.messages, signal, run.effort, run.model, onEvent, run.maxTokens).finally(done);
   };
 
   turn.asked = Date.now();

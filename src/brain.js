@@ -12,6 +12,7 @@ import { routeMethods } from './brainroute.js';
 import { hasSystemMessages, apiMethods } from './brainapi.js';
 import { deathNote, deathMethods } from './braindeath.js';
 import { AFTER_SPAWN_MS, STOPPED_STANDING, standingMethods } from './brainstanding.js';
+import { previewMethods } from './brainpreview.js';
 import { NEXT, AGAIN, whisperTo, openTurn, appendBlocks, openRun, startRun, firstTurn, runStep } from './brainsteps.js';
 
 export { chatPart, announcesMore, lastJobLine, leanSnapshot, errorMessage } from './brainlines.js';
@@ -711,6 +712,6 @@ export class Brain {
 }
 
 // Parts of the class that live in files of their own, put on it as if written here.
-for (const methods of [routeMethods, apiMethods, deathMethods, standingMethods]) {
+for (const methods of [routeMethods, apiMethods, deathMethods, standingMethods, previewMethods]) {
   for (const [name, desc] of Object.entries(Object.getOwnPropertyDescriptors(methods))) Object.defineProperty(Brain.prototype, name, { ...desc, enumerable: false });
 }
