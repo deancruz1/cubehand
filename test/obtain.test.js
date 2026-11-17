@@ -420,3 +420,47 @@ test('obtain plans no craft that would have no room to come out, and says so', (
   assert.deepEqual(actions(fits), ['craft 12 spruce_slab']);
   assert.deepEqual(fits.steps[0].ingredients, ['spruce_planks']);
 });
+
+test('obtain looks in a chest she never opened before planning to go without, then takes from it', async () => {
+  const { index, cleanup } = tempIndex();
+  const bot = fakeBot({ containers: { '2,64,0': { name: 'chest', items: [['iron_ingot', 5]] } } });
+  bot.chestIndex = index;
+  const result = await obtain({ bot }, { item: 'iron_ingot', count: 3 });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.message, 'now carrying 3 iron_ingot. did: looked in chest at 2 64 0; took 3 iron_ingot');
+  assert.deepEqual(bot.opened, ['2,64,0', '2,64,0']);
+  cleanup();
+});
+
+test('obtain looks once per call in at most four unknown containers, never a trapped or known one', async () => {
+  const { index, cleanup } = tempIndex();
+  const containers = {
+    '0,64,1': { name: 'trapped_chest', items: [['iron_ingot', 5]] },
+    '2,64,0': { name: 'chest', items: [['dirt', 9]] },
+    '2,64,2': { name: 'chest', items: [] },
+    '0,64,-2': { name: 'chest', items: [['dirt', 3]] },
+    '-2,64,2': { name: 'barrel', items: [] },
+    '3,64,3': { name: 'chest', items: [] },
+    '-3,64,-2': { name: 'chest', items: [['iron_ingot', 2]] }
+  };
+  const bot = fakeBot({ containers });
+  bot.chestIndex = index;
+  index.record({ dim: 'overworld', name: 'chest', parts: [{ x: 2, y: 64, z: 0 }], items: new Map([['dirt', 9]]), free: 26 });
+  const first = await obtain({ bot }, { item: 'iron_ingot', count: 2 });
+  assert.equal(first.ok, false);
+  assert.match(first.message, /^carrying 0 of 2 iron_ingot\. did: looked in chest at 2 64 2, chest at 0 64 -2, barrel at -2 64 2, chest at 3 64 3\. missing 2 raw_iron for iron_ingot/);
+  assert.deepEqual(bot.opened, ['2,64,2', '0,64,-2', '-2,64,2', '3,64,3']);
+
+  const second = await obtain({ bot }, { item: 'iron_ingot', count: 2 });
+  assert.equal(second.ok, true, second.message);
+  assert.equal(second.message, 'now carrying 2 iron_ingot. did: looked in chest at -3 64 -2; took 2 iron_ingot');
+
+  // Every container nearby is known now, so the message is the same as without any.
+  const third = await obtain({ bot }, { item: 'iron_ingot', count: 4 });
+  assert.equal(third.ok, false);
+  assert.doesNotMatch(third.message, /looked in/);
+  assert.match(third.message, /^carrying 2 of 4 iron_ingot\. did nothing\. missing 2 raw_iron for iron_ingot/);
+  assert.equal(bot.opened.length, 6);
+  assert.ok(!bot.opened.includes('0,64,1'));
+  cleanup();
+});

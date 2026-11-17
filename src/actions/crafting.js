@@ -10,17 +10,16 @@ const TABLE_RANGE = 32;
 const BATCH = 8;
 const MAX_NUDGES = 3;
 const TABLE_STUCK = 'the crafting table stopped responding';
-export const CRAFT_TIMING = { batchMs: 20000, quietMs: 3000, settleMs: 6000, tickMs: 1000 };
-// A batch at a table that timed out is still running inside mineflayer, and starting another
+// drainMs is longer than the 20 s mineflayer waits for a slot update before it gives up.
+export const CRAFT_TIMING = { batchMs: 20000, quietMs: 3000, settleMs: 6000, drainMs: 25000, progressMs: 10000, tickMs: 1000 };
+// A batch that was given up on can still be running inside mineflayer, and starting another
 // would mix its clicks with the first one's.
 const running = new WeakMap();
 
-// mineflayer copies a crafting window's slots into the inventory only when it closes, so while
-// one is open its slots are the up-to-date ones.
+// What she carries, for crafting and for obtain alike. Crafts close their window and resync
+// the inventory before anything counts, so bot.inventory is the only count that is needed.
 export function carriedItems(bot) {
-  const w = bot.currentWindow;
-  if (!w?.type?.startsWith('minecraft:crafting')) return bot.inventory.items();
-  return w.slots.slice(w.inventoryStart, w.inventoryEnd).filter(Boolean);
+  return bot.inventory.items();
 }
 
 function have(bot, id) {
@@ -70,11 +69,11 @@ function windowState(bot) {
   return `${w.id}|${w.selectedItem?.count ?? 0}|${w.slots.map((s) => (s ? `${s.type}:${s.count}` : '')).join(',')}`;
 }
 
-// A resync sends every slot of the open window again, which wakes a click that is still waiting
-// for a slot update the server never sent. With no window open the craft is waiting for the
+// A resync sends every slot of the window again, which wakes a click that is still waiting for
+// a slot update the server never sent. A table craft with no window open is waiting for the
 // table to open, so it gets used again.
 function nudge(bot, table) {
-  const w = bot.currentWindow;
+  const w = bot.currentWindow ?? (table ? null : bot.inventory);
   if (w) bot._syncWindow?.(w).catch(() => {});
   else bot.activateBlock?.(table).catch(() => {});
 }
@@ -98,39 +97,72 @@ function watchQuiet(bot, table, job) {
 }
 
 // Gives a batch that timed out one more resync and a few seconds to finish by itself.
-async function settle(bot, table, job) {
-  if (!job.done) nudge(bot, table);
+async function settle(bot, table, job, status) {
+  if (job.done) return true;
+  status?.progress('waiting for a slow craft to finish');
+  nudge(bot, table);
   const end = Date.now() + CRAFT_TIMING.settleMs;
   while (!job.done && Date.now() < end) await delay(100);
   return job.done;
 }
 
-async function runBatch(bot, recipe, n, table) {
-  if (!table) return guarded(() => bot.craft(recipe, n, undefined), { ms: CRAFT_TIMING.batchMs });
-  const job = { done: false };
-  job.promise = bot.craft(recipe, n, table).finally(() => {
+// Ends a craft that was given up on. Closing its table window makes the server hand back what
+// is left in the grid and on the cursor, and leaves the craft waiting for slot updates that
+// can't come, so it stops when mineflayer's own wait runs out instead of clicking on. Nothing
+// resyncs the inventory meanwhile, because that would wake a 2x2 craft back up.
+async function stop(bot, job, status) {
+  const end = Date.now() + CRAFT_TIMING.drainMs;
+  // The stuck watchdog would stop the job during a wait this long with nothing moving.
+  let told = 0;
+  while (!job.done && Date.now() < end) {
+    if (Date.now() - told >= CRAFT_TIMING.progressMs) {
+      told = Date.now();
+      status?.progress('waiting for a stuck craft to end');
+    }
+    const w = bot.currentWindow;
+    if (job.table && w?.type?.startsWith('minecraft:crafting')) bot.closeWindow(w);
+    await delay(100);
+  }
+  return job.done;
+}
+
+// One bot.craft that has really ended when this returns, unless the job is still marked running.
+async function runBatch(bot, recipe, n, table, status) {
+  const job = { done: false, table };
+  job.promise = bot.craft(recipe, n, table ?? undefined).finally(() => {
     job.done = true;
   });
   running.set(bot, job);
-  const watch = watchQuiet(bot, table, job);
+  const watch = table ? watchQuiet(bot, table, job) : null;
   try {
     await guarded(() => job.promise, { ms: CRAFT_TIMING.batchMs });
   } catch (err) {
-    if (!(err instanceof TimeoutError) || !(await settle(bot, table, job))) throw err;
-    await job.promise;
+    if (!(err instanceof TimeoutError)) throw err;
+    if (await settle(bot, table, job, status)) return job.promise;
+    // A nudge now would open the table again while stop is closing it.
+    clearInterval(watch);
+    await stop(bot, job, status);
+    throw err;
   } finally {
     clearInterval(watch);
   }
 }
 
-// Crafts a few at a time and checks the inventory in between, so one lost click can't take the
-// rest of the job with it. Returns how many were really made.
+// Gives a craft an earlier call gave up on one more nudge, then stops it. Returns why crafting
+// can't start yet, or null.
+async function finishRunning(bot, status) {
+  const job = running.get(bot);
+  if (!job || job.done || (await settle(bot, job.table, job, status)) || (await stop(bot, job, status))) return null;
+  return job.table ? 'my last craft at the crafting table never finished, so the table is still busy' : "my last craft never finished, so I can't start another yet";
+}
+
+// Crafts a few at a time and recounts in between, so one lost click can't take the rest of the
+// job with it. Every count comes from bot.inventory after the batch has ended and the inventory
+// was resynced. Returns how many were really made.
 async function craftTimes(ctx, item, perCraft, times, table, pick = () => true) {
   const { bot } = ctx;
-  const job = running.get(bot);
-  if (table && job && !(await settle(bot, table, job))) return { count: 0, error: 'my last craft at the crafting table never finished, so the table is still busy' };
   const start = have(bot, item.id);
-  const made = () => have(bot, item.id) - start;
+  const made = () => Math.max(0, have(bot, item.id) - start);
   let error = null;
   let misses = 0;
   while (made() < times * perCraft && misses < 2 && !ctx.signal?.aborted) {
@@ -151,17 +183,18 @@ async function craftTimes(ctx, item, perCraft, times, table, pick = () => true) 
     const before = have(bot, item.id);
     let stuck = false;
     try {
-      await runBatch(bot, recipe, n, table);
+      await runBatch(bot, recipe, n, table, ctx.status);
     } catch (err) {
       stuck = err instanceof TimeoutError;
       error = stuck ? (table ? TABLE_STUCK : 'crafting got stuck') : err.message;
       bot.emit('craft_trouble', `crafting ${item.name} failed (${err.message}). Inventory: ${inventoryText(bot)}`);
     }
-    if (!table) await settleInventory(bot);
-    // A stuck craft keeps waiting in the background, so starting another one would mix their clicks.
+    // A resync would wake a craft that is still running, so that one keeps the count it has.
+    if (running.get(bot)?.done !== false) await settleInventory(bot);
     if (stuck) break;
     if (error && have(bot, item.id) <= before) misses++;
   }
+  if (ctx.signal?.aborted && made() < times * perCraft) error = `stopped after making ${made()}`;
   return { count: made(), error };
 }
 
@@ -270,6 +303,8 @@ async function craftItem(ctx, name, count, depth, notes, ingredients) {
 // ingredients (from obtain's plan) picks the recipe variant made from exactly those items.
 export async function craft(ctx, { item, count, ingredients }) {
   const notes = [];
+  const busy = await finishRunning(ctx.bot, ctx.status);
+  if (busy) return fail(`couldn't craft ${item}: ${busy}`);
   await settleInventory(ctx.bot);
   const result = await craftItem(ctx, item, Math.max(1, count ?? 1), 0, notes, ingredients);
   const steps = notes.length ? ` (first ${notes.join(', ')})` : '';

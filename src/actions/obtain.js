@@ -1,6 +1,6 @@
 import { Vec3 } from 'vec3';
 import { ok, fail, posText } from './util.js';
-import { takeItems, countItems, isPickable } from './containers.js';
+import { takeItems, countItems, isPickable, lookInUnknown } from './containers.js';
 import { craft, carriedItems } from './crafting.js';
 import { smelt, smeltOutput, fuelValue, pickFuel, furnaceKind } from './furnace.js';
 import { mine, chopTree, isTerrain, isBuildTerrain, isLogName, nextToBuild, treeLogTest, treeAt, mineableBlocks } from './mining.js';
@@ -556,7 +556,7 @@ export function readWorld(ctx, blocked = new Map()) {
     .filter((p) => ctx.smeltJobs?.has(p.toString()) || !bot.blockAt(p, false)?.getProperties?.().lit)
     .map((p) => bot.blockAt(p, false).name);
   return {
-    have: countItems(bot.inventory.items()),
+    have: countItems(carriedItems(bot)),
     stored,
     recipes: (name) => {
       if (!recipeCache.has(name)) {
@@ -618,7 +618,20 @@ export function planText(plan) {
   return plan.missing.length ? `${body}. Would still be missing ${missingText(plan.missing)}` : body;
 }
 
-export const RUNNERS = { take: takeItems, craft, smelt, mine, chop: chopTree };
+export const RUNNERS = { take: takeItems, craft, smelt, mine, chop: chopTree, look: lookInUnknown };
+
+// A chest she hasn't opened yet could hold what the plan is short of, or what it would mine,
+// chop or smelt for.
+function worthLooking(plan) {
+  return !plan.complete || plan.steps.some((st) => st.action === 'mine' || st.action === 'chop' || st.action === 'smelt');
+}
+
+function lookText({ looked, problems }) {
+  const parts = [];
+  if (looked.length) parts.push(`looked in ${looked.join(', ')}`);
+  parts.push(...problems);
+  return parts.join('; ');
+}
 
 function carriedOf(bot, name) {
   return carriedItems(bot).reduce((sum, i) => (i.name === name ? sum + i.count : sum), 0);
@@ -681,6 +694,11 @@ export async function obtain(ctx, { item, count, plan_only: planOnly }, runners 
   if (planOnly) return ok(planText(plan));
 
   const done = [];
+  if (worthLooking(plan)) {
+    const seen = await run.look(ctx);
+    if (seen.looked.length) plan = planObtain(readWorld(ctx, blocked), item, want);
+    if (seen.looked.length || seen.problems.length) done.push(lookText(seen));
+  }
   let ran = 0;
   let rounds = 1;
   let stopped = false;
@@ -712,7 +730,7 @@ export async function obtain(ctx, { item, count, plan_only: planOnly }, runners 
         result = fail(err.message);
       }
       ran++;
-      const got = expect.map(([n], k) => [n, carriedOf(bot, n) - before[k]]);
+      const got = expect.map(([n], k) => [n, Math.max(0, carriedOf(bot, n) - before[k])]);
       const text = doneText(st, got);
       const short = expect.filter(([, c], k) => got[k][1] < c);
       done.push(short.length && !result.ok ? `${text} (${shortReason(st, result)})` : text);

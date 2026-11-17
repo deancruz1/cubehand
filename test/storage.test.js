@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { Vec3 } from 'vec3';
 import { ChestIndex, chestKey, contentsText, agoText, pickSource, labelFit, stashTargets, keepReason, itemCategories } from '../src/chests.js';
 import { storageSummary } from '../src/perception.js';
-import { takeItems, stash, stashSelection, openContainer, openWindow, isPickable } from '../src/actions/containers.js';
+import { takeItems, storeItems, stash, stashSelection, openContainer, openWindow, isPickable, lookInUnknown } from '../src/actions/containers.js';
 import { EventEmitter } from 'node:events';
 import { setPauseScale } from '../src/actions/util.js';
 
@@ -156,16 +156,42 @@ test('stash keeps tools, weapons, armor, food and torches unless told otherwise'
 });
 
 // A few chests and barrels around the bot, all within reach so nothing needs walking.
-const NAMES = ['air', 'chest', 'barrel', 'oak_sign', 'iron_ingot', 'cobblestone', 'oak_log', 'iron_pickaxe', 'bread', 'dirt', 'diamond', 'trapped_chest'];
+const NAMES = ['air', 'chest', 'barrel', 'oak_sign', 'iron_ingot', 'cobblestone', 'oak_log', 'iron_pickaxe', 'bread', 'dirt', 'diamond', 'trapped_chest', 'ender_chest'];
 const id = (name) => NAMES.indexOf(name);
 const key = (p) => `${p.x},${p.y},${p.z}`;
 
+// The inventory has 36 slots of up to 64 each. Withdrawing behaves like Mineflayer's: it refuses
+// when no slot is empty and throws part-way when the rest doesn't fit. c.limit makes a
+// container hand out only that many before throwing, as a server that disagrees would.
 function fakeBot({ containers, signs = {}, inventory = [] }) {
   const blocks = new Map();
   for (const [k, c] of Object.entries(containers)) blocks.set(k, c.name);
   for (const k of Object.keys(signs)) blocks.set(k, 'oak_sign');
   const stack = (name, count) => ({ name, count, type: id(name) });
   const inv = inventory.map(([name, count]) => stack(name, count));
+  const used = () => inv.filter((s) => s.count > 0).length;
+  const intoInventory = (type, n) => {
+    let left = n;
+    for (const s of inv) {
+      if (s.type !== type || s.count <= 0 || s.count >= 64 || !left) continue;
+      const a = Math.min(64 - s.count, left);
+      s.count += a;
+      left -= a;
+    }
+    while (left > 0 && used() < 36) {
+      const a = Math.min(64, left);
+      inv.push(stack(NAMES[type], a));
+      left -= a;
+    }
+    return n - left;
+  };
+  const takeOut = (c, type, n) => {
+    const have = c.items.reduce((sum, s) => (s.type === type ? sum + s.count : sum), 0);
+    const want = Math.min(n, have, c.limit ?? Infinity);
+    const placed = intoInventory(type, want);
+    move(c.items, [], type, placed);
+    if (placed < n) throw new Error(c.limit === undefined ? 'destination full' : 'Unable to withdraw, Bot inventory is full.');
+  };
   const move = (from, to, type, n, room = Infinity) => {
     let moved = 0;
     for (const s of from) {
@@ -209,21 +235,36 @@ function fakeBot({ containers, signs = {}, inventory = [] }) {
       bot.opened.push(key(block.position));
       // A blocked chest never sends a window.
       if (c.stuck) await new Promise(() => {});
-      return {
+      const window = {
         inventoryStart: 27,
+        inventoryEnd: 63,
         containerItems: () => live(c.items),
         items: () => live(inv),
         withdraw: async (type, meta, n) => {
-          move(c.items, inv, type, n);
+          if (used() >= 36) throw new Error('Unable to withdraw, Bot inventory is full.');
+          takeOut(c, type, n);
         },
         deposit: async (type, meta, n) => {
           const room = (c.room ?? Infinity) - c.items.reduce((sum, s) => sum + s.count, 0);
           const moved = move(inv, c.items, type, n, room);
-          if (moved < n) throw new Error('destination full');
+          if (moved < n) {
+            window.selectedItem = stack(NAMES[type], n - moved);
+            throw new Error('destination full');
+          }
         },
         close: () => {}
       };
-    }
+      bot.windows.set(window, c);
+      return window;
+    },
+    // Mineflayer's own transfer, which tops up stacks without needing an empty slot.
+    transfer: async ({ window, itemType, count }) => takeOut(bot.windows.get(window), itemType, count),
+    putSelectedItemRange: async (start, end, window) => {
+      bot.putBack.push([start, end]);
+      window.selectedItem = null;
+    },
+    putBack: [],
+    windows: new Map()
   };
   for (const c of Object.values(containers)) c.items = c.items.map(([name, count]) => stack(name, count));
   return bot;
@@ -268,19 +309,158 @@ test('take_items corrects a chest that no longer has the item and tries the next
   cleanup();
 });
 
-test('take_items uses the nearest container when the index knows nothing', async () => {
+test('take_items looks in containers the index knows nothing about, nearest first, and notes them', async () => {
   const { index, cleanup } = tempIndex();
   const containers = {
     '2,64,0': { name: 'chest', items: [['bread', 3]] },
-    '-3,64,0': { name: 'chest', items: [['iron_ingot', 4]] }
+    '3,64,2': { name: 'chest', items: [['iron_ingot', 4]] },
+    '0,64,-3': { name: 'barrel', items: [['iron_ingot', 10]] }
+  };
+  const bot = fakeBot({ containers });
+  bot.chestIndex = index;
+  const result = await takeItems({ bot }, { items: [{ item: 'iron_ingot', count: 10 }] });
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(bot.opened, ['2,64,0', '3,64,2', '0,64,-3']);
+  assert.match(result.message, /took 4 iron_ingot from chest at 3 64 2; 6 iron_ingot from barrel at 0 64 -3/);
+  assert.match(result.message, /none in chest at 2 64 0/);
+  assert.deepEqual(index.find({ x: 2, y: 64, z: 0 }, 'overworld').items, [['bread', 3]]);
+  assert.deepEqual(index.find({ x: 0, y: 64, z: -3 }, 'overworld').items, [['iron_ingot', 4]]);
+  cleanup();
+});
+
+test('take_items opens at most four unknown containers and fails when it took nothing', async () => {
+  const { index, cleanup } = tempIndex();
+  const containers = {
+    '2,64,0': { name: 'chest', items: [['bread', 3]] },
+    '3,64,2': { name: 'chest', items: [] },
+    '0,64,-3': { name: 'chest', items: [['dirt', 5]] },
+    '-3,64,2': { name: 'chest', items: [] },
+    '-3,64,-2': { name: 'chest', items: [['iron_ingot', 4]] }
   };
   const bot = fakeBot({ containers });
   bot.chestIndex = index;
   const result = await takeItems({ bot }, { items: [{ item: 'iron_ingot' }] });
   assert.equal(result.ok, false);
-  assert.deepEqual(bot.opened, ['2,64,0']);
-  assert.ok(index.find({ x: 2, y: 64, z: 0 }, 'overworld'));
+  assert.deepEqual(bot.opened, ['2,64,0', '3,64,2', '0,64,-3', '-3,64,2']);
+  assert.match(result.message, /took nothing\. still missing: iron_ingot/);
+  assert.equal(index.list('overworld').length, 4);
+
+  const again = await takeItems({ bot }, { items: [{ item: 'iron_ingot' }] });
+  assert.equal(again.ok, true, again.message);
+  assert.match(again.message, /took 4 iron_ingot from chest at -3 64 -2/);
   cleanup();
+});
+
+test('looking in unknown containers notes up to four, nearest first, and moves nothing', async () => {
+  const { index, cleanup } = tempIndex();
+  const containers = {
+    '0,64,1': { name: 'trapped_chest', items: [['iron_ingot', 5]] },
+    '2,64,0': { name: 'ender_chest', items: [['diamond', 1]] },
+    '2,64,2': { name: 'chest', items: [['dirt', 9]] },
+    '0,64,-2': { name: 'barrel', items: [['iron_ingot', 4]] },
+    '-2,64,2': { name: 'chest', items: [['bread', 3]] },
+    '3,64,3': { name: 'chest', items: [] },
+    '-3,64,-2': { name: 'chest', items: [['dirt', 2]] },
+    '-4,64,3': { name: 'chest', items: [['cobblestone', 7]] }
+  };
+  const bot = fakeBot({ containers });
+  bot.chestIndex = index;
+  index.record({ dim: 'overworld', name: 'chest', parts: [{ x: 2, y: 64, z: 2 }], items: items({ dirt: 9 }), free: 26 });
+  const seen = await lookInUnknown({ bot });
+  assert.deepEqual(seen, { looked: ['barrel at 0 64 -2', 'chest at -2 64 2', 'chest at 3 64 3', 'chest at -3 64 -2'], problems: [] });
+  assert.deepEqual(bot.opened, ['0,64,-2', '-2,64,2', '3,64,3', '-3,64,-2']);
+  assert.deepEqual(index.find({ x: 0, y: 64, z: -2 }, 'overworld').items, [['iron_ingot', 4]]);
+  assert.equal(containers['0,64,-2'].items[0].count, 4);
+  assert.equal(index.find({ x: -4, y: 64, z: 3 }, 'overworld'), null);
+  cleanup();
+});
+
+test('a container that will not open is looked at once, skipped for ten minutes, then tried again', async () => {
+  const { index, cleanup } = tempIndex();
+  const containers = {
+    '2,64,0': { name: 'chest', items: [['iron_ingot', 5]], stuck: true },
+    '0,64,-2': { name: 'chest', items: [['dirt', 3]] }
+  };
+  const bot = fakeBot({ containers });
+  bot.chestIndex = index;
+  const ctx = { bot, openMs: 50 };
+  const first = await lookInUnknown(ctx);
+  assert.deepEqual(first.looked, ['chest at 0 64 -2']);
+  assert.equal(first.problems.length, 1);
+  assert.match(first.problems[0], /the chest at 2 64 0 wouldn't open/);
+  const until = bot.lookFails.get(chestKey([{ x: 2, y: 64, z: 0 }], 'overworld'));
+  assert.ok(until - Date.now() > 590000 && until - Date.now() <= 600000);
+
+  assert.deepEqual(await lookInUnknown(ctx), { looked: [], problems: [] });
+  assert.deepEqual(bot.opened, ['2,64,0', '0,64,-2']);
+
+  bot.lookFails.set(chestKey([{ x: 2, y: 64, z: 0 }], 'overworld'), Date.now() - 1);
+  const later = await lookInUnknown(ctx);
+  assert.equal(later.problems.length, 1);
+  assert.deepEqual(bot.opened, ['2,64,0', '0,64,-2', '2,64,0']);
+  cleanup();
+});
+
+test('take_items says when every container nearby was already seen without the item', async () => {
+  const { index, cleanup } = tempIndex();
+  const bot = fakeBot({ containers: { '2,64,0': { name: 'chest', items: [['bread', 3]] } } });
+  bot.chestIndex = index;
+  index.record({ dim: 'overworld', name: 'chest', parts: [{ x: 2, y: 64, z: 0 }], items: items({ bread: 3 }), free: 26 });
+  const result = await takeItems({ bot }, { items: [{ item: 'iron_ingot' }] });
+  assert.equal(result.ok, false);
+  assert.deepEqual(bot.opened, []);
+  assert.match(result.message, /no container within 64 blocks had it when last opened/);
+  cleanup();
+});
+
+const fullOf = (name, slots) => Array.from({ length: slots }, () => [name, 64]);
+
+test('take_items with x y z reports what came out when the inventory fills up', async () => {
+  const containers = { '2,64,0': { name: 'chest', items: [['cobblestone', 320]] } };
+  const bot = fakeBot({ containers, inventory: fullOf('dirt', 35) });
+  const result = await takeItems({ bot }, { x: 2, y: 64, z: 0, items: [{ item: 'cobblestone' }] });
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^took 64 cobblestone \(chest at 2 64 0\)/);
+  assert.match(result.message, /inventory is full \(0 free slots\), left 256 cobblestone in the chest at 2 64 0\. stash puts things away to free room/);
+  assert.equal(containers['2,64,0'].items[0].count, 256);
+});
+
+test('take_items counts what really moved when the server stops the transfer part-way', async () => {
+  const containers = { '2,64,0': { name: 'chest', items: [['cobblestone', 320]], limit: 100 } };
+  const bot = fakeBot({ containers });
+  const result = await takeItems({ bot }, { x: 2, y: 64, z: 0, items: [{ item: 'cobblestone' }] });
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^took 100 cobblestone \(chest at 2 64 0\)/);
+  assert.match(result.message, /inventory is full \(\d+ free slots\), left 220 cobblestone/);
+});
+
+test('take_items tops up a stack when no slot is empty, and gives up early when nothing fits', async () => {
+  const containers = { '2,64,0': { name: 'chest', items: [['cobblestone', 100]] } };
+  const bot = fakeBot({ containers, inventory: [...fullOf('dirt', 35), ['cobblestone', 10]] });
+  const topped = await takeItems({ bot }, { x: 2, y: 64, z: 0, items: [{ item: 'cobblestone', count: 100 }] });
+  assert.equal(topped.ok, true, topped.message);
+  assert.match(topped.message, /^took 54 cobblestone/);
+  assert.match(topped.message, /left 46 cobblestone in the chest at 2 64 0/);
+
+  const full = await takeItems({ bot }, { items: [{ item: 'cobblestone' }] });
+  assert.equal(full.ok, false);
+  assert.match(full.message, /took nothing: inventory is full \(0 free slots\)\. stash puts things away to free room/);
+  assert.deepEqual(bot.opened, ['2,64,0']);
+});
+
+test('store_items says how much went in when the container fills up', async () => {
+  const containers = { '2,64,0': { name: 'chest', items: [], room: 10 } };
+  const bot = fakeBot({ containers, inventory: [['cobblestone', 30], ['dirt', 5]] });
+  const result = await storeItems({ bot }, { x: 2, y: 64, z: 0, items: [{ item: 'cobblestone' }, { item: 'dirt' }] });
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^stored 10 cobblestone \(chest at 2 64 0\)\. the chest at 2 64 0 is full, 20 cobblestone, 5 dirt did not fit/);
+  assert.equal(containers['2,64,0'].items[0].count, 10);
+  // What was left on the cursor goes back into the inventory part of the window.
+  assert.deepEqual(bot.putBack, [[27, 63], [27, 63]]);
+
+  const none = await storeItems({ bot }, { x: 2, y: 64, z: 0, items: [{ item: 'dirt' }] });
+  assert.equal(none.ok, false);
+  assert.match(none.message, /^nothing moved \(chest at 2 64 0\)\. the chest at 2 64 0 is full, 5 dirt did not fit/);
 });
 
 test('opening a chest remembers its contents and sign label', async () => {
@@ -350,7 +530,7 @@ test('trapped chests are only opened when their x y z is given', async () => {
   const bot = fakeBot({ containers, inventory: [['cobblestone', 8]] });
   bot.chestIndex = index;
   const took = await takeItems({ bot }, { items: [{ item: 'iron_ingot' }] });
-  assert.match(took.message, /took 2 iron_ingot \(chest at -3 64 0\)/);
+  assert.match(took.message, /took 2 iron_ingot from chest at -3 64 0/);
   await stash({ bot }, {});
   assert.deepEqual(bot.opened, ['-3,64,0', '-3,64,0']);
   const asked = await takeItems({ bot }, { x: 1, y: 64, z: 0, items: [{ item: 'iron_ingot' }] });
