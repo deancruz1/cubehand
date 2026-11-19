@@ -464,3 +464,44 @@ test('obtain looks once per call in at most four unknown containers, never a tra
   assert.ok(!bot.opened.includes('0,64,1'));
   cleanup();
 });
+
+test('obtain with a list gets each item in turn and does not spend an earlier one on a later one', async () => {
+  const bot = fakeBot({ inventory: [['oak_log', 6], ['crafting_table', 1]] });
+  const calls = [];
+  const progress = [];
+  const result = await obtain(
+    { bot, status: { progress: (t) => progress.push(t) } },
+    { items: [{ item: 'oak_planks', count: 8 }, { item: 'oak_stairs', count: 4 }] },
+    { craft: fakeCraft(bot, calls) }
+  );
+  assert.equal(result.ok, true, result.message);
+  assert.match(result.message, /^got all 2 items\.\nnow carrying 8 oak_planks\. did: crafted 8 oak_planks\nnow carrying 4 oak_stairs\./);
+  // The stairs take six planks, made from two more logs and not taken from the first eight.
+  assert.equal(bot.count('oak_planks'), 10);
+  assert.equal(bot.count('oak_stairs'), 4);
+  assert.deepEqual(calls, ['craft 8 oak_planks', 'craft 8 oak_planks', 'craft 4 oak_stairs']);
+  assert.match(progress[0], /^item 1 of 2: oak_planks, step 1 of 1/);
+  assert.ok(progress.some((t) => t.startsWith('item 2 of 2: oak_stairs')));
+});
+
+test('obtain with a list carries on past an item it cannot get and says which came up short', async () => {
+  const bot = fakeBot({ inventory: [['oak_log', 2]] });
+  const calls = [];
+  const result = await obtain({ bot }, { items: [{ item: 'diamond', count: 2 }, { item: 'oak_planks', count: 4 }, { item: 'oak_planks', count: 4 }] }, { craft: fakeCraft(bot, calls) });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /^got 1 of 2 items in full, short of diamond\.\ncarrying 0 of 2 diamond\./);
+  assert.match(result.message, /\nnow carrying 8 oak_planks\. did: crafted 8 oak_planks$/);
+  assert.equal(bot.count('oak_planks'), 8);
+});
+
+test('obtain with a list plans every item with plan_only, and turns down a list with item or too many items', async () => {
+  const bot = fakeBot({ inventory: [['oak_log', 6]] });
+  const busy = async () => assert.fail('nothing should run');
+  const plan = await obtain({ bot }, { items: [{ item: 'oak_planks', count: 8 }, { item: 'stick', count: 4 }], plan_only: true }, { craft: busy });
+  assert.equal(plan.ok, true);
+  assert.match(plan.message, /^plan for 8 oak_planks: 1\. craft 8 oak_planks\nplan for 4 stick: /);
+  assert.equal((await obtain({ bot }, { item: 'stick', items: [{ item: 'oak_planks' }] })).message, 'give item and count, or items, not both');
+  const many = registry.itemsArray.slice(1, 14).map((i) => ({ item: i.name }));
+  assert.match((await obtain({ bot }, { items: many })).message, /^items takes at most 12 different items a call, this is 13$/);
+  assert.equal((await obtain({ bot }, {})).message, 'give item, or items with a list');
+});

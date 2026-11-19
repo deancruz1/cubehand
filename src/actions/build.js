@@ -784,6 +784,7 @@ export function slabFinder(bot) {
 // back what got knocked out or grown over, and snow and plants on and in the build are swept off.
 export async function buildStructure(ctx, { origin, blocks = [], parts = [], palette, mirror, clear = false, foundation, replace = false, dry_run }) {
   const { bot, config, signal } = ctx;
+  if (!origin) return fail('give origin, or plan with the id of a plan you previewed');
   const box = (p) => {
     const to = p.to ?? p.from;
     return (Math.abs(to.dx - p.from.dx) + 3) * (Math.abs(to.dy - p.from.dy) + 1) * (Math.abs(to.dz - p.from.dz) + 3) * partCopies(p, mirror);

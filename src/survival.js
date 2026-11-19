@@ -103,6 +103,10 @@ async function runAway(ctx, threats, distance) {
 // Mineflayer's oxygenLevel runs 0 to 20 (the game's air supply divided by 15, so 0.75 s a point).
 // Below this with her head under water she heads for air, with time left to swim to it.
 const LOW_AIR = 14;
+// Once she has her head out, a dip back under only counts again at or below this, or after
+// AIR_QUIET_MS, so bobbing at the surface doesn't stop her job over and over.
+const URGENT_AIR = 6;
+const AIR_QUIET_MS = 4000;
 const FIRE = new Set(['fire', 'soul_fire']);
 
 export function headBlock(bot) {
@@ -261,11 +265,19 @@ async function breakOverhead(bot) {
   }
 }
 
+// Where her feet are when she floats at the top of the water over feet. A bank is looked for from
+// there, since one level with the water is out of reach of the search from a block or two down.
+export function floatingFeet(getBlock, feet) {
+  let p = feet;
+  for (let i = 0; i < 12 && isWater(getBlock(p.offset(0, 2, 0))); i++) p = p.offset(0, 1, 0);
+  return p;
+}
+
 async function toLand(bot, getBlock) {
-  const spot = standSpots(getBlock, bot.entity.position.floored(), 8)[0];
+  const spot = standSpots(getBlock, floatingFeet(getBlock, bot.entity.position.floored()), 12)[0];
   if (!spot) return null;
   const e = bot.entity;
-  const out = await steer(bot, [spot], () => e.onGround && !e.isInWater && !e.isInLava);
+  const out = await steer(bot, [spot], () => e.onGround && !e.isInWater && !e.isInLava, { ms: 12000 });
   return out ? `got out onto ${getBlock(spot.offset(0, -1, 0))?.name ?? 'land'} at ${posText(e.position)}` : null;
 }
 
@@ -416,6 +428,7 @@ export class Survival {
     this.seenHealth = 20;
     this.escaping = null;
     this.quietUntil = {};
+    this.treading = false;
   }
 
   start() {
@@ -450,10 +463,11 @@ export class Survival {
     this.seenHealth = bot.health;
     if (this.escaping) return;
     const danger = hazard(bot, { hurt });
-    if (danger && !this.quiet(danger)) {
+    if (danger && !this.quiet(danger, bot, hurt)) {
       this.escape(bot, danger).catch((err) => this.log(`[survival] ${err.message}`));
       return;
     }
+    this.tread(bot);
     if (this.recovering) return;
     const critical = bot.health <= this.config.survival.criticalHealth;
     const starving = bot.food <= 6 && !hasFood(bot);
@@ -466,9 +480,29 @@ export class Survival {
   }
 
   // A danger she couldn't get away from last time (no water for a fire, no land to climb onto)
-  // is left alone for a few seconds, so she doesn't spin on it. Running out of air never is.
-  quiet(danger) {
+  // is left alone for a few seconds, so she doesn't spin on it. So is her head dipping under again
+  // right after she got it out, unless she is hurt there or her air is nearly gone.
+  quiet(danger, bot, hurt = false) {
+    if (danger === 'air' && (hurt || (bot?.oxygenLevel ?? 20) <= URGENT_AIR)) return false;
     return Date.now() < (this.quietUntil[danger] ?? 0);
+  }
+
+  // With her head under water and nothing steering her, she holds jump the way a player holds
+  // space, so she stays at the surface while a tool places or digs instead of sinking until her
+  // air runs low. She lets go once she stands or is out of the water.
+  tread(bot) {
+    const e = bot.entity;
+    if (!e?.position || !bot.blockAt) return;
+    const wet = e.isInWater || isWater(bot.blockAt(e.position, false));
+    const steered = Boolean(bot.vehicle) || Boolean(bot.pathfinder?.isMoving?.());
+    if (!isWater(headBlock(bot)) && !(this.treading && wet && !e.onGround)) {
+      if (this.treading && !steered) bot.setControlState?.('jump', false);
+      this.treading = false;
+      return;
+    }
+    if (steered) return;
+    this.treading = true;
+    bot.setControlState?.('jump', true);
   }
 
   // Getting out of water, lava or fire comes before everything else. The running tool and chores
@@ -489,7 +523,13 @@ export class Survival {
       this.log(`[survival] ${what}`);
       const e = bot.entity;
       if (onFire(e) && !e.isInWater) this.quietUntil.burning = Date.now() + 8000;
-      if (e.isInWater || isWater(bot.blockAt(e.position, false))) this.quietUntil.water = Date.now() + 10000;
+      if (e.isInWater || isWater(bot.blockAt(e.position, false))) {
+        this.quietUntil.water = Date.now() + 10000;
+        // Still in the water with nowhere to climb out: stay up, and don't count the next dip.
+        if (!isWater(headBlock(bot))) this.quietUntil.air = Date.now() + AIR_QUIET_MS;
+        this.treading = true;
+        bot.setControlState?.('jump', true);
+      }
       if (!own && what && this.notes?.at(-1) !== what) this.notes?.push(what);
       return what;
     } finally {

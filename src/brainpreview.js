@@ -11,8 +11,14 @@ const BIG_PART = 150;
 // Fields of a call that say how to draw, check or clear for the plan, not what it looks like.
 const NOT_PLAN = new Set(['views', 'cut_above', 'dry_run', 'replace', 'clear']);
 
+// What a build_structure call may set next to plan, the id of a previewed plan.
+const WITH_PLAN = new Set(['plan', 'origin', 'clear', 'replace', 'dry_run']);
+
 export const PREVIEW_FIRST =
-  'Not built: preview this plan first with preview_structure, look at the pictures, fix what looks plain or wrong, then call build_structure with the plan you previewed (it may go at another origin).';
+  'Not built: preview this plan first with preview_structure, look at the pictures, fix what looks plain or wrong, then build the plan you previewed by its id (build_structure with plan; it may go at another origin).';
+
+const planId = (id) => String(id).trim().toLowerCase();
+const isEmpty = (v) => v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0) || (typeof v === 'object' && Object.keys(v).length === 0);
 
 // The same value with object keys in order, and empty or missing fields left out.
 function canonical(value) {
@@ -69,9 +75,42 @@ export const previewMethods = {
     return PREVIEW_FIRST;
   },
 
-  // Remembers a plan that was drawn, or one that a build_structure call worked on.
+  // The input a build_structure call runs with, as { input }, or { error } with the line it is
+  // turned back with. A call that names a previewed plan by its id gets that plan as it was drawn,
+  // with the call's own origin, clear, replace and dry_run on top, so the plan is written once.
+  planInput(block) {
+    const id = block.name === 'build_structure' ? block.input?.plan : undefined;
+    if (isEmpty(id)) return { input: block.input };
+    const saved = this.savedPlans?.get(planId(id));
+    if (!saved) {
+      return { error: `Not built: no previewed plan "${id}" is kept (the last ${KEEP_PLANS} are, until a restart). Preview the plan again and build it by the id that gives.` };
+    }
+    const extra = Object.keys(block.input).filter((k) => !WITH_PLAN.has(k) && !isEmpty(block.input[k]));
+    if (extra.length) {
+      return { error: `Not built: plan "${id}" is built as it was previewed, so leave out ${extra.join(', ')}. To change it, preview the changed plan and build that one by its id.` };
+    }
+    const own = Object.fromEntries(Object.entries(block.input).filter(([k, v]) => k !== 'plan' && v !== undefined && v !== null));
+    return { input: { ...saved, ...own } };
+  },
+
+  // Remembers a plan that was drawn, or one that a build_structure call worked on. For a plan
+  // that was drawn, returns the line that tells the model the id to build it by.
   notePlan(block, result) {
-    if (block.name === 'preview_structure' && result?.ok) remember((this.previewedPlans ??= []), planKey(block.input, { origin: false }));
     if (block.name === 'build_structure' && block.input?.dry_run !== true && result) remember((this.builtPlans ??= []), planKey(block.input));
+    if (block.name !== 'preview_structure' || !result?.ok) return null;
+    remember((this.previewedPlans ??= []), planKey(block.input, { origin: false }));
+    const plan = Object.fromEntries(Object.entries(block.input ?? {}).filter(([k]) => !['views', 'cut_above', 'dry_run'].includes(k)));
+    const key = planKey(plan);
+    this.savedPlans ??= new Map();
+    let id = [...this.savedPlans].find(([, p]) => planKey(p) === key)?.[0];
+    if (!id) {
+      this.planCount = (this.planCount ?? 0) + 1;
+      id = `p${this.planCount}`;
+    }
+    // Put last again, so the plans drawn longest ago go first.
+    this.savedPlans.delete(id);
+    this.savedPlans.set(id, plan);
+    if (this.savedPlans.size > KEEP_PLANS) this.savedPlans.delete(this.savedPlans.keys().next().value);
+    return `Kept as plan ${id}. To build it, call build_structure with plan "${id}" and nothing else, instead of writing the plan out again (add origin to put it somewhere else, or clear, replace or dry_run).`;
   }
 };

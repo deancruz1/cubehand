@@ -8,6 +8,7 @@ import { findNearest, matchesBlockName, buriedText } from './blocks.js';
 import { partsDistance } from '../chests.js';
 
 const MAX_COUNT = 256;
+const MAX_ITEMS = 12;
 // An iron pickaxe from nothing goes ten deep: ingot, raw iron, stone pickaxe, cobblestone,
 // wooden pickaxe, sticks, planks, logs.
 const MAX_DEPTH = 10;
@@ -532,8 +533,11 @@ function gatherFor(ctx, name) {
 }
 
 // What the planner needs to know, read from the bot and its chest index.
-export function readWorld(ctx, blocked = new Map()) {
+export function readWorld(ctx, blocked = new Map(), keep = null) {
   const { bot } = ctx;
+  // What a list's earlier items need stays out of the count, so getting a later one doesn't use it up.
+  const have = countItems(carriedItems(bot));
+  for (const [name, n] of keep ?? []) if (have.has(name)) have.set(name, Math.max(0, have.get(name) - n));
   const reg = bot.registry;
   const here = bot.entity.position;
   const dim = bot.game?.dimension;
@@ -556,7 +560,7 @@ export function readWorld(ctx, blocked = new Map()) {
     .filter((p) => ctx.smeltJobs?.has(p.toString()) || !bot.blockAt(p, false)?.getProperties?.().lit)
     .map((p) => bot.blockAt(p, false).name);
   return {
-    have: countItems(carriedItems(bot)),
+    have,
     stored,
     recipes: (name) => {
       if (!recipeCache.has(name)) {
@@ -680,23 +684,61 @@ function runStep(ctx, st, run) {
   return run.chop(ctx, st.pos ? { x: st.pos.x, y: st.pos.y, z: st.pos.z, trees: st.count, log: st.item } : { trees: st.count, log: st.item });
 }
 
-// Ends with count of item carried: plans the chain from what it carries and remembers, runs it
-// with the other tools, and plans again whenever a step comes up short.
-export async function obtain(ctx, { item, count, plan_only: planOnly }, runners = {}) {
+const wanted = (count) => Math.min(Math.max(count ?? 1, 1), MAX_COUNT);
+
+// Ends with count of item carried, or with every item of items: a list is got one after another
+// in the same call, carrying on past one that comes up short, and what an earlier item needed is
+// not used up for a later one.
+export async function obtain(ctx, { item, count, items, plan_only: planOnly }, runners = {}) {
   const { bot } = ctx;
   const run = { ...RUNNERS, ...runners };
+  const list = Array.isArray(items) ? items.filter((e) => e?.item) : [];
+  if (!list.length) return item ? obtainOne(ctx, { item, count, planOnly }, run) : fail('give item, or items with a list');
+  if (item) return fail('give item and count, or items, not both');
+  // The same item twice is one entry for both counts.
+  const wants = new Map();
+  for (const e of list) wants.set(e.item, Math.min((wants.get(e.item) ?? 0) + wanted(e.count), MAX_COUNT));
+  if (wants.size > MAX_ITEMS) return fail(`items takes at most ${MAX_ITEMS} different items a call, this is ${wants.size}`);
+
+  const keep = new Map();
+  const lines = [];
+  const short = [];
+  const names = [...wants.keys()];
+  for (const [i, name] of names.entries()) {
+    if (ctx.signal?.aborted) {
+      lines.push(`stopped before ${names.slice(i).join(', ')}`);
+      short.push(...names.slice(i));
+      break;
+    }
+    const head = `item ${i + 1} of ${names.length}`;
+    const sub = ctx.status ? { ...ctx, status: { progress: (text) => ctx.status.progress(`${head}: ${text}`) } } : ctx;
+    const result = await obtainOne(sub, { item: name, count: wants.get(name), planOnly }, run, keep);
+    lines.push(result.message);
+    if (!result.ok) short.push(name);
+    keep.set(name, Math.min(wants.get(name), carriedOf(bot, name)));
+  }
+  if (planOnly) return ok(lines.join('\n'));
+  const head = short.length ? `got ${names.length - short.length} of ${names.length} items in full, short of ${short.join(', ')}` : `got all ${names.length} items`;
+  const text = `${head}.\n${lines.join('\n')}`;
+  return short.length ? fail(text) : ok(text);
+}
+
+// One item: plans the chain from what it carries and remembers, runs it with the other tools, and
+// plans again whenever a step comes up short. keep is what to leave of other items she carries.
+async function obtainOne(ctx, { item, count, planOnly }, run, keep = null) {
+  const { bot } = ctx;
   if (!bot.registry.itemsByName[item]) return fail(`unknown item: ${item}`);
-  const want = Math.min(Math.max(count ?? 1, 1), MAX_COUNT);
+  const want = wanted(count);
   const start = carriedOf(bot, item);
   if (start >= want) return ok(`already carrying ${start} ${item}`);
   const blocked = new Map();
-  let plan = planObtain(readWorld(ctx, blocked), item, want);
+  let plan = planObtain(readWorld(ctx, blocked, keep), item, want);
   if (planOnly) return ok(planText(plan));
 
   const done = [];
   if (worthLooking(plan)) {
     const seen = await run.look(ctx);
-    if (seen.looked.length) plan = planObtain(readWorld(ctx, blocked), item, want);
+    if (seen.looked.length) plan = planObtain(readWorld(ctx, blocked, keep), item, want);
     if (seen.looked.length || seen.problems.length) done.push(lookText(seen));
   }
   let ran = 0;
@@ -751,7 +793,7 @@ export async function obtain(ctx, { item, count, plan_only: planOnly }, runners 
       break;
     }
     rounds++;
-    plan = planObtain(readWorld(ctx, blocked), item, want);
+    plan = planObtain(readWorld(ctx, blocked, keep), item, want);
     if (!plan.steps.length) break;
   }
 

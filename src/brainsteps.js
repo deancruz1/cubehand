@@ -136,6 +136,11 @@ export function openRun(brain, request, signal, job) {
   return { request, signal, job, record: job.record, player, text, self, whisper, limits, claude, idle, to, tell, speak, ended };
 }
 
+// With routing on, a player's job on the main model is there because it builds or needs a plan,
+// so it gets the build effort from its first step on that model. Raising the effort later, when
+// its first build call comes, would write the whole conversation to the cache again.
+const mainModelJob = (claude, tier, self) => claude.routing === true && tier === 'complex' && !self;
+
 // The model, budget and clock the job starts with.
 export function startRun(brain, run) {
   const { request, job, record, player, text, self, whisper, limits, claude, idle } = run;
@@ -155,7 +160,7 @@ export function startRun(brain, run) {
   const moreEffort = EFFORTS.indexOf(buildEffort) > EFFORTS.indexOf(claude.effort) ? buildEffort : claude.effort;
   const maxSeconds = self ? idle.freeTimeSeconds : build ? buildSeconds : limits.maxSeconds;
   const maxSteps = self ? idle.freeTimeSteps : build ? buildSteps : limits.maxSteps;
-  const effort = build ? moreEffort : claude.effort;
+  const effort = build || mainModelJob(claude, tier, self) ? moreEffort : claude.effort;
   // Without streaming the SDK turns away a request whose cap could run past ten minutes, which
   // a build's bigger cap can.
   const moreTokens = claude.streaming === true ? Math.max(claude.maxTokens, claude.buildMaxTokens ?? 32000) : claude.maxTokens;
@@ -247,7 +252,9 @@ function handOver(brain, run, to, why) {
     run.tier = to;
     job.tier = run.tier;
     run.model = next;
-    if (record) Object.assign(record, { tier: run.tier, model: run.model });
+    // The new model has no cache of this conversation yet, so the effort can change for free.
+    if (mainModelJob(claude, to, run.self)) run.effort = run.moreEffort;
+    if (record) Object.assign(record, { tier: run.tier, model: run.model, effort: run.effort });
     return null;
   }
   brain.log(`[brain] ${why}, starting over on ${next}`);
@@ -342,9 +349,11 @@ export async function runStep(brain, run) {
 
   run.messages.push({ role: 'assistant', content: response.content });
 
-  // A response whose calls have started gets their results, whatever it ended with.
-  if (response.stop_reason === 'pause_turn' && !turn.runner) return NEXT;
-  if (response.stop_reason !== 'tool_use' && !turn.runner) return replied(brain, run, response);
+  // A response with calls gets their results, whatever it ended with: the API turns down the next
+  // request when a call in the conversation has no result after it.
+  const hasCalls = response.content.some((b) => b.type === 'tool_use');
+  if (response.stop_reason === 'pause_turn' && !turn.runner && !hasCalls) return NEXT;
+  if (!hasCalls && !turn.runner) return replied(brain, run, response);
   const handed = handUp(brain, run, response, logged);
   if (handed) return handed;
 
@@ -487,6 +496,7 @@ function logStep(run, turn, message) {
   const ms = Date.now() - turn.asked;
   const logged = run.record?.step(message?.model ?? run.model, message?.usage, ms, turn.first ?? ms);
   if (logged) logged.tools = turn.toolLog;
+  if (logged && message?.stop_reason) logged.stop = message.stop_reason;
   return logged;
 }
 

@@ -10,7 +10,7 @@ export const METHOD = [
   'Stay within the block budget below and what you have or can obtain; when short, shrink the footprint before dropping detail.',
   'Write the plan in layers: massing, base course, walls and posts, door, windows, roof, detail, surroundings. Later parts win; windows skips spots over a door or behind an earlier post. On a symmetric build set mirror at the centre and write half; once true keeps a part or block single.',
   'preview_structure it. Previews draw the plan in colour over the faded world (terrain, water and obstacles, or flat grass if unloaded); faded blocks are the world, not the plan. dy -1 is the ground layer for paths.',
-  'Each preview ends with the Checklist: name every failing point, fix it and preview again, 1 to 3 times. Add a straight view (views south) if a porch hides the entrance; use cut_above for interiors. Then build_structure it and check with view_area.',
+  'Each preview ends with the Checklist: name every failing point, fix it and preview again, 1 to 3 times. Add a straight view (views south) if a porch hides the entrance; use cut_above for interiors. Then build it by its plan id and check with view_area.',
   'What the players asked for (size, materials, style, plain or quick) always wins over this guide.'
 ];
 

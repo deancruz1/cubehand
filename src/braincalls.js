@@ -122,12 +122,15 @@ function becomeBuild(brain, run) {
 
 async function toolCall(brain, run, turn, block) {
   const { job, signal, clock } = run;
-  const building = !run.self && isBuildCall(block);
   brain.log(`[tool] ${block.name} ${JSON.stringify(block.input)}`);
+  // A build_structure that names a previewed plan runs with that plan's input.
+  const planned = brain.planInput(block);
+  const call = planned.error || planned.input === block.input ? block : { ...block, input: planned.input };
+  const building = !run.self && isBuildCall(call);
   if (building && !run.build) becomeBuild(brain, run);
-  const turnedBack = brain.previewFirst(run, block);
+  const turnedBack = planned.error ?? brain.previewFirst(run, call);
   if (turnedBack) {
-    brain.log('[brain] turned back build_structure: that plan was not previewed');
+    brain.log(planned.error ? '[brain] turned back build_structure: no such previewed plan, or more than a plan id' : '[brain] turned back build_structure: that plan was not previewed');
     turn.toolLog.push({ name: block.name, ok: false, ms: 0, error: turnedBack });
     job.ran.push(`${block.name} (turned back, not previewed)`);
     turn.failed = true;
@@ -146,7 +149,7 @@ async function toolCall(brain, run, turn, block) {
   const ran = Date.now();
   try {
     const as = block.name === 'remember' ? brain.rememberFor(job) : undefined;
-    const running = brain.runTool(block.name, block.input, AbortSignal.any([signal, tool.signal]), as);
+    const running = brain.runTool(call.name, call.input, AbortSignal.any([signal, tool.signal]), as);
     job.running = running;
     result = await running;
   } finally {
@@ -159,14 +162,14 @@ async function toolCall(brain, run, turn, block) {
     job.running = null;
     clock.release('tool');
   }
-  brain.notePlan(block, result);
+  const planNote = brain.notePlan(call, result);
   // After a long build there's always a little time left to check on it.
   if (building) clock.setLimit(Math.max(clock.limit, clock.used + 120000));
-  toolResult(brain, run, turn, block, { result, tool, watch, toolSeconds, ran });
+  toolResult(brain, run, turn, block, { result, tool, watch, toolSeconds, ran, planNote });
 }
 
 // What a finished call tells the model, the job log and the job.
-function toolResult(brain, run, turn, block, { result, tool, watch, toolSeconds, ran }) {
+function toolResult(brain, run, turn, block, { result, tool, watch, toolSeconds, ran, planNote }) {
   const { job, signal } = run;
   let why = tool.signal.aborted && !signal.aborted ? tool.signal.reason : null;
   // A change that landed as the tool was finishing cut nothing short: its result stands and
@@ -184,6 +187,7 @@ function toolResult(brain, run, turn, block, { result, tool, watch, toolSeconds,
     content += ` (Stopped because ${HOLD_CAUSES[why]}, see below.)`;
   }
   const ok = Boolean(result.ok && !why);
+  if (ok && planNote) content += `\n${planNote}`;
   // Only a call that went through hands its pictures on, and only up to the job's limit. The
   // count is on the job, so a hand-over or a restart on another model keeps it.
   let images = ok && hasPictures(result.images) ? result.images : null;

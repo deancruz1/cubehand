@@ -1023,6 +1023,34 @@ test('build requests skip the sorting and go straight to the main model', async 
   assert.deepEqual(visit.calls[0].params.output_config, { effort: 'medium' });
 });
 
+test('with routing on, a job on the main model has the build effort from its first step there', async () => {
+  for (const config of [routed, unstrict]) {
+    const lines = [];
+    const client = fakeClient([
+      reply('tool_use', [toolUse('a', 'escalate', { to: 'complex', reason: 'needs a plan' })]),
+      reply('tool_use', [toolUse('b', 'look_at', {})]),
+      reply('end_turn', [{ type: 'text', text: 'Done.' }])
+    ]);
+    const { brain } = makeBrain({ client, config, jobLog: { write: (l) => lines.push(l) } });
+    await brain.start({ player: 'Steve', text: 'Clodine tidy up the windmill' });
+    assert.deepEqual(
+      client.calls.map((c) => [c.params.model, c.params.output_config.effort]),
+      [['claude-haiku-5-5', 'medium'], ['claude-opus-5-5', 'high'], ['claude-opus-5-5', 'high']]
+    );
+    assert.equal(lines.at(-1).effort, 'high');
+  }
+
+  // A job that starts there without the word "build" has it too, so its first build call changes nothing.
+  const fix = fakeClient([reply('end_turn', [{ type: 'text', text: 'Done.' }])]);
+  await makeBrain({ client: fix, config: routed }).brain.start({ player: 'Steve', text: 'Clodine fix the hole in the roof' });
+  assert.deepEqual([fix.calls[0].params.model, fix.calls[0].params.output_config.effort], ['claude-opus-5-5', 'high']);
+
+  // The everyday model keeps the plain effort.
+  const chore = fakeClient([reply('end_turn', [{ type: 'text', text: 'Done.' }])]);
+  await makeBrain({ client: chore, config: routed }).brain.start({ player: 'Steve', text: 'Clodine mine 10 stone' });
+  assert.deepEqual([chore.calls[0].params.model, chore.calls[0].params.output_config.effort], ['claude-sonnet-5-5', 'medium']);
+});
+
 test('only requests that ask for something to be built count as builds', async () => {
   const { isBuildRequest } = await import('../src/brain.js');
   const builds = [
@@ -2973,6 +3001,27 @@ test('a standing order answered with only "Understood" is held back once, until 
   assert.equal(plainJob.calls.length, 1);
 });
 
+test('calls in a response that did not end on tool_use still run and get their results', async () => {
+  const lines = [];
+  const client = fakeClient([
+    reply('end_turn', [saveRule('a'), toolUse('b', 'finish', { message: 'Saved that as a standing order.' })])
+  ]);
+  const { brain, said, toolCalls } = makeBrain({ client, config: withAdmins(routed), jobLog: { write: (line) => lines.push(line) } });
+  await brain.start({ player: 'Steve', text: IRON_DOOR });
+  assert.equal(client.calls.length, 1);
+  assert.deepEqual(toolCalls.map((t) => t.name), ['remember']);
+  assert.deepEqual(said, ['Saved that as a standing order.']);
+  assert.equal(lines[0].end, 'done');
+  assert.equal(lines[0].steps[0].stop, 'end_turn');
+
+  // With more steps to come, every call has its result in the next request.
+  const more = fakeClient([reply('end_turn', [toolUse('a', 'look_at', {}), toolUse('b', 'look_at', {})]), reply('end_turn', [{ type: 'text', text: 'Done.' }])]);
+  const next = makeBrain({ client: more });
+  await next.brain.start({ player: 'Steve', text: 'look around' });
+  const results = more.calls[1].params.messages.at(-1).content.filter((b) => b.type === 'tool_result');
+  assert.deepEqual(results.map((r) => r.tool_use_id), ['a', 'b']);
+});
+
 test('the hold for an unsaved rule happens once and shares the nudge limit with promises of more work', async () => {
   const promise = "Understood. I'll go ahead and dig the next tunnel at y -59.";
   const client = fakeClient(() => reply('tool_use', [toolUse('a', 'finish', { message: promise })]));
@@ -3886,7 +3935,10 @@ test('a tool that returns pictures sends them in its result, after the text, eac
     type: 'tool_result',
     tool_use_id: 'a',
     content: [
-      { type: 'text', text: 'preview_structure drew it' },
+      {
+        type: 'text',
+        text: 'preview_structure drew it\nKept as plan p1. To build it, call build_structure with plan "p1" and nothing else, instead of writing the plan out again (add origin to put it somewhere else, or clear, replace or dry_run).'
+      },
       { type: 'text', text: 'Picture 1: south-east' },
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PIXELS } },
       { type: 'text', text: 'Picture 2: top' },
@@ -4000,7 +4052,7 @@ test('a big build_structure is turned back until that plan was previewed', async
   assert.deepEqual(toolCalls, []);
   const result = client.calls[1].params.messages.at(-1).content[0];
   assert.equal(result.is_error, true);
-  assert.equal(result.content, 'Not built: preview this plan first with preview_structure, look at the pictures, fix what looks plain or wrong, then call build_structure with the plan you previewed (it may go at another origin).');
+  assert.equal(result.content, 'Not built: preview this plan first with preview_structure, look at the pictures, fix what looks plain or wrong, then build the plan you previewed by its id (build_structure with plan; it may go at another origin).');
   assert.ok(logged.includes('[brain] turned back build_structure: that plan was not previewed'));
 });
 
@@ -4017,6 +4069,34 @@ test('a previewed plan builds, at another origin and with its keys in another or
   again.brain.previewedPlans = brain.previewedPlans;
   await again.brain.start({ player: 'Steve', text: 'Clodine build a house here' });
   assert.deepEqual(again.toolCalls, []);
+});
+
+test('a previewed plan is built by its id, without the plan being written out again', async () => {
+  const { origin, ...look } = housePlan;
+  const client = callsClient(
+    ['preview_structure', { ...housePlan, views: ['top'] }],
+    ['build_structure', { plan: 'p1' }],
+    ['build_structure', { plan: 'P1', origin: { x: 5, y: 70, z: 5 }, replace: true }],
+    // Drawn again, the same plan keeps its id.
+    ['preview_structure', housePlan],
+    ['build_structure', { plan: 'p1', parts: housePlan.parts }],
+    ['build_structure', { plan: 'p9' }]
+  );
+  const logged = [];
+  const { brain, toolCalls } = makeBrain({ client, config: plain, log: (line) => logged.push(line) });
+  await brain.start({ player: 'Steve', text: 'Clodine build a house here' });
+  const resultOf = (i) => client.calls[i].params.messages.at(-1).content[0];
+  assert.match(textOf([{ text: resultOf(1).content }]), /Kept as plan p1\. To build it, call build_structure with plan "p1" and nothing else/);
+  assert.deepEqual(ranTools(toolCalls), ['preview_structure', 'build_structure', 'build_structure', 'preview_structure']);
+  assert.deepEqual(toolCalls[1].input, housePlan);
+  assert.deepEqual(toolCalls[2].input, { ...look, origin: { x: 5, y: 70, z: 5 }, replace: true });
+  assert.match(String(resultOf(4).content), /Kept as plan p1\./);
+  assert.equal(resultOf(5).is_error, true);
+  assert.match(resultOf(5).content, /^Not built: plan "p1" is built as it was previewed, so leave out parts\./);
+  assert.equal(resultOf(6).is_error, true);
+  assert.match(resultOf(6).content, /^Not built: no previewed plan "p9" is kept/);
+  // The log keeps the call as the model wrote it.
+  assert.ok(logged.includes('[tool] build_structure {"plan":"p1"}'));
 });
 
 test('small plans, dry runs and a plan built before go straight through', async () => {

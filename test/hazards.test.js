@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Vec3 } from 'vec3';
-import { hazard, swimPath, standSpots, waterSpots, getOut, escapeReport, Survival } from '../src/survival.js';
+import { hazard, swimPath, standSpots, waterSpots, floatingFeet, getOut, escapeReport, Survival } from '../src/survival.js';
 import { wetDrop, collectItems } from '../src/actions/items.js';
 
 const SOLID = new Set(['stone', 'ice', 'dirt']);
@@ -202,6 +202,68 @@ test('with air to spare and nothing hurting her, a job under water carries on', 
   survival.check();
   assert.equal(survival.escaping, null);
   assert.deepEqual(calls, []);
+});
+
+// Water from y 60 to 62 on stone with no shore anywhere.
+const sea = (x, y) => (y <= 59 ? 'stone' : y <= 62 ? 'water' : 'air');
+
+test('in open water with nowhere to climb out she treads water, and the rescue does not fire again', async () => {
+  const bot = fakeBot(sea, { oxygen: 10 });
+  const calls = [];
+  const survival = survivalFor(bot, quietBrain(calls));
+  survival.check();
+  await survival.escaping;
+  assert.equal(calls.length, 2);
+  assert.match(calls[1][2], /found nothing solid close by to climb onto/);
+  assert.equal(bot.controls.jump, true);
+
+  // Her head dips under again with her air still coming back: she is kept up, the job isn't stopped.
+  bot.entity.position = new Vec3(0.5, 60.9, 0.5);
+  assert.equal(headIn(bot), 'water');
+  survival.check();
+  assert.equal(survival.escaping, null);
+  assert.equal(calls.length, 2);
+  assert.equal(bot.controls.jump, true);
+
+  // With her air nearly gone it is a danger again at once.
+  bot.entity.position = new Vec3(0.5, 60, 0.5);
+  bot.oxygenLevel = 5;
+  survival.check();
+  assert.ok(survival.escaping);
+  await survival.escaping;
+  assert.equal(calls.length, 4);
+});
+
+test('with her head under and nothing steering her she holds jump, and lets go once she is out', () => {
+  const bot = fakeBot(openWater, { oxygen: 18 });
+  const calls = [];
+  const survival = survivalFor(bot, quietBrain(calls));
+  survival.check();
+  assert.equal(bot.controls.jump, true);
+  assert.deepEqual(calls, []);
+
+  // A walk steers her itself.
+  const walking = fakeBot(openWater, { oxygen: 18 });
+  walking.pathfinder.isMoving = () => true;
+  survivalFor(walking, quietBrain()).check();
+  assert.notEqual(walking.controls.jump, true);
+
+  bot.entity.position = new Vec3(3.5, 63, 0.5);
+  survival.check();
+  assert.equal(bot.controls.jump, false);
+
+  // Wading with her head out, she never starts.
+  const wading = fakeBot((x, y) => (y <= 59 ? 'stone' : y === 60 ? 'water' : 'air'));
+  survivalFor(wading, quietBrain()).check();
+  assert.notEqual(wading.controls.jump, true);
+});
+
+test('sunk a block or two, she still finds the bank level with the water', async () => {
+  const bot = fakeBot(openWater);
+  assert.deepEqual(floatingFeet((p) => bot.blockAt(p), new Vec3(0, 60, 0)), new Vec3(0, 61, 0));
+  assert.deepEqual(floatingFeet((p) => bot.blockAt(p), new Vec3(0, 61, 0)), new Vec3(0, 61, 0));
+  const what = await getOut(bot, 'water');
+  assert.match(what, /^got out onto stone at 3 63 0$/);
 });
 
 test('hurt under water, recovery gets her to air before it waits for the job to stop or heals', async () => {

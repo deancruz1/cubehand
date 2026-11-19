@@ -11,7 +11,7 @@ const BATCH = 8;
 const MAX_NUDGES = 3;
 const TABLE_STUCK = 'the crafting table stopped responding';
 // drainMs is longer than the 20 s mineflayer waits for a slot update before it gives up.
-export const CRAFT_TIMING = { batchMs: 20000, quietMs: 3000, settleMs: 6000, drainMs: 25000, progressMs: 10000, tickMs: 1000 };
+export const CRAFT_TIMING = { batchMs: 20000, quietMs: 3000, settleMs: 6000, drainMs: 25000, progressMs: 10000, tickMs: 1000, calmMs: 400 };
 // A batch that was given up on can still be running inside mineflayer, and starting another
 // would mix its clicks with the first one's.
 const running = new WeakMap();
@@ -50,6 +50,22 @@ export async function settleInventory(bot) {
   bot.closeWindow(bot.inventory);
   if (!bot._syncWindow) return delay(300);
   await guarded(() => bot._syncWindow(bot.inventory), { ms: 3000 }).catch(() => {});
+}
+
+// A batch that went wrong leaves the server's answers to its clicks still on the way, each one
+// the whole inventory as it was at that click. The resync takes the first answer it sees, and an
+// old one shows the ingredients on the cursor or gone, so this waits until they stop coming.
+async function calm(bot) {
+  if (!bot.on) return;
+  let last = Date.now();
+  const seen = () => {
+    last = Date.now();
+  };
+  const event = `setWindowItems:${bot.inventory.id}`;
+  bot.on(event, seen);
+  const end = Date.now() + CRAFT_TIMING.calmMs * 5;
+  while (Date.now() - last < CRAFT_TIMING.calmMs && Date.now() < end) await delay(20);
+  bot.removeListener(event, seen);
 }
 
 // Room for more of an item in the main inventory and hotbar.
@@ -182,13 +198,16 @@ async function craftTimes(ctx, item, perCraft, times, table, pick = () => true) 
     }
     const before = have(bot, item.id);
     let stuck = false;
+    let threw = false;
     try {
       await runBatch(bot, recipe, n, table, ctx.status);
     } catch (err) {
       stuck = err instanceof TimeoutError;
+      threw = !stuck;
       error = stuck ? (table ? TABLE_STUCK : 'crafting got stuck') : err.message;
       bot.emit('craft_trouble', `crafting ${item.name} failed (${err.message}). Inventory: ${inventoryText(bot)}`);
     }
+    if (threw) await calm(bot);
     // A resync would wake a craft that is still running, so that one keeps the count it has.
     if (running.get(bot)?.done !== false) await settleInventory(bot);
     if (stuck) break;

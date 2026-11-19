@@ -1,13 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { EventEmitter } from 'node:events';
 import { Vec3 } from 'vec3';
 import { craft, CRAFT_TIMING } from '../src/actions/crafting.js';
 import { obtain } from '../src/actions/obtain.js';
 import { setPauseScale } from '../src/actions/util.js';
 
 setPauseScale(0);
-Object.assign(CRAFT_TIMING, { batchMs: 300, quietMs: 30, settleMs: 200, drainMs: 300, progressMs: 100, tickMs: 10 });
+Object.assign(CRAFT_TIMING, { batchMs: 300, quietMs: 30, settleMs: 200, drainMs: 300, progressMs: 100, tickMs: 10, calmMs: 40 });
 
 // Real 26.1 items and recipes, loaded the way mineflayer loads them.
 const require = createRequire(createRequire(import.meta.url).resolve('mineflayer'));
@@ -294,4 +295,39 @@ test('obtain never reports a negative amount for a step that lost items', async 
   assert.equal(result.ok, false);
   assert.match(result.message, /did: crafted 0 spruce_trapdoor \(craft: the table broke\)/);
   assert.doesNotMatch(result.message, /-\d/);
+});
+
+test('after a 2x2 batch that lost its ingredient, an old answer still on the way is not taken for the inventory', async () => {
+  const { bot, state } = tableBot([['oak_log', 8]]);
+  const events = new EventEmitter();
+  const slots = bot.inventory.slots;
+  bot.inventory.id = 0;
+  bot.on = (name, fn) => events.on(name, fn);
+  bot.removeListener = (name, fn) => events.removeListener(name, fn);
+  const answer = (list) => {
+    list.forEach((s, i) => {
+      slots[i] = s;
+    });
+    events.emit('setWindowItems:0');
+  };
+  // The real resync ends on the next whole-inventory answer, whichever click it answers.
+  bot._syncWindow = () => {
+    setTimeout(() => answer(copy(state.server.slots)), 30);
+    return new Promise((resolve) => events.once('setWindowItems:0', resolve));
+  };
+  const gridCraft = bot.craft;
+  let first = true;
+  bot.craft = async (r, times, table) => {
+    if (!first) return gridCraft(r, times, table);
+    first = false;
+    await gridCraft(r, 3, table);
+    // The answer to a click made while the logs were on the cursor is still on the way.
+    const old = copy(state.server.slots).map((s) => (s?.type === id('oak_log') ? null : s));
+    setTimeout(() => answer(old), 10);
+    throw new Error('Error: missing ingredient');
+  };
+  const result = await craft({ bot }, { item: 'oak_planks', count: 32 });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(bot.count('oak_planks'), 32);
+  assert.equal(bot.count('oak_log'), 0);
 });
